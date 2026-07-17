@@ -1,0 +1,886 @@
+<?php
+/**
+ * Class Controller file.
+ *
+ * Local DB-backed consent log controller.
+ *
+ * @package FazCookie
+ */
+
+namespace FazCookie\Admin\Modules\Consentlogs\Includes;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit; // Exit if accessed directly.
+}
+
+/**
+ * Handles Consent Log Operations using local WordPress database.
+ *
+ * @class       Controller
+ * @version     3.0.0
+ * @package     FazCookie
+ */
+class Controller {
+
+	/**
+	 * Instance of the current class
+	 *
+	 * @var object
+	 */
+	private static $instance;
+
+	/**
+	 * Table name (without prefix)
+	 *
+	 * @var string
+	 */
+	private $table_name = 'faz_consent_logs';
+
+	/**
+	 * DB version option key
+	 *
+	 * @var string
+	 */
+	private $db_version = '1.1';
+
+	/**
+	 * Return the current instance of the class
+	 *
+	 * @return Controller
+	 */
+	public static function get_instance() {
+		if ( null === self::$instance ) {
+			self::$instance = new self();
+		}
+		return self::$instance;
+	}
+
+	/**
+	 * Constructor - ensure table exists.
+	 *
+	 * Deferred to plugins_loaded so wp_salt() (pluggable.php) is guaranteed
+	 * to be available before the migration query runs. Running it synchronously
+	 * in the constructor crashes WordPress Playground where the loading order
+	 * differs from a standard installation.
+	 */
+	private function __construct() {
+		if ( did_action( 'plugins_loaded' ) ) {
+			$this->maybe_create_table();
+		} else {
+			add_action( 'plugins_loaded', array( $this, 'maybe_create_table' ), 20 );
+		}
+	}
+
+	/**
+	 * Get the full table name with WP prefix.
+	 *
+	 * @return string
+	 */
+	private function get_table_name() {
+		global $wpdb;
+		return $wpdb->prefix . $this->table_name;
+	}
+
+	/**
+	 * Create the consent logs table if it does not exist.
+	 *
+	 * @return void
+	 */
+	public function maybe_create_table() {
+		$installed_version = get_option( 'faz_consent_logs_db_version', '0' );
+		if ( version_compare( $installed_version, $this->db_version, '>=' ) ) {
+			return;
+		}
+
+		global $wpdb;
+		$table_name      = $this->get_table_name();
+		$charset_collate = $wpdb->get_charset_collate();
+
+		$sql = "CREATE TABLE {$table_name} (
+			log_id bigint(20) NOT NULL AUTO_INCREMENT,
+			consent_id varchar(190) NOT NULL,
+			status varchar(20) NOT NULL,
+			categories longtext,
+			ip_hash varchar(64) DEFAULT '',
+			user_agent text,
+			url varchar(500) DEFAULT '',
+			banner_slug varchar(190) DEFAULT '',
+			policy_revision bigint(20) NOT NULL DEFAULT 1,
+			created_at datetime NOT NULL,
+			PRIMARY KEY  (log_id),
+			KEY idx_consent_id (consent_id),
+			KEY idx_status (status),
+			KEY idx_created_at (created_at)
+		) $charset_collate;";
+
+		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+		dbDelta( $sql );
+
+		// Migrate legacy plaintext user_agent values to hashed form.
+		$migration_ok = true;
+		if ( version_compare( $installed_version, '1.1', '<' ) ) {
+			if ( function_exists( 'wp_salt' ) ) {
+				$migration_ok = $this->hash_legacy_user_agents();
+			}
+			// If wp_salt() is not yet available, skip migration silently.
+			// Fresh installs have no rows to migrate; upgrades will retry next request.
+		}
+
+		if ( $migration_ok ) {
+			update_option( 'faz_consent_logs_db_version', $this->db_version );
+		}
+	}
+
+	/**
+	 * Hash any legacy plaintext user_agent rows in PHP.
+	 *
+	 * The previous implementation used MySQL's SHA2()/REGEXP in a single UPDATE,
+	 * which fatals on SQLite-backed WordPress (no SHA2 function) and left the
+	 * migration to retry — and emit a database error — on every request. We hash
+	 * in PHP instead, with the exact same algorithm as hash_user_agent()
+	 * (hash('sha256', $ua . wp_salt('auth')) === LOWER(SHA2(CONCAT(ua, salt), 256))),
+	 * so the result is identical and the path is portable across MySQL and SQLite.
+	 * A log_id cursor guarantees forward progress and loop termination regardless
+	 * of row contents.
+	 *
+	 * @return bool True on success (or nothing to migrate), false on a query error.
+	 */
+	private function hash_legacy_user_agents() {
+		global $wpdb;
+		$table_name = $this->get_table_name();
+		$batch_size = 500;
+		$last_id    = 0;
+
+		do {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- one-shot upgrade-path migration; $table_name is $wpdb->prefix + literal "faz_consent_logs"; bounds are bound via prepare(%d).
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT log_id, user_agent FROM {$table_name}
+					 WHERE log_id > %d
+					 ORDER BY log_id ASC
+					 LIMIT %d",
+					$last_id,
+					$batch_size
+				),
+				ARRAY_A
+			);
+
+			if ( null === $rows ) {
+				return false;
+			}
+
+			foreach ( $rows as $row ) {
+				$last_id = (int) $row['log_id'];
+				$ua      = (string) $row['user_agent'];
+				// Skip empties and already-hashed values (64-char lowercase hex).
+				if ( '' === $ua || preg_match( '/^[0-9a-f]{64}$/', $ua ) ) {
+					continue;
+				}
+				$updated = $wpdb->update(
+					$table_name,
+					array( 'user_agent' => $this->hash_user_agent( $ua ) ),
+					array( 'log_id' => (int) $row['log_id'] ),
+					array( '%s' ),
+					array( '%d' )
+				);
+				if ( false === $updated ) {
+					return false;
+				}
+			}
+		} while ( count( $rows ) === $batch_size );
+
+		return true;
+	}
+
+	/**
+	 * Hash an IP address for GDPR compliance.
+	 *
+	 * @param string $ip The IP address.
+	 * @return string SHA256 hash of IP + salt.
+	 */
+	private function hash_ip( $ip ) {
+		if ( empty( $ip ) ) {
+			return '';
+		}
+		return hash( 'sha256', $ip . \wp_salt() );
+	}
+
+	/**
+	 * Hash the user agent so the raw fingerprint is not stored in the database.
+	 *
+	 * @param string $user_agent Raw user agent string.
+	 * @return string
+	 */
+	private function hash_user_agent( $user_agent ) {
+		if ( empty( $user_agent ) ) {
+			return '';
+		}
+
+		return hash( 'sha256', $user_agent . \wp_salt( 'auth' ) );
+	}
+
+	/**
+	 * Drop query string and fragment before persisting a consent log URL.
+	 *
+	 * @param string $url URL to sanitize.
+	 * @return string
+	 */
+	private function sanitize_log_url( $url ) {
+		$url = esc_url_raw( (string) $url );
+		if ( '' === $url ) {
+			return '';
+		}
+
+		$parts = wp_parse_url( $url );
+		if ( false === $parts || ! is_array( $parts ) ) {
+			return '';
+		}
+
+		$sanitized = '';
+		if ( ! empty( $parts['scheme'] ) ) {
+			$sanitized .= $parts['scheme'] . '://';
+		}
+		// Deliberately omit user:pass — never persist credentials in logs.
+		if ( ! empty( $parts['host'] ) ) {
+			$sanitized .= $parts['host'];
+		}
+		if ( ! empty( $parts['port'] ) ) {
+			$sanitized .= ':' . absint( $parts['port'] );
+		}
+		if ( ! empty( $parts['path'] ) ) {
+			$sanitized .= $parts['path'];
+		}
+
+		return $sanitized;
+	}
+
+	/**
+	 * Generate a unique consent ID.
+	 *
+	 * @return string Base64-encoded random string.
+	 */
+	private function generate_consent_id() {
+		return base64_encode( wp_generate_password( 24, false ) ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
+	}
+
+	/**
+	 * Get the visitor's IP address.
+	 *
+	 * @return string
+	 */
+	private function get_visitor_ip() {
+		return faz_resolve_client_ip();
+	}
+
+	/**
+	 * Log a consent record.
+	 *
+	 * @param array $data Consent data with keys: consent_id, status, categories, url.
+	 * @return array|false The inserted record data or false on failure.
+	 */
+	public function log_consent( $data ) {
+		global $wpdb;
+
+		$consent_id = ! empty( $data['consent_id'] ) ? sanitize_text_field( $data['consent_id'] ) : $this->generate_consent_id();
+		$status     = isset( $data['status'] ) ? sanitize_text_field( $data['status'] ) : 'partial';
+		// Constrain status to the known set. The REST `status` param has no
+		// validate_callback, so an unauthenticated POST could otherwise write an
+		// arbitrary string that pollutes the dashboard's GROUP BY statistics
+		// (total != accepted + rejected + partial). Unknown values fold to
+		// 'partial'; the internal-only dnsmpi_optout / dns_rescinded stay valid
+		// because the internal callers pass them verbatim.
+		if ( ! in_array( $status, array( 'accepted', 'rejected', 'partial', 'dnsmpi_optout', 'dns_rescinded' ), true ) ) {
+			$status = 'partial';
+		}
+		$categories = isset( $data['categories'] ) ? $data['categories'] : array();
+		$url        = isset( $data['url'] ) ? $this->sanitize_log_url( $data['url'] ) : '';
+		$user_agent = isset( $_SERVER['HTTP_USER_AGENT'] ) ? $this->hash_user_agent( sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) ) : '';
+		$ip_hash    = $this->hash_ip( $this->get_visitor_ip() );
+		$banner_slug = isset( $data['banner_slug'] ) ? sanitize_title( $data['banner_slug'] ) : '';
+		$policy_revision = isset( $data['policy_revision'] ) ? max( 1, absint( $data['policy_revision'] ) ) : 1;
+
+		// Sanitize the category/service decision map before persisting. The
+		// REST `categories` param has no per-key sanitize_callback and the
+		// frontend now folds svc.*/ck.* keys read from the (client-writable)
+		// consent cookie into it, so a crafted cookie could otherwise push
+		// arbitrary keys/values into the consent-log row. Cap the entry count,
+		// length-bound every key, and constrain values so the stored audit map
+		// stays well-formed regardless of what the client sends.
+		if ( is_array( $categories ) || is_object( $categories ) ) {
+			$clean = array();
+			$count = 0;
+			foreach ( (array) $categories as $key => $value ) {
+				if ( $count >= 250 ) {
+					break;
+				}
+				$key = substr( sanitize_text_field( (string) $key ), 0, 190 );
+				// Only yes/no scalars are valid. Skip nested arrays/objects before
+				// the string cast so a crafted payload can't trigger an
+				// array-to-string warning (or an object __toString fatal).
+				if ( ! is_scalar( $value ) ) {
+					continue;
+				}
+				$value = sanitize_text_field( (string) $value );
+				if ( '' === $key || ! in_array( $value, array( 'yes', 'no' ), true ) ) {
+					continue;
+				}
+				$clean[ $key ] = $value;
+				++$count;
+			}
+			$categories = wp_json_encode( $clean );
+		} else {
+			// A scalar value (e.g. a DNSMPI opt-out passes '' and the audit /
+			// export contract expects '' for that column — NOT the '[]' that
+			// wp_json_encode( array() ) would produce). Keep it as a sanitized
+			// string, length-bounded so a crafted REST payload (the param has no
+			// validate_callback) cannot write an unbounded blob into the log.
+			$categories = substr( sanitize_text_field( (string) $categories ), 0, 1000 );
+		}
+
+		// L2-SP1-S003 fix (1.15.0): populate the 7 geo-routing v2
+		// audit columns added by Migration_V2. Resolves Constitution V
+		// (Auditable Records) gap — until this commit the columns were
+		// added schema-side but never written, leaving NULL on every row.
+		//
+		// Data source priority:
+		//   1. $data['visitor_context'] explicitly passed by caller
+		//      (REST API consent_log endpoint, JS-side hydration).
+		//   2. Geo_Routing::get_visitor_context() server-side resolve
+		//      (cached per-request — no extra HTTP). Only invoked if
+		//      the Geo_Routing class is available (defensive — geo-
+		//      routing v2 module might be removed by a future host
+		//      filter).
+		//   3. NULL columns (legacy fallback).
+		$geo_fields = $this->resolve_geo_audit_fields( $data );
+
+		$insert_data = array(
+			'consent_id'      => $consent_id,
+			'status'          => $status,
+			'categories'      => $categories,
+			'ip_hash'         => $ip_hash,
+			'user_agent'      => $user_agent,
+			'url'             => $url,
+			'banner_slug'     => $banner_slug,
+			'policy_revision' => $policy_revision,
+			'created_at'      => current_time( 'mysql' ),
+		);
+		$insert_format = array( '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s' );
+
+		// Append v2 columns only when geo-routing v2 has resolved data
+		// AND the migration completed successfully on this install. Two
+		// guards (both must be false for v2 columns to be appended):
+		//   - faz_geo_v2_disabled_reason: set when admin explicitly disabled
+		//     v2 (MySQL too old, kill switch, etc.) — skip permanently.
+		//   - faz_geo_v2_migration_pending: set when Migration_V2::run()
+		//     finished with status 'partial' (some columns added, others
+		//     failed mid-ALTER). Appending v2 keys here would hit the
+		//     unknown-column branch on the missing columns; better to fall
+		//     back to a v1-shape insert until the next activator pass
+		//     retries the migration.
+		if (
+			is_array( $geo_fields )
+			&& ! empty( $geo_fields )
+			&& '' === (string) get_option( 'faz_geo_v2_disabled_reason', '' )
+			&& ! get_option( 'faz_geo_v2_migration_pending', false )
+		) {
+			foreach ( $geo_fields as $col => $val ) {
+				$insert_data[ $col ]   = $val;
+				$insert_format[]        = is_int( $val ) ? '%d' : '%s';
+			}
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- consent log writes by design must not be cached; every visitor consent action produces a fresh row.
+		$result = $wpdb->insert(
+			$this->get_table_name(),
+			$insert_data,
+			$insert_format
+		);
+
+		if ( false === $result ) {
+			if ( ! empty( $wpdb->last_error ) ) {
+				error_log( 'FAZ consent log insert failed: ' . $wpdb->last_error ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			}
+			return false;
+		}
+
+		return array(
+			'log_id'     => $wpdb->insert_id,
+			'consent_id' => $consent_id,
+			'status'     => $status,
+			'banner_slug' => $banner_slug,
+			'policy_revision' => $policy_revision,
+			'created_at' => current_time( 'mysql' ),
+		);
+	}
+
+	/**
+	 * Resolve the 7 geo-routing v2 audit fields for `log_consent()`.
+	 *
+	 * Spec: 001-geo-routing-next FR-07, L2-SP1-S003 fix.
+	 *
+	 * Returns columns the caller can pass-through to $wpdb->insert:
+	 *   country_at_consent, region_at_consent, ruleset_id_at_consent,
+	 *   signal_gpc_received, signal_dnt_received, tc_string, gpp_string
+	 *
+	 * Defensive: never throws. If geo-routing v2 module is absent,
+	 * returns an empty array → caller skips the v2 columns entirely.
+	 *
+	 * @since 1.15.0
+	 * @param array $data Caller payload (may contain 'visitor_context').
+	 * @return array Sparse column→value map.
+	 */
+	protected function resolve_geo_audit_fields( $data ) {
+		$ctx = isset( $data['visitor_context'] ) && is_array( $data['visitor_context'] ) ? $data['visitor_context'] : null;
+
+		if ( null === $ctx ) {
+			$class = '\\FazCookie\\Admin\\Modules\\Geo_Routing\\Geo_Routing';
+			if ( class_exists( $class ) ) {
+				try {
+					$orchestrator = $class::get_instance();
+					if ( method_exists( $orchestrator, 'get_visitor_context' ) ) {
+						$ctx = $orchestrator->get_visitor_context();
+					}
+				} catch ( \Throwable $e ) {
+					$ctx = null;
+				}
+			}
+		}
+
+		if ( ! is_array( $ctx ) ) {
+			return array();
+		}
+
+		$out = array();
+		if ( isset( $ctx['country'] ) && is_string( $ctx['country'] ) && preg_match( '/^[A-Z]{2}$/', $ctx['country'] ) ) {
+			$out['country_at_consent'] = $ctx['country'];
+		}
+		if ( isset( $ctx['region'] ) && is_string( $ctx['region'] ) && preg_match( '/^[A-Z]{2}-[A-Z0-9]{1,3}$/', $ctx['region'] ) ) {
+			$out['region_at_consent'] = $ctx['region'];
+		}
+		if ( isset( $ctx['ruleset_id'] ) && is_string( $ctx['ruleset_id'] ) && preg_match( '/^[a-z][a-z0-9-]*[a-z0-9]$/', $ctx['ruleset_id'] ) ) {
+			$out['ruleset_id_at_consent'] = $ctx['ruleset_id'];
+		}
+		if ( isset( $ctx['signals']['gpc'] ) ) {
+			$out['signal_gpc_received'] = ! empty( $ctx['signals']['gpc'] ) ? 1 : 0;
+		} elseif ( isset( $data['signal_gpc'] ) ) {
+			$out['signal_gpc_received'] = ! empty( $data['signal_gpc'] ) ? 1 : 0;
+		}
+		if ( isset( $ctx['signals']['dnt'] ) ) {
+			$out['signal_dnt_received'] = ! empty( $ctx['signals']['dnt'] ) ? 1 : 0;
+		} elseif ( isset( $data['signal_dnt'] ) ) {
+			$out['signal_dnt_received'] = ! empty( $data['signal_dnt'] ) ? 1 : 0;
+		}
+		// IAB TC + GPP strings: stored verbatim for audit, but pass through
+		// sanitize_text_field() to strip control chars / extra whitespace
+		// that can't legally appear in a TCF/GPP container string. The
+		// regex shape is intentionally not enforced — TCF / GPP have
+		// evolving versions; we keep the schema permissive and validate
+		// at consumer time. Length is bounded by the TEXT column type
+		// (65 KB) which is far above any real-world payload (TCF strings
+		// are typically < 1 KB).
+		if ( isset( $data['tc_string'] ) && is_string( $data['tc_string'] ) ) {
+			$tc = sanitize_text_field( wp_unslash( $data['tc_string'] ) );
+			if ( '' !== $tc ) {
+				$out['tc_string'] = $tc;
+			}
+		}
+		if ( isset( $data['gpp_string'] ) && is_string( $data['gpp_string'] ) ) {
+			$gpp = sanitize_text_field( wp_unslash( $data['gpp_string'] ) );
+			if ( '' !== $gpp ) {
+				$out['gpp_string'] = $gpp;
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Get paginated consent logs.
+	 *
+	 * @param array $args {
+	 *     Optional. Query arguments.
+	 *     @type int    $paged    Current page. Default 1.
+	 *     @type int    $per_page Items per page. Default 10.
+	 *     @type string $search   Search term (matches consent_id or url).
+	 *     @type string $status   Filter by status.
+	 *     @type string $orderby  Column to order by. Default 'created_at'.
+	 *     @type string $order    ASC or DESC. Default 'DESC'.
+	 * }
+	 * @return array {
+	 *     @type array $items Array of log records.
+	 *     @type int   $total Total number of matching records.
+	 *     @type int   $pages Total number of pages.
+	 * }
+	 */
+	public function get_logs( $args = array() ) {
+		global $wpdb;
+
+		$defaults = array(
+			'paged'    => 1,
+			'per_page' => 10,
+			'search'   => '',
+			'status'   => '',
+			'orderby'  => 'created_at',
+			'order'    => 'DESC',
+		);
+		$args     = wp_parse_args( $args, $defaults );
+		$table    = $this->get_table_name();
+
+		$where = array( '1=1' );
+		$values = array();
+
+		if ( ! empty( $args['search'] ) ) {
+			$like     = '%' . $wpdb->esc_like( $args['search'] ) . '%';
+			$where[]  = '(consent_id LIKE %s OR url LIKE %s)';
+			$values[] = $like;
+			$values[] = $like;
+		}
+
+		if ( ! empty( $args['status'] ) ) {
+			$where[]  = 'status = %s';
+			$values[] = $args['status'];
+		}
+
+		$where_clause = implode( ' AND ', $where );
+
+		// Whitelist orderby columns.
+		$allowed_orderby = array( 'log_id', 'consent_id', 'status', 'created_at' );
+		$orderby         = in_array( $args['orderby'], $allowed_orderby, true ) ? $args['orderby'] : 'created_at';
+		$order           = strtoupper( $args['order'] ) === 'ASC' ? 'ASC' : 'DESC';
+
+		// Count total — always use prepare() even when $values is empty.
+		if ( ! empty( $values ) ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is plugin-prefix; $where_clause is built from a server-controlled allowlist of column names + bound %s/%d placeholders, all user values flow through $values which prepare() binds. Stats query — caching would mask near-real-time admin dashboard.
+			$total = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE {$where_clause}", $values ) );
+		} else {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is plugin-prefix + literal; literal WHERE 1=1 has no user input. Stats query — caching would mask near-real-time data.
+			$total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table} WHERE 1=1" );
+		}
+
+		// Get items.
+		$per_page = absint( $args['per_page'] );
+		$offset   = ( absint( $args['paged'] ) - 1 ) * $per_page;
+
+		$query = "SELECT * FROM {$table} WHERE {$where_clause} ORDER BY {$orderby} {$order} LIMIT %d OFFSET %d";
+		$query_values = array_merge( $values, array( $per_page, $offset ) );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $query is built from plugin-prefix $table, allowlisted $orderby/$order, and a $where_clause assembled from allowlisted column names + %s/%d placeholders; all user input flows through $query_values which prepare() binds. Caching would mask admin-dashboard listing freshness.
+		$items = $wpdb->get_results( $wpdb->prepare( $query, $query_values ), ARRAY_A );
+
+		if ( ! is_array( $items ) ) {
+			$items = array();
+		}
+
+		// Decode categories JSON for each item.
+		foreach ( $items as &$item ) {
+			if ( ! empty( $item['categories'] ) ) {
+				$decoded = json_decode( $item['categories'], true );
+				if ( json_last_error() === JSON_ERROR_NONE ) {
+					$item['categories'] = $decoded;
+				}
+			}
+		}
+
+		return array(
+			'items' => $items,
+			'total' => $total,
+			'pages' => $per_page > 0 ? (int) ceil( $total / $per_page ) : 0,
+		);
+	}
+
+	/**
+	 * Get a single consent log by consent_id.
+	 *
+	 * @param string $consent_id The consent ID to look up.
+	 * @return array|null The log record or null if not found.
+	 */
+	public function get_log_by_consent_id( $consent_id ) {
+		global $wpdb;
+
+		$table = $this->get_table_name();
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is plugin-prefix; $consent_id is bound via prepare(%s). Caching would mask post-write reads from the same request.
+		$item  = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT * FROM {$table} WHERE consent_id = %s ORDER BY created_at DESC LIMIT 1", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$consent_id
+			),
+			ARRAY_A
+		);
+
+		if ( null === $item ) {
+			return null;
+		}
+
+		if ( ! empty( $item['categories'] ) ) {
+			$decoded = json_decode( $item['categories'], true );
+			if ( json_last_error() === JSON_ERROR_NONE ) {
+				$item['categories'] = $decoded;
+			}
+		}
+
+		return $item;
+	}
+
+	/**
+	 * Get consent statistics grouped by status.
+	 *
+	 * @return array Array of objects with 'type' and 'count' keys.
+	 */
+	public function get_statistics() {
+		global $wpdb;
+
+		$table = $this->get_table_name();
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is plugin-prefix; literal GROUP BY status query has no user input. Aggregate refreshed on every request — caching would defeat the purpose.
+		$results = $wpdb->get_results(
+			"SELECT status, COUNT(*) as count FROM {$table} GROUP BY status", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			ARRAY_A
+		);
+
+		if ( ! is_array( $results ) || empty( $results ) ) {
+			return array();
+		}
+
+		$logs  = array();
+		$total = 0;
+		foreach ( $results as $row ) {
+			$count  = absint( $row['count'] );
+			$total += $count;
+			$logs[] = array(
+				'type'  => sanitize_text_field( $row['status'] ),
+				'count' => $count,
+			);
+		}
+
+		if ( $total <= 0 ) {
+			return array();
+		}
+
+		return $logs;
+	}
+
+	/**
+	 * Export consent logs as CSV.
+	 *
+	 * @param array $args Query arguments (same as get_logs, but per_page can be -1 for all).
+	 * @return string CSV content.
+	 */
+	public function export_csv( $args = array() ) {
+		global $wpdb;
+
+		$table = $this->get_table_name();
+
+		$where  = array( '1=1' );
+		$values = array();
+
+		if ( ! empty( $args['search'] ) ) {
+			$like     = '%' . $wpdb->esc_like( $args['search'] ) . '%';
+			$where[]  = '(consent_id LIKE %s OR url LIKE %s)';
+			$values[] = $like;
+			$values[] = $like;
+		}
+
+		if ( ! empty( $args['status'] ) ) {
+			$where[]  = 'status = %s';
+			$values[] = $args['status'];
+		}
+
+		$where_clause = implode( ' AND ', $where );
+
+		if ( ! empty( $values ) ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is plugin-prefix; $where_clause is built from a closed allowlist of column names + %s/%d placeholders, all user values flow through $values which prepare() binds.
+			$query = $wpdb->prepare( "SELECT * FROM {$table} WHERE {$where_clause} ORDER BY created_at DESC", $values );
+		} else {
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is plugin-prefix + literal; literal "WHERE 1=1" has no user input.
+			$query = "SELECT * FROM {$table} WHERE 1=1 ORDER BY created_at DESC";
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $query produced by the prepare() block above (or a literal-only fallback). CSV export — must reflect live data.
+		$items = $wpdb->get_results( $query, ARRAY_A );
+
+		if ( ! is_array( $items ) ) {
+			$items = array();
+		}
+
+		$output = fopen( 'php://temp', 'r+' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen
+		if ( false === $output ) {
+			return '';
+		}
+
+		// CSV header row.
+		fputcsv( $output, array( 'Log ID', 'Consent ID', 'Status', 'Categories', 'IP Hash', 'User Agent Hash', 'URL', 'Banner Slug', 'Policy Revision', 'Created At' ) );
+
+		foreach ( $items as $item ) {
+			fputcsv(
+				$output,
+				array_map(
+					array( $this, 'sanitize_csv_cell' ),
+					array(
+						$item['log_id'],
+						$item['consent_id'],
+						$item['status'],
+						$item['categories'], // Already JSON string from DB.
+						$item['ip_hash'],
+						$item['user_agent'],
+						$item['url'],
+						isset( $item['banner_slug'] ) ? $item['banner_slug'] : '',
+						isset( $item['policy_revision'] ) ? $item['policy_revision'] : 1,
+						$item['created_at'],
+					)
+				)
+			);
+		}
+
+		rewind( $output );
+		$csv = stream_get_contents( $output );
+		fclose( $output ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+
+		return $csv;
+	}
+
+	/**
+	 * Sanitize a single CSV cell to prevent formula injection.
+	 *
+	 * Prefixes values starting with dangerous characters (=, +, -, @, \t, \r)
+	 * with a single quote so spreadsheet apps do not interpret them as formulas.
+	 *
+	 * @param string $value Cell value.
+	 * @return string Sanitized value.
+	 */
+	private function sanitize_csv_cell( $value ) {
+		if ( ! is_string( $value ) || '' === $value ) {
+			return $value;
+		}
+		// Strip leading whitespace/newlines that could bypass the prefix check.
+		$trimmed = ltrim( $value, " \t\n\r\0\x0B" );
+		if ( '' !== $trimmed && in_array( $trimmed[0], array( '=', '+', '-', '@', "\t", "\r", "\n" ), true ) ) {
+			return "'" . $value;
+		}
+		return $value;
+	}
+
+	/**
+	 * Get detailed consent statistics: daily breakdown, totals, and per-category acceptance.
+	 *
+	 * @param int $days Number of days to look back.
+	 * @return array {
+	 *     @type array      $daily      Daily breakdown with date, accepted, rejected, partial, total.
+	 *     @type array      $totals     Overall totals for the period.
+	 *     @type array      $categories Per-category yes/no counts.
+	 * }
+	 */
+	public function get_consent_stats( $days = 30 ) {
+		global $wpdb;
+
+		$table  = $this->get_table_name();
+		$days   = absint( $days );
+		// Use PHP-computed cutoff with current_time() for consistency with
+		// how created_at is stored (via current_time('mysql') in log_consent).
+		$cutoff = gmdate( 'Y-m-d H:i:s', strtotime( '-' . $days . ' days', strtotime( current_time( 'mysql' ) ) ) );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- The three queries below all read from the plugin-prefix custom $table with $cutoff bound via prepare(%s); they power the admin dashboard's live aggregate and must not be cached.
+
+		// Daily consent breakdown.
+		$daily = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT DATE(created_at) as date,
+						SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) as accepted,
+						SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
+						SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) as partial,
+						COUNT(*) as total
+				 FROM {$table}
+				 WHERE created_at >= %s
+				 GROUP BY DATE(created_at)
+				 ORDER BY date ASC",
+				$cutoff
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $daily ) ) {
+			$daily = array();
+		}
+
+		// Overall totals.
+		$totals = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT COUNT(*) as total,
+						SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) as accepted,
+						SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
+						SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) as partial
+				 FROM {$table}
+				 WHERE created_at >= %s",
+				$cutoff
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $totals ) ) {
+			$totals = array(
+				'total'    => 0,
+				'accepted' => 0,
+				'rejected' => 0,
+				'partial'  => 0,
+			);
+		}
+
+		// Per-category acceptance rates — parse the JSON categories column.
+		$category_rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT categories FROM {$table}
+				 WHERE created_at >= %s
+				 AND categories IS NOT NULL AND categories != ''",
+				$cutoff
+			),
+			ARRAY_A
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		$cat_counts = array();
+		if ( is_array( $category_rows ) ) {
+			foreach ( $category_rows as $row ) {
+				$cats = json_decode( $row['categories'], true );
+				if ( ! is_array( $cats ) ) {
+					continue;
+				}
+				foreach ( $cats as $cat => $value ) {
+					$cat = sanitize_text_field( $cat );
+					if ( ! isset( $cat_counts[ $cat ] ) ) {
+						$cat_counts[ $cat ] = array( 'yes' => 0, 'no' => 0 );
+					}
+					if ( 'yes' === $value ) {
+						$cat_counts[ $cat ]['yes']++;
+					} else {
+						$cat_counts[ $cat ]['no']++;
+					}
+				}
+			}
+		}
+
+		return array(
+			'daily'      => $daily,
+			'totals'     => $totals,
+			'categories' => $cat_counts,
+		);
+	}
+
+	/**
+	 * Cleanup old consent logs beyond a given retention period.
+	 *
+	 * @param int $months Number of months to retain. Logs older than this are deleted.
+	 * @return int Number of rows deleted.
+	 */
+	public function cleanup_old_logs( $months = 12 ) {
+		global $wpdb;
+
+		$table    = $this->get_table_name();
+		$months   = absint( $months );
+		$cutoff   = gmdate( 'Y-m-d H:i:s', strtotime( "-{$months} months" ) );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is plugin-prefix; $cutoff is bound via prepare(%s). Retention cleanup writes — caching irrelevant for DELETE.
+		$deleted = $wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$table} WHERE created_at < %s", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$cutoff
+			)
+		);
+
+		return (int) $deleted;
+	}
+}

@@ -1,0 +1,159 @@
+{
+    "name": "Dark Professional",
+    "description": "Dark theme with professional appearance.",
+    "preview": "dark",
+    "config": {
+        "type": "banner",
+        "position": "bottom",
+        "theme": "dark",
+        "preferenceCenterType": "popup",
+        "notice": {
+            "styles": {
+                "background-color": "#1f2937",
+                "border-color": "#374151",
+                "color": "#d1d5db"
+            },
+            "elements": {
+                "title": { "styles": { "color": "#f9fafb" } },
+                "description": { "styles": { "color": "#9ca3af" } },
+                "buttons": {
+                    "elements": {
+                        "accept": {
+                            "styles": {
+                                "background-color": "#3b82f6",
+                                "color": "#ffffff",
+                                "border-color": "#3b82f6"
+                            }
+                        },
+                        "reject": {
+                            "styles": {
+                                "background-color": "transparent",
+                                "color": "#d1d5db",
+                                "border-color": "#4b5563"
+                            }
+                        },
+                        "settings": {
+                            "styles": {
+                                "background-color": "transparent",
+                                "color": "#9ca3af",
+                                "border-color": "transparent"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "preferenceCenter": {
+            "styles": {
+                "color": "#d1d5db",
+                "background-color": "#1f2937",
+                "border-color": "#374151"
+            },
+            "elements": {
+                "title": { "styles": { "color": "#f9fafb" } },
+                "description": { "styles": { "color": "#9ca3af" } },
+                "categories": {
+                    "elements": {
+                        "title": { "styles": { "color": "#e5e7eb" } },
+                        "description": { "styles": { "color": "#9ca3af" } },
+                        "toggle": {
+                            "states": {
+                                "active": { "styles": { "background-color": "#3b82f6" } },
+                                "inactive": { "styles": { "background-color": "#4b5563" } },
+                                "alwaysActive": { "styles": { "background-color": "#3b82f6" } }
+                            }
+                        }
+                    }
+                },
+                "buttons": {
+                    "elements": {
+                        "accept": {
+                            "styles": {
+                                "color": "#ffffff",
+                                "background-color": "#3b82f6",
+                                "border-color": "#3b82f6"
+                            }
+                        },
+                        "reject": {
+                            "styles": {
+                                "color": "#e5e7eb",
+                                "background-color": "transparent",
+                                "border-color": "#4b5563"
+                            }
+                        },
+                        "save": {
+                            "styles": {
+                                "color": "#e5e7eb",
+                                "background-color": "transparent",
+                                "border-color": "#4b5563"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "categoryPreview": {
+            "elements": {
+                "title": { "styles": { "color": "#e5e7eb" } },
+                "toggle": {
+                    "states": {
+                        "active": { "styles": { "background-color": "#3b82f6" } },
+                        "inactive": { "styles": { "background-color": "#4b5563" } },
+                        "alwaysActive": { "styles": { "background-color": "#3b82f6" } }
+                    }
+                },
+                "buttons": {
+                    "elements": {
+                        "save": {
+                            "styles": {
+                                "color": "#e5e7eb",
+                                "background-color": "transparent",
+                                "border-color": "#4b5563"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "optoutPopup": {
+            "styles": {
+                "color": "#d1d5db",
+                "background-color": "#1f2937",
+                "border-color": "#374151"
+            },
+            "elements": {
+                "title": { "styles": { "color": "#f9fafb" } },
+                "description": { "styles": { "color": "#9ca3af" } },
+                "optOption": {
+                    "elements": {
+                        "toggle": {
+                            "states": {
+                                "active": { "styles": { "background-color": "#3b82f6" } },
+                                "inactive": { "styles": { "background-color": "#4b5563" } }
+                            }
+                        },
+                        "title": { "styles": { "color": "#e5e7eb" } }
+                    }
+                },
+                "buttons": {
+                    "elements": {
+                        "confirm": {
+                            "styles": {
+                                "color": "#ffffff",
+                                "background-color": "#3b82f6",
+                                "border-color": "#3b82f6"
+                            }
+                        },
+                        "cancel": {
+                            "styles": {
+                                "color": "#e5e7eb",
+                                "background-color": "transparent",
+                                "border-color": "#4b5563"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

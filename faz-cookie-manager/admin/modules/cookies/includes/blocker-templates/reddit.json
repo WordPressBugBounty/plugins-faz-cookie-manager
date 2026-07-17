@@ -1,0 +1,16 @@
+{
+    "id": "reddit",
+    "name": "Reddit Pixel",
+    "description": "Blocks Reddit Pixel marketing pixels, conversion tracking, and ad-targeting cookies.",
+    "category": "marketing",
+    "patterns": [
+        "reddit.com/r",
+        "redd.it",
+        "www.redditstatic.com/ads/",
+        "rdt(",
+        "alb.reddit.com"
+    ],
+    "cookies": [
+        "_rdt_uuid"
+    ]
+}

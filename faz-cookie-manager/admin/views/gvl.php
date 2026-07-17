@@ -1,0 +1,57 @@
+<?php
+/**
+ * FAZ Cookie Manager — GVL (Global Vendor List) Admin Page
+ *
+ * @package FazCookie\Admin
+ */
+
+defined( 'ABSPATH' ) || exit;
+?>
+<div id="faz-gvl">
+
+	<div class="faz-card">
+		<div class="faz-card-header" style="display:flex;align-items:center;justify-content:space-between;">
+			<h3><?php esc_html_e( 'Global Vendor List (IAB TCF 2.3)', 'faz-cookie-manager' ); ?></h3>
+			<button class="faz-btn faz-btn-secondary faz-btn-sm" id="faz-gvl-download" type="button"><?php esc_html_e( 'Update GVL Now', 'faz-cookie-manager' ); ?></button>
+		</div>
+		<div class="faz-card-body">
+			<div id="faz-gvl-meta" style="padding:10px;border-radius:6px;background:var(--faz-bg-secondary);margin-bottom:16px;">
+				<span style="color:var(--faz-text-secondary);"><?php esc_html_e( 'Loading GVL status…', 'faz-cookie-manager' ); ?></span>
+			</div>
+		</div>
+	</div>
+
+	<div class="faz-card">
+		<div class="faz-card-header">
+			<h3><?php esc_html_e( 'Vendor Selection', 'faz-cookie-manager' ); ?></h3>
+		</div>
+		<div class="faz-card-body">
+			<div style="display:flex;gap:12px;margin-bottom:16px;align-items:center;">
+				<input type="text" id="faz-gvl-search" class="faz-input" placeholder="<?php esc_attr_e( 'Search vendors…', 'faz-cookie-manager' ); ?>" aria-label="<?php esc_attr_e( 'Search vendors', 'faz-cookie-manager' ); ?>" style="flex:1;max-width:300px;">
+				<select id="faz-gvl-purpose-filter" class="faz-input" aria-label="<?php esc_attr_e( 'Filter by purpose', 'faz-cookie-manager' ); ?>" style="width:auto;">
+					<option value="0"><?php esc_html_e( 'All purposes', 'faz-cookie-manager' ); ?></option>
+				</select>
+				<span id="faz-gvl-selected-count" aria-live="polite" style="color:var(--faz-text-secondary);white-space:nowrap;"></span>
+			</div>
+
+			<div style="margin-bottom:8px;">
+				<label for="faz-gvl-select-all" style="cursor:pointer;font-weight:600;">
+					<input type="checkbox" id="faz-gvl-select-all"> <?php esc_html_e( 'Select all on this page', 'faz-cookie-manager' ); ?>
+				</label>
+			</div>
+
+			<div id="faz-gvl-vendor-list"></div>
+
+			<div id="faz-gvl-pagination" style="display:flex;gap:8px;align-items:center;justify-content:center;margin-top:16px;"></div>
+
+			<div style="margin-top:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+				<button class="faz-btn faz-btn-primary" id="faz-gvl-save" type="button"><?php esc_html_e( 'Save Selection', 'faz-cookie-manager' ); ?></button>
+				<?php // Disabled by default — gvl.js re-enables it in loadSelectedVendors().then()/.catch() once the saved selection has hydrated, so a click during hydration can't wipe the auto-detected selection (defense-in-depth for the F008 race). ?>
+				<button class="faz-btn faz-btn-secondary" id="faz-gvl-auto-detect" type="button" disabled title="<?php esc_attr_e( 'Pre-tick vendors whose tracking domains were found by the cookie scanner. You still need to click Save Selection to apply.', 'faz-cookie-manager' ); ?>"><?php esc_html_e( 'Auto-detect from cookie scan', 'faz-cookie-manager' ); ?></button>
+				<?php // Render the hydrating message server-side so the disabled control has accessible context even before gvl.js runs; the script overwrites it on init via setAutoDetectStatus(). ?>
+				<span id="faz-gvl-auto-detect-status" aria-live="polite" aria-atomic="true" style="color:var(--faz-text-secondary);"><?php esc_html_e( 'Loading saved selection…', 'faz-cookie-manager' ); ?></span>
+			</div>
+		</div>
+	</div>
+
+</div>

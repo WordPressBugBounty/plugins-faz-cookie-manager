@@ -1,0 +1,553 @@
+<?php
+/**
+ * Class Category_Controller file.
+ *
+ * @package FazCookie
+ */
+
+namespace FazCookie\Admin\Modules\Cookies\Includes;
+
+use FazCookie\Includes\Base_Controller;
+use FazCookie\Includes\Cache;
+use FazCookie\Admin\Modules\Cookies\Includes\Cookie_Controller;
+use FazCookie\Admin\Modules\Cookies\Includes\Cookie;
+use stdClass;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit; // Exit if accessed directly.
+}
+
+/**
+ * Handles Cookies Operation
+ *
+ * @class       Category_Controller
+ * @version     3.0.0
+ * @package     FazCookie
+ */
+class Category_Controller extends Base_Controller {
+
+	/**
+	 * Instance of the current class
+	 *
+	 * @var object
+	 */
+	private static $instance;
+
+	/**
+	 * Cache group
+	 *
+	 * @var string
+	 */
+	protected $cache_group = 'categories';
+
+	/**
+	 * Table versioning option name.
+	 *
+	 * @var string
+	 */
+	protected $table_option = 'cookie_category';
+
+	/**
+	 * Cateogory identifier key.
+	 *
+	 * @var string
+	 */
+	protected $id = 'category_id';
+	/**
+	 * Return the current instance of the class
+	 *
+	 * @return object
+	 */
+	public static function get_instance() {
+		if ( null === self::$instance ) {
+			self::$instance = new self();
+		}
+		return self::$instance;
+	}
+
+	/**
+	 * Return a list of Cookies tables
+	 *
+	 * @return array Cookies tables.
+	 */
+	protected function get_tables() {
+		global $wpdb;
+		$tables = array(
+			"{$wpdb->prefix}faz_cookie_categories",
+		);
+		return $tables;
+	}
+
+	/**
+	 * Get table schema
+	 *
+	 * @return string
+	 */
+	protected function get_schema() {
+		global $wpdb;
+
+		// CPRA §1798.140 distinguishes a "sale" (disclosure for monetary or other
+		// valuable consideration) from "sharing" (disclosure for cross-context
+		// behavioural advertising). Both carry an opt-out right, surfaced together
+		// as the single "Do Not Sell or Share My Personal Information" control, so
+		// a category is opt-out-able (denied once the visitor opts out, and
+		// flagged ccpaDoNotSell on the frontend) when EITHER flag is set:
+		//   - sell_personal_data: the category's data may be SOLD.
+		//   - share_personal_data: the category's data may be SHARED for
+		//     cross-context behavioural advertising.
+		// Both default to 1 so a new category is opt-out-able by default (the
+		// frontend exempts a category only when it is `necessary` OR neither sold
+		// nor shared). dbDelta adds share_personal_data to existing installs with
+		// default 1 on the next schema pass.
+		$collate = '';
+
+		if ( $wpdb->has_cap( 'collation' ) ) {
+			$collate = $wpdb->get_charset_collate();
+		}
+
+		$tables = "
+		CREATE TABLE {$wpdb->prefix}faz_cookie_categories (
+			category_id bigint(20) NOT NULL AUTO_INCREMENT,
+			name text NOT NULL,
+			slug varchar(190) NOT NULL DEFAULT '',
+			description longtext NOT NULL,
+			prior_consent int(11) NOT NULL default 0,
+			visibility int(11) NOT NULL default 1,
+			priority int(11) NOT NULL default 0,
+			sell_personal_data int(11) NOT NULL default 1,
+			share_personal_data int(11) NOT NULL default 1,
+			meta longtext NULL,
+			date_created datetime NOT NULL DEFAULT '0000-00-00 00:00:00',
+			date_modified datetime NOT NULL DEFAULT '0000-00-00 00:00:00',
+			PRIMARY KEY (category_id),
+			UNIQUE KEY slug (slug)
+	  ) ENGINE=InnoDB $collate;
+      ";
+		return $tables;
+	}
+
+	/**
+	 * Get a list of banners from localhost.
+	 *
+	 * @param array $args Array of arguments.
+	 * @return array
+	 */
+	public function get_item_from_db( $args = array() ) {
+
+		global $wpdb;
+		$items = array();
+		if ( false === $this->data_exist() ) {
+			return $items;
+		}
+		if ( isset( $args['id'] ) && '' !== $args['id'] ) {
+			$results = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM `{$wpdb->prefix}faz_cookie_categories` WHERE `category_id` = %d", absint( $args['id'] ) ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		} else {
+			$results = $wpdb->get_results( "SELECT * FROM `{$wpdb->prefix}faz_cookie_categories`" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		}
+		if ( isset( $results ) && ! empty( $results ) ) {
+			if ( true === is_array( $results ) ) {
+				// Batch-load all cookies in one query to avoid N+1.
+				$cookies_by_cat = $this->get_all_cookies_grouped();
+				foreach ( $results as $data ) {
+					$item = $this->prepare_item( $data );
+					if ( ! empty( $item ) ) {
+						$item->cookies               = isset( $cookies_by_cat[ $item->category_id ] ) ? $cookies_by_cat[ $item->category_id ] : array();
+						$items[ $item->{$this->id} ] = $item;
+					}
+				}
+			} else {
+				$items = $this->prepare_item( $results );
+				if ( ! empty( $items ) ) {
+					$items->cookies = $this->get_cookies( $results->category_id );
+				}
+			}
+		}
+		return $items;
+	}
+
+	/**
+	 * Batch-load all cookies grouped by category ID (avoids N+1).
+	 *
+	 * @return array<int, array> Category ID => array of prepared cookie data.
+	 */
+	private function get_all_cookies_grouped() {
+		$all_cookies = Cookie_Controller::get_instance()->get_item_from_db();
+		$grouped     = array();
+		foreach ( $all_cookies as $cookie ) {
+			$object = new Cookie( $cookie );
+			$cat_id = isset( $cookie->category ) ? (int) $cookie->category : 0;
+			if ( ! isset( $grouped[ $cat_id ] ) ) {
+				$grouped[ $cat_id ] = array();
+			}
+			$grouped[ $cat_id ][] = $object->get_prepared_data();
+		}
+		return $grouped;
+	}
+
+	/**
+	 * Create a new category
+	 *
+	 * @param object $object Category object.
+	 * @return void
+	 */
+	public function create_item( $object ) {
+		global $wpdb;
+		$date_created = current_time( 'mysql' );
+		$object->set_date_created( $date_created );
+		$object->set_date_modified( $date_created );
+
+		$wpdb->insert( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			$wpdb->prefix . 'faz_cookie_categories',
+			array(
+				'name'               => wp_json_encode( $object->get_name() ),
+				'slug'               => $object->get_slug(),
+				'description'        => wp_json_encode( $object->get_description() ),
+				'prior_consent'      => ( true === $object->get_prior_consent() ? 1 : 0 ),
+				'visibility'         => ( true === $object->get_visibility() ? 1 : 0 ),
+				'priority'           => $object->get_priority(),
+				'sell_personal_data' => ( true === $object->get_sell_personal_data() ? 1 : 0 ),
+				'share_personal_data' => ( true === $object->get_share_personal_data() ? 1 : 0 ),
+				'meta'               => wp_json_encode( $object->get_meta() ),
+				'date_created'       => $object->get_date_created(),
+				'date_modified'      => $object->get_date_modified(),
+			),
+			array(
+				'%s',
+				'%s',
+				'%s',
+				'%d',
+				'%d',
+				'%d',
+				'%d',
+				'%d',
+				'%s',
+				'%s',
+				'%s',
+			)
+		);
+		$object->set_id( $wpdb->insert_id );
+		$this->delete_cache();
+		do_action( 'faz_after_update_cookie_category' );
+	}
+
+	/**
+	 * Update an existing category on a local db.
+	 *
+	 * @param object $object category object.
+	 * @return void
+	 */
+	public function update_item( $object ) {
+		global $wpdb;
+		$date_modified = current_time( 'mysql' );
+		$object->set_date_modified( $date_modified );
+		$wpdb->update( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			$wpdb->prefix . 'faz_cookie_categories',
+			array(
+				'name'               => wp_json_encode( $object->get_name() ),
+				'slug'               => $object->get_slug(),
+				'description'        => wp_json_encode( $object->get_description() ),
+				'prior_consent'      => ( true === $object->get_prior_consent() ? 1 : 0 ),
+				'visibility'         => ( true === $object->get_visibility() ? 1 : 0 ),
+				'priority'           => $object->get_priority(),
+				'sell_personal_data' => ( true === $object->get_sell_personal_data() ? 1 : 0 ),
+				'share_personal_data' => ( true === $object->get_share_personal_data() ? 1 : 0 ),
+				'meta'               => wp_json_encode( $object->get_meta() ),
+				'date_modified'      => $date_modified,
+			),
+			array( 'category_id' => $object->get_id() ),
+			array(
+				'%s',
+				'%s',
+				'%s',
+				'%d',
+				'%d',
+				'%d',
+				'%d',
+				'%d',
+				'%s',
+				'%s',
+			)
+		);
+		$this->delete_cache();
+		if ( defined( 'FAZ_BULK_REQUEST' ) && FAZ_BULK_REQUEST ) {
+			return;
+		}
+		do_action( 'faz_after_update_cookie_category' );
+	}
+
+	/**
+	 * Properly sanitize category data before sending to the controllers.
+	 *
+	 * @param object $item Category raw data.
+	 * @return object|false
+	 */
+	public function prepare_item( $item ) {
+
+		if ( false === is_object( $item ) ) {
+			return false;
+		}
+		$object                     = new stdClass();
+		$object->category_id        = isset( $item->category_id ) ? absint( $item->category_id ) : 0;
+		$object->name               = isset( $item->name ) ? $this->prepare_json( $item->name ) : '';
+		$object->slug               = isset( $item->slug ) ? sanitize_text_field( $item->slug ) : '';
+		$object->description        = isset( $item->description ) ? $this->prepare_json( $item->description ) : '';
+		$object->prior_consent      = isset( $item->prior_consent ) ? absint( $item->prior_consent ) : '';
+		$object->priority           = isset( $item->priority ) ? absint( $item->priority ) : '';
+		$object->visibility         = isset( $item->visibility ) ? absint( $item->visibility ) : 0;
+		$object->sell_personal_data = isset( $item->sell_personal_data ) ? absint( $item->sell_personal_data ) : 1;
+		$object->share_personal_data = isset( $item->share_personal_data ) ? absint( $item->share_personal_data ) : 1;
+		$object->meta               = isset( $item->meta ) ? $this->prepare_json( $item->meta ) : '';
+		$object->date_created       = isset( $item->date_created ) ? sanitize_text_field( $item->date_created ) : '';
+		$object->date_modified      = isset( $item->date_modified ) ? sanitize_text_field( $item->date_modified ) : '';
+		return $object;
+	}
+
+	/**
+	 * Delete a category from database.
+	 *
+	 * @param object $object Category object.
+	 * @return void
+	 */
+	public function delete_item( $object ) {
+		global $wpdb;
+		$category_id = absint( $object->get_id() );
+		if ( ! $category_id ) {
+			return;
+		}
+		// When called from the REST API, the object has only set_id() — get_loaded()
+		// is false because read() was never called. In that case fetch the slug
+		// directly so the protection check below still works correctly.
+		if ( method_exists( $object, 'get_loaded' ) && ! $object->get_loaded() ) {
+			$row = $wpdb->get_row( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				$wpdb->prepare(
+					"SELECT slug FROM {$wpdb->prefix}faz_cookie_categories WHERE category_id = %d",
+					$category_id
+				)
+			);
+			if ( ! $row ) {
+				return;
+			}
+			$slug = sanitize_text_field( $row->slug );
+		} else {
+			$slug = (string) $object->get_slug();
+		}
+
+		// Protect built-in non-removable categories. The `necessary` and
+		// `uncategorized` slugs are referenced by the consent flow and the
+		// scanner respectively; deleting either silently breaks the
+		// scanner's auto-categorisation pipeline and the necessary-toggle
+		// non-disableable invariant on the frontend banner. Refuse at
+		// the controller layer — REST callers receive a clear error
+		// instead of a 200 with stale state.
+		if ( in_array( $slug, array( 'necessary', 'uncategorized' ), true ) ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- defensive no-op if no transaction is open.
+			throw new \RuntimeException(
+				sprintf( 'Refusing to delete protected built-in category "%s".', esc_html( $slug ) )
+			);
+		}
+
+		$fallback_id = $this->get_fallback_category_id( $category_id );
+		if ( null === $fallback_id ) {
+			return;
+		}
+
+		$transaction_started = false !== $wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		if ( ! $transaction_started ) {
+			return;
+		}
+		if ( $fallback_id ) {
+			$cookie_result = $wpdb->update( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				$wpdb->prefix . 'faz_cookies',
+				array( 'category' => $fallback_id ),
+				array( 'category' => $category_id ),
+				array( '%d' ),
+				array( '%d' )
+			);
+		} else {
+			$cookie_result = $wpdb->delete( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				$wpdb->prefix . 'faz_cookies',
+				array( 'category' => $category_id ),
+				array( '%d' )
+			);
+		}
+		if ( false === $cookie_result ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			return;
+		}
+		$deleted = $wpdb->delete( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			$wpdb->prefix . 'faz_cookie_categories',
+			array(
+				'category_id' => $category_id,
+			),
+			array( '%d' )
+		);
+		if ( false === $deleted ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			return;
+		}
+		if ( false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			return;
+		}
+		$this->delete_cache();
+		Cookie_Controller::get_instance()->delete_cache();
+		do_action( 'faz_after_update_cookie_category' );
+		do_action( 'faz_after_delete_cookie_category' );
+	}
+
+	/**
+	 * Pick a fallback category for cookies when deleting a category.
+	 *
+	 * Prefer "uncategorized", then "necessary", then the first remaining category.
+	 *
+	 * @param int $deleted_category_id Category being deleted.
+	 * @return int|null
+	 */
+	private function get_fallback_category_id( $deleted_category_id ) {
+		global $wpdb;
+		$rows = $wpdb->get_results( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			"SELECT category_id, slug FROM {$wpdb->prefix}faz_cookie_categories WHERE category_id <> %d ORDER BY category_id ASC",
+			absint( $deleted_category_id )
+		) );
+
+		if ( ! is_array( $rows ) ) {
+			return null; // Query error — don't delete cookies.
+		}
+		if ( empty( $rows ) ) {
+			return 0; // No other categories.
+		}
+
+		$fallbacks = array(
+			'uncategorized' => 0,
+			'necessary'     => 0,
+			'first'         => 0,
+		);
+
+		foreach ( $rows as $row ) {
+			$id   = (int) $row->category_id;
+			$slug = $row->slug;
+			if ( ! $fallbacks['first'] ) {
+				$fallbacks['first'] = $id;
+			}
+			if ( 'uncategorized' === $slug ) {
+				$fallbacks['uncategorized'] = $id;
+			}
+			if ( 'necessary' === $slug ) {
+				$fallbacks['necessary'] = $id;
+			}
+		}
+
+		return $fallbacks['uncategorized'] ?: $fallbacks['necessary'] ?: $fallbacks['first'];
+	}
+
+	/**
+	 * Get contents by language.
+	 *
+	 * @return array
+	 */
+	public static function get_defaults() {
+		$contents = wp_cache_get( 'faz_category_contents_en', 'faz_category_contents' );
+		if ( ! $contents ) {
+			$contents = faz_read_json_file( dirname( __FILE__ ) . '/contents/categories/en.json' );
+			wp_cache_set( 'faz_category_contents_en', $contents, 'faz_category_contents', 12 * HOUR_IN_SECONDS );
+		}
+		return $contents;
+	}
+	/**
+	 * Load default cookies.
+	 *
+	 * @return void
+	 */
+	protected function load_default() {
+		$categories = self::get_defaults();
+		$lang       = faz_default_language();
+		foreach ( $categories as $slug => $category ) {
+			$object               = new \FazCookie\Admin\Modules\Cookies\Includes\Cookie_Categories();
+			$name[ $lang ]        = isset( $category['name'] ) ? $category['name'] : '';
+			$description[ $lang ] = isset( $category['description'] ) ? $category['description'] : '';
+			$object->set_name( $name );
+			$object->set_description( $description );
+			$object->set_slug( $slug );
+			// Only the strictly-necessary category may be pre-consented. The
+			// "uncategorized" bucket holds cookies the scanner could not classify
+			// — they may well be tracking/profiling cookies, so pre-ticking them
+			// (prior_consent=true) would load them before any affirmative action,
+			// which is a pre-consent violation (EDPB Guidelines 03/2022 / ePrivacy
+			// Art. 5(3)). uncategorized now defaults to denied until opt-in.
+			if ( 'necessary' === $slug ) {
+				$object->set_prior_consent( true );
+			}
+			// CCPA/CPRA sell/share defaults. The schema column defaults to 1
+			// (opt-out-able) so an unknown/scanner-imported cookie is treated
+			// conservatively, but the strictly-functional buckets are never
+			// "sold" or "shared for cross-context advertising": they serve the
+			// user-requested functionality of the site. Defaulting them to 1
+			// would make a "Do Not Sell or Share" / GPC opt-out switch off
+			// language/preference/internal cookies with no privacy gain — pure
+			// over-blocking. Seed them at 0; the admin can still flip any
+			// category in the Cookies UI if their setup genuinely sells it.
+			if ( in_array( $slug, array( 'necessary', 'functional', 'wordpress-internal' ), true ) ) {
+				$object->set_sell_personal_data( false );
+				$object->set_share_personal_data( false );
+			}
+			$object->save();
+		}
+	}
+
+	/**
+	 * Decode a JSON string if necessary
+	 *
+	 * @param string $data String data.
+	 * @return array
+	 */
+	public function prepare_json( $data ) {
+		if ( empty( $data ) ) {
+			return array();
+		}
+		return is_string( $data ) ? json_decode( $data, true ) : $data;
+	}
+
+	/**
+	 * Load items from the cache.
+	 *
+	 * @param boolean $id Category ID.
+	 * @return array|object|false
+	 */
+	protected function get_cache( $id = false ) {
+		$key        = 'all';
+		$categories = array();
+		$items      = Cache::get( $key, $this->cache_group );
+		if ( false === $items ) {
+			return false;
+		}
+		if ( ! empty( $items ) ) {
+			foreach ( $items as $data ) {
+				$item = $this->prepare_item( $data );
+				if ( ! empty( $item ) ) {
+					$item->cookies                    = $data->cookies;
+					$categories[ $item->category_id ] = $item;
+				}
+			}
+		}
+		return isset( $id ) && isset( $categories[ $id ] ) ? $categories[ $id ] : $categories;
+	}
+
+	/**
+	 * Get cookies of each category.
+	 *
+	 * @param string|int $category Category slug or id.
+	 * @return array
+	 */
+	public function get_cookies( $category = '' ) {
+		$cookies = array();
+		if ( empty( $category ) ) {
+			return array();
+		}
+		$items = Cookie_Controller::get_instance()->get_items_by_category( $category );
+		foreach ( $items as $data ) {
+			$object    = new Cookie( $data );
+			$cookies[] = $object->get_prepared_data();
+		}
+		return $cookies;
+	}
+}

@@ -1,0 +1,416 @@
+<?php
+/**
+ * Placeholder builder for blocked third-party content.
+ *
+ * Generates branded, accessible placeholder HTML when iframes, oEmbeds,
+ * or social embeds are blocked pending cookie consent.
+ *
+ * @package FazCookie\Frontend\Includes
+ */
+
+namespace FazCookie\Frontend\Includes;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+/**
+ * Class Placeholder_Builder
+ */
+class Placeholder_Builder {
+
+	/**
+	 * Service icons as inline SVG paths (compact, 24x24 viewBox).
+	 *
+	 * @var array<string,string>
+	 */
+	private static $service_icons = array(
+		'youtube'     => '<path d="M23.5 6.2c-.3-1-1-1.8-2-2.1C19.6 3.5 12 3.5 12 3.5s-7.6 0-9.5.6c-1 .3-1.8 1-2 2.1C0 8.1 0 12 0 12s0 3.9.5 5.8c.3 1 1 1.8 2 2.1 1.9.6 9.5.6 9.5.6s7.6 0 9.5-.6c1-.3 1.8-1 2-2.1.5-1.9.5-5.8.5-5.8s0-3.9-.5-5.8zM9.5 15.6V8.4l6.3 3.6-6.3 3.6z" fill="#FF0000"/>',
+		'vimeo'       => '<path d="M22.9 6.2c-.1 2.2-1.6 5.1-4.7 8.9C15 18.9 12.4 20.5 10.2 20.5c-1.4 0-2.5-1.3-3.4-3.8L5 9.5C4.4 7 3.7 5.7 3 5.7c-.2 0-.8.4-1.8 1.1L0 5.3 3.3 2.4c1.5-1.3 2.6-2 3.4-2 1.8-.2 2.9 1 3.3 3.6.4 2.8.7 4.5.9 5.2.5 2.3 1 3.4 1.7 3.4.5 0 1.2-.8 2.1-2.3.9-1.5 1.4-2.7 1.5-3.5.1-1.4-.4-2.1-1.5-2.1-.5 0-1.1.1-1.7.4 1.1-3.7 3.3-5.5 6.4-5.3 2.3.1 3.4 1.6 3.3 4.4z" fill="#1AB7EA"/>',
+		'google-maps' => '<path d="M12 2C8.1 2 5 5.1 5 9c0 5.2 7 13 7 13s7-7.8 7-13c0-3.9-3.1-7-7-7zm0 9.5c-1.4 0-2.5-1.1-2.5-2.5S10.6 6.5 12 6.5 14.5 7.6 14.5 9 13.4 11.5 12 11.5z" fill="#4285F4"/>',
+		'facebook'    => '<path d="M24 12c0-6.6-5.4-12-12-12S0 5.4 0 12c0 6 4.4 11 10.1 11.9v-8.4H7.1V12h3V9.4c0-3 1.8-4.7 4.5-4.7 1.3 0 2.7.2 2.7.2v3h-1.5c-1.5 0-2 .9-2 1.9V12h3.3l-.5 3.5h-2.8v8.4C19.6 23 24 18 24 12z" fill="#1877F2"/>',
+		'instagram'   => '<path d="M12 2.2c3.2 0 3.6 0 4.8.1 3.5.2 5.1 1.7 5.3 5.3.1 1.3.1 1.6.1 4.8 0 3.2 0 3.6-.1 4.8-.2 3.5-1.8 5.1-5.3 5.3-1.3.1-1.6.1-4.8.1-3.2 0-3.6 0-4.8-.1-3.5-.2-5.1-1.8-5.3-5.3-.1-1.3-.1-1.6-.1-4.8 0-3.2 0-3.6.1-4.8.2-3.5 1.8-5.1 5.3-5.3 1.3-.1 1.6-.1 4.8-.1zM12 0C8.7 0 8.3 0 7.1.1 2.7.3.3 2.7.1 7.1 0 8.3 0 8.7 0 12s0 3.7.1 4.9c.2 4.4 2.6 6.8 7 7 1.2.1 1.6.1 4.9.1s3.7 0 4.9-.1c4.4-.2 6.8-2.6 7-7 .1-1.2.1-1.6.1-4.9s0-3.7-.1-4.9c-.2-4.4-2.6-6.8-7-7C16.7 0 16.3 0 12 0zm0 5.8a6.2 6.2 0 100 12.4 6.2 6.2 0 000-12.4zM12 16a4 4 0 110-8 4 4 0 010 8zm6.4-10.8a1.4 1.4 0 100 2.8 1.4 1.4 0 000-2.8z" fill="#E4405F"/>',
+		'twitter'     => '<path d="M18.2 2h3.6l-7.9 9 9.3 12.3h-7.3l-5.7-7.4-6.5 7.4H.1l8.4-9.6L0 2h7.5l5.1 6.8L18.2 2zm-1.3 19.1h2L7.3 4H5.1l11.8 17.1z" fill="#000"/>',
+		'spotify'     => '<path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.6 0 12 0zm5.5 17.3c-.2.3-.6.4-.9.2-2.6-1.6-5.8-1.9-9.6-1.1-.4.1-.7-.2-.8-.5-.1-.4.2-.7.5-.8 4.2-.9 7.8-.5 10.6 1.2.4.2.4.7.2 1zm1.5-3.3c-.3.4-.8.5-1.2.3-3-1.8-7.5-2.4-11-1.3-.4.1-.9-.1-1-.6-.1-.4.1-.9.6-1 4-.1.2 8.9.7 12.2 2.5.3.2.5.8.2 1.1zm.1-3.4C15.3 8.4 8.9 8.2 5.2 9.3c-.5.2-1-.2-1.2-.7-.2-.5.2-1 .7-1.2 4.3-1.3 11.4-1 15.9 1.5.5.3.6.9.4 1.3-.3.5-.9.6-1.3.4z" fill="#1DB954"/>',
+		'dailymotion' => '<path d="M12.1 2C6.5 2 2 6.5 2 12.1s4.5 10.1 10.1 10.1c2.4 0 4.7-.9 6.5-2.4v2h3.4V12.1C22 6.5 17.5 2 12.1 2zm0 16.1c-3.3 0-6-2.7-6-6s2.7-6 6-6 6 2.7 6 6-2.7 6-6 6z" fill="#00B2FF"/>',
+		'soundcloud'  => '<path d="M1.2 14.3c-.1 0-.2-.1-.2-.2l-.3-2.1.3-2.2c0-.1.1-.2.2-.2s.2.1.2.2l.4 2.2-.4 2.1c0 .1-.1.2-.2.2zm1.7.5c-.1 0-.2-.1-.3-.2L2.3 12l.3-3.1c0-.1.1-.2.3-.2.1 0 .2.1.2.2l.4 3.1-.4 2.6c0 .1-.1.2-.2.2zm1.7.2c-.1 0-.2-.1-.3-.3l-.3-2.7.3-3.7c0-.1.1-.3.3-.3.1 0 .2.1.3.3l.3 3.7-.3 2.7c0 .2-.1.3-.3.3zm1.8 0c-.2 0-.3-.1-.3-.3l-.3-2.7.3-4.2c0-.2.1-.3.3-.3s.3.1.3.3l.3 4.2-.3 2.7c0 .2-.1.3-.3.3zM8 15c-.2 0-.3-.2-.3-.3l-.3-2.7.3-4.5c0-.2.2-.3.3-.3.2 0 .3.2.3.3l.3 4.5-.3 2.7c-.1.2-.2.3-.3.3zm1.7.1c-.2 0-.4-.2-.4-.4l-.2-2.7.2-4.8c0-.2.2-.4.4-.4s.4.2.4.4l.2 4.8-.2 2.7c0 .2-.2.4-.4.4zm1.8 0c-.2 0-.4-.2-.4-.4L10.9 12l.2-5c0-.2.2-.4.4-.4.2 0 .4.2.4.4l.2 5-.2 2.7c0 .2-.2.4-.4.4zm2.2-.1c-.3 0-.4-.2-.5-.4l-.1-2.6.1-5c0-.3.2-.5.5-.5.2 0 .4.2.5.5l.1 5-.1 2.6c0 .3-.2.5-.5.5zM22 9c-.6 0-1.2.1-1.7.4-.3-3.2-3-5.7-6.3-5.7-.8 0-1.5.1-2.2.4-.3.1-.4.2-.4.5v10.1c0 .3.2.5.4.5h10.2c1.6 0 2.9-1.3 2.9-2.9 0-1.8-1.3-3.3-2.9-3.3z" fill="#FF5500"/>',
+		'twitch'      => '<path d="M11.6 11h-1.4V6.6h1.4V11zm3.8 0h-1.4V6.6h1.4V11zM7 1L3.4 4.6v14.8h4.2V23l3.6-3.6h2.8L21 12.6V1H7zm12.6 11l-2.8 2.8h-2.8L11.2 17.6v-2.8H7.6V2.4h12v9.6z" fill="#9146FF"/>',
+		'default'     => '<path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 18c-4.4 0-8-3.6-8-8s3.6-8 8-8 8 3.6 8 8-3.6 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z" fill="#666"/>',
+	);
+
+	/**
+	 * Brand accent colour per service — drives the placeholder CTA button via
+	 * the `--faz-svc-color` custom property so each blocked embed reads as the
+	 * right provider (YouTube red, Vimeo blue, …) instead of a single hard-coded
+	 * colour. No remote assets; pure CSS.
+	 *
+	 * @var array<string,string>
+	 */
+	private static $service_colors = array(
+		'youtube'     => '#ff0000',
+		'vimeo'       => '#1ab7ea',
+		'google-maps' => '#4285f4',
+		'facebook'    => '#1877f2',
+		'instagram'   => '#e4405f',
+		'twitter'     => '#1d1d1f',
+		'spotify'     => '#1db954',
+		'dailymotion' => '#00b2ff',
+		'soundcloud'  => '#ff5500',
+		'twitch'      => '#9146ff',
+		'default'     => '#0d6efd',
+	);
+
+	/**
+	 * Service IDs that are video platforms (used for aspect-ratio CSS class).
+	 *
+	 * @var array<int,string>
+	 */
+	private static $video_services = array(
+		'youtube', 'vimeo', 'dailymotion', 'twitch',
+		// Extended video embeds.
+		'tiktok', 'wistia', 'loom', 'streamable', 'rumble',
+	);
+
+	/**
+	 * Map URL fragments to service identifiers.
+	 *
+	 * @var array<string,string>
+	 */
+	private static $url_service_map = array(
+		'youtube.com'          => 'youtube',
+		'youtube-nocookie.com' => 'youtube',
+		'youtu.be'             => 'youtube',
+		'vimeo.com'            => 'vimeo',
+		'google.com/maps'      => 'google-maps',
+		'maps.google'          => 'google-maps',
+		'facebook.com'         => 'facebook',
+		'instagram.com'        => 'instagram',
+		'twitter.com'          => 'twitter',
+		// Host-anchored: a bare "x.com" substring also matches dropbox.com,
+		// netflix.com, mapbox.com, mailbox.com… — anchor to the host so only
+		// real x.com URLs resolve to Twitter/X.
+		'//x.com/'             => 'twitter',
+		'spotify.com'          => 'spotify',
+		'dailymotion.com'      => 'dailymotion',
+		'soundcloud.com'       => 'soundcloud',
+		'twitch.tv'            => 'twitch',
+		// Extended embed services. These have no bespoke brand icon and fall
+		// back to the default placeholder icon (see build()); only the URL→id
+		// mapping and the human name matter for the placeholder. Short link
+		// domains carry a trailing slash so `stripos` can't match them inside
+		// an unrelated host (e.g. "t.me/" won't match "content.medium.com").
+		'tiktok.com'           => 'tiktok',
+		'linkedin.com'         => 'linkedin',
+		'pinterest.com'        => 'pinterest',
+		'pin.it/'              => 'pinterest',
+		'reddit.com'           => 'reddit',
+		'redd.it/'             => 'reddit',
+		'tumblr.com'           => 'tumblr',
+		'flickr.com'           => 'flickr',
+		'threads.net'          => 'threads',
+		'bsky.app'             => 'bluesky',
+		't.me/'                => 'telegram',
+		'telegram.org'         => 'telegram',
+		'calendar.google.com'  => 'google-calendar',
+		'drive.google.com'     => 'google-drive',
+		'docs.google.com'      => 'google-docs',
+		'calendly.com'         => 'calendly',
+		'typeform.com'         => 'typeform',
+		'openstreetmap.org'    => 'openstreetmap',
+		'mapbox.com'           => 'mapbox',
+		'podcasts.apple.com'   => 'apple-podcasts',
+		'music.apple.com'      => 'apple-music',
+		'bandcamp.com'         => 'bandcamp',
+		'mixcloud.com'         => 'mixcloud',
+		'wistia.com'           => 'wistia',
+		'wistia.net'           => 'wistia',
+		'loom.com'             => 'loom',
+		'streamable.com'       => 'streamable',
+		'rumble.com'           => 'rumble',
+		'codepen.io'           => 'codepen',
+		'jsfiddle.net'         => 'jsfiddle',
+		'disqus.com'           => 'disqus',
+		'giphy.com'            => 'giphy',
+		'slideshare.net'       => 'slideshare',
+		'issuu.com'            => 'issuu',
+	);
+
+	/**
+	 * Map service IDs to human-readable names.
+	 *
+	 * @var array<string,string>
+	 */
+	private static $service_names = array(
+		'youtube'     => 'YouTube',
+		'vimeo'       => 'Vimeo',
+		'google-maps' => 'Google Maps',
+		'facebook'    => 'Facebook',
+		'instagram'   => 'Instagram',
+		'twitter'     => 'Twitter/X',
+		'spotify'     => 'Spotify',
+		'dailymotion' => 'Dailymotion',
+		'soundcloud'  => 'SoundCloud',
+		'twitch'      => 'Twitch',
+		// Extended embed services (default placeholder icon).
+		'tiktok'          => 'TikTok',
+		'linkedin'        => 'LinkedIn',
+		'pinterest'       => 'Pinterest',
+		'reddit'          => 'Reddit',
+		'tumblr'          => 'Tumblr',
+		'flickr'          => 'Flickr',
+		'threads'         => 'Threads',
+		'bluesky'         => 'Bluesky',
+		'telegram'        => 'Telegram',
+		'google-calendar' => 'Google Calendar',
+		'google-drive'    => 'Google Drive',
+		'google-docs'     => 'Google Docs',
+		'calendly'        => 'Calendly',
+		'typeform'        => 'Typeform',
+		'openstreetmap'   => 'OpenStreetMap',
+		'mapbox'          => 'Mapbox',
+		'apple-podcasts'  => 'Apple Podcasts',
+		'apple-music'     => 'Apple Music',
+		'bandcamp'        => 'Bandcamp',
+		'mixcloud'        => 'Mixcloud',
+		'wistia'          => 'Wistia',
+		'loom'            => 'Loom',
+		'streamable'      => 'Streamable',
+		'rumble'          => 'Rumble',
+		'codepen'         => 'CodePen',
+		'jsfiddle'        => 'JSFiddle',
+		'disqus'          => 'Disqus',
+		'giphy'           => 'GIPHY',
+		'slideshare'      => 'SlideShare',
+		'issuu'           => 'Issuu',
+	);
+
+	/**
+	 * Build a placeholder for blocked content.
+	 *
+	 * @param string $service_id     Service identifier (e.g., 'youtube', 'google-maps').
+	 * @param string $service_name   Human-readable name (e.g., 'YouTube').
+	 * @param string $category       Consent category slug.
+	 * @param string $blocked_html   Original blocked HTML (stored in <template> for JS restoration).
+	 * @param string $thumbnail_url  Optional thumbnail URL for video embeds.
+	 * @return string Placeholder HTML.
+	 */
+	public static function build( $service_id, $service_name, $category, $blocked_html, $thumbnail_url = '' ) {
+		$icon_svg = isset( self::$service_icons[ $service_id ] )
+			? self::$service_icons[ $service_id ]
+			: self::$service_icons['default'];
+
+		$has_thumb        = ! empty( $thumbnail_url );
+		$is_video_service = in_array( $service_id, self::$video_services, true );
+		$class            = 'faz-placeholder' . ( ( $has_thumb || $is_video_service ) ? ' faz-placeholder--video' : '' );
+		$brand            = isset( self::$service_colors[ $service_id ] ) ? self::$service_colors[ $service_id ] : self::$service_colors['default'];
+
+		$message = sprintf(
+			/* translators: %s: service name (e.g., "YouTube", "Google Maps") */
+			esc_html__( 'This content is blocked because %s cookies have not been accepted.', 'faz-cookie-manager' ),
+			esc_html( $service_name )
+		);
+
+		$button_text = esc_html__( 'Accept cookies', 'faz-cookie-manager' );
+
+		$html  = '<div class="' . esc_attr( $class ) . '" data-faz-category="' . esc_attr( $category ) . '" data-faz-service="' . esc_attr( $service_id ) . '" style="--faz-svc-color:' . esc_attr( $brand ) . '">';
+
+		if ( $has_thumb ) {
+			$html .= '<img class="faz-placeholder-thumb" src="' . esc_url( $thumbnail_url ) . '" alt="" loading="lazy"/>';
+		}
+
+		$html .= '<div class="faz-placeholder-overlay">';
+		$html .= '<svg class="faz-placeholder-icon" viewBox="0 0 24 24" width="32" height="32" xmlns="http://www.w3.org/2000/svg">' . $icon_svg . '</svg>';
+		if ( $is_video_service || $has_thumb ) {
+			$html .= '<span class="faz-placeholder-svcname">' . esc_html( $service_name ) . '</span>';
+		}
+		$html .= '<p class="faz-placeholder-msg">' . $message . '</p>';
+		$html .= '<button type="button" class="faz-placeholder-btn" data-faz-accept="' . esc_attr( $category ) . '" data-faz-accept-service="' . esc_attr( $service_id ) . '">' . $button_text . '</button>';
+		$html .= '</div>';
+
+		// Hidden original content for JS to restore after consent.
+		// Sanitize with wp_kses to prevent XSS from crafted oEmbed/post content.
+		$safe_html = wp_kses( $blocked_html, array_merge(
+			wp_kses_allowed_html( 'post' ),
+			array(
+				'iframe' => array(
+					'src' => true, 'data-faz-src' => true, 'data-faz-category' => true, 'data-faz-service' => true,
+					'width' => true, 'height' => true, 'frameborder' => true,
+					'allow' => true, 'allowfullscreen' => true, 'loading' => true,
+					'style' => true, 'class' => true, 'id' => true, 'title' => true,
+				),
+				'script' => array(
+					'type' => true, 'src' => true, 'data-faz-category' => true, 'data-faz-service' => true,
+					'data-faz-src' => true, 'async' => true, 'defer' => true,
+				),
+			)
+		) );
+		$html .= '<template class="faz-placeholder-content">' . $safe_html . '</template>';
+
+		$html .= '</div>';
+
+		return $html;
+	}
+
+	/**
+	 * Build a social-embed placeholder (no <template> — the original element
+	 * stays hidden as the next sibling in the DOM).
+	 *
+	 * @param string $service_id   Service identifier (e.g., 'facebook', 'instagram').
+	 * @param string $service_name Human-readable name.
+	 * @param string $category     Consent category slug.
+	 * @return string Placeholder HTML (placed before the hidden original element).
+	 */
+	public static function build_social( $service_id, $service_name, $category ) {
+		$icon_svg = isset( self::$service_icons[ $service_id ] )
+			? self::$service_icons[ $service_id ]
+			: self::$service_icons['default'];
+
+		$message = sprintf(
+			/* translators: %s: service name (e.g., "YouTube", "Google Maps") */
+			esc_html__( 'This content is blocked because %s cookies have not been accepted.', 'faz-cookie-manager' ),
+			esc_html( $service_name )
+		);
+
+		$button_text = esc_html__( 'Accept cookies', 'faz-cookie-manager' );
+
+		$html  = '<div class="faz-placeholder faz-placeholder--social faz-social-placeholder" data-faz-category="' . esc_attr( $category ) . '" data-faz-service="' . esc_attr( $service_id ) . '">';
+		$html .= '<div class="faz-placeholder-overlay">';
+		$html .= '<svg class="faz-placeholder-icon" viewBox="0 0 24 24" width="32" height="32" xmlns="http://www.w3.org/2000/svg">' . $icon_svg . '</svg>';
+		$html .= '<p class="faz-placeholder-msg">' . $message . '</p>';
+		$html .= '<button type="button" class="faz-placeholder-btn" data-faz-accept="' . esc_attr( $category ) . '" data-faz-accept-service="' . esc_attr( $service_id ) . '">' . $button_text . '</button>';
+		$html .= '</div>';
+		$html .= '</div>';
+
+		return $html;
+	}
+
+	/**
+	 * Detect service identifier from a URL.
+	 *
+	 * @param string $url URL to inspect.
+	 * @return string Service identifier (e.g. 'youtube') or 'default'.
+	 */
+	public static function detect_service_from_url( $url ) {
+		foreach ( self::$url_service_map as $domain => $id ) {
+			if ( false !== stripos( $url, $domain ) ) {
+				return $id;
+			}
+		}
+		return 'default';
+	}
+
+	/**
+	 * Whether a service id is an embedded third-party widget (video, social,
+	 * map, etc.) rendered as a blocked-embed placeholder.
+	 *
+	 * Such a service's cookies are set by the EMBED's own domain (e.g.
+	 * youtube.com), not the publisher's site, so the first-party cookie
+	 * shredder — which can only write `document.cookie` for the site's root
+	 * domain — can never delete them. Enforcement for these is necessarily at
+	 * the SERVICE level (allow/block the whole embed), not per individual
+	 * cookie. The preference center uses this to clarify that nested per-cookie
+	 * toggles for an embed are enforced by blocking the embed, not by deleting
+	 * the cookie one by one.
+	 *
+	 * The authoritative set is the union of the URL→service map (every iframe
+	 * embed the placeholder system recognises) and the video-service list.
+	 *
+	 * @param string $service_id Sanitised service identifier.
+	 * @return bool
+	 */
+	public static function is_embed_service( $service_id ) {
+		if ( '' === (string) $service_id ) {
+			return false;
+		}
+		$embed_ids = array_merge(
+			array_values( self::$url_service_map ),
+			self::$video_services
+		);
+		return in_array( $service_id, $embed_ids, true );
+	}
+
+	/**
+	 * Get human-readable service name from a service ID.
+	 *
+	 * @param string $service_id Service identifier.
+	 * @return string Human-readable name.
+	 */
+	public static function get_service_name( $service_id ) {
+		if ( isset( self::$service_names[ $service_id ] ) ) {
+			return self::$service_names[ $service_id ];
+		}
+		return __( 'third-party', 'faz-cookie-manager' );
+	}
+
+	/**
+	 * Extract a video thumbnail URL.
+	 *
+	 * Remote thumbnails are intentionally disabled so blocked embeds do not
+	 * trigger third-party requests before consent.
+	 *
+	 * @param string $url Video URL or iframe src.
+	 * @return string Thumbnail URL or empty string.
+	 */
+	public static function get_video_thumbnail( $url ) {
+		unset( $url );
+		return '';
+	}
+
+	/**
+	 * Return the placeholder CSS rules.
+	 *
+	 * Intended to be output once in the <head> via insert_styles().
+	 *
+	 * @return string Minified CSS.
+	 */
+	public static function get_css() {
+		return '.faz-placeholder{position:relative;width:100%;min-height:200px;background:#f6f7f9;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;box-sizing:border-box;margin:16px 0}'
+			. '.faz-placeholder *{box-sizing:border-box}'
+			/* When the blocked embed sits inside WordPress's responsive-embed */
+			/* wrapper (figure.wp-has-aspect-ratio), core already reserves the */
+			/* 16:9 height with a ::before padding-top hack and absolutely */
+			/* positions the iframe to fill it. Our placeholder replaced that */
+			/* iframe but stayed in normal flow, so its own height stacked on */
+			/* top of the reserved space and the figure rendered ~twice as */
+			/* tall (a large empty gap above the card). Fill the reserved box */
+			/* exactly the way core fills it for the iframe. Reported on */
+			/* wp.org ("youtube-38"). */
+			. '.wp-embed-responsive .wp-has-aspect-ratio .faz-placeholder{position:absolute;top:0;left:0;width:100%;height:100%;min-height:0;margin:0;aspect-ratio:auto}'
+			/* `min-height: 200px` (kept from the base rule) is the floor; */
+			/* `aspect-ratio: 16/9` applies on top so the placeholder gets a */
+			/* video-shaped height when its container provides a real width. */
+			/* The previous `min-height: 0` collapsed the placeholder to */
+			/* zero height when the host page-builder wrapper had `width: */
+			/* auto` and no flex/grid context to compute width from (Bricks */
+			/* Builder native Video element wraps the iframe in a flex */
+			/* container that collapses once we replace the iframe with our */
+			/* div). Reported in issue #87. */
+			/* `min-width: min(280px, 100%)` is scoped to the video variant */
+			/* only — the base placeholder must shrink to its container so */
+			/* it doesn't blow the layout out on narrow sidebars or sub- */
+			/* 320px viewports. The `min(280px, 100%)` form keeps a 280px */
+			/* readable floor when the container is wider, but yields to */
+			/* the container width when it is narrower (no horizontal */
+			/* overflow). */
+			/* Video variant: a neutral grey poster card that leads with the service brand mark (e.g. the red YouTube play button). Thumbnail intentionally not fetched (privacy). Pure CSS, no remote assets, no gradients. */
+			. '.faz-placeholder--video{min-width:min(280px,100%);aspect-ratio:16/9;background:#e9eaec;border:1px solid #d7d9dd}'
+			. '.faz-placeholder-thumb{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(4px) brightness(.7)}'
+			. '.faz-placeholder .faz-placeholder-overlay{position:relative;z-index:1;text-align:center;padding:32px 24px;color:#495057;max-width:420px;display:flex;flex-direction:column;align-items:center}'
+			. '.faz-placeholder--video .faz-placeholder-overlay{padding:24px}'
+			. '.faz-placeholder .faz-placeholder-icon{margin:0 auto 16px;display:block;opacity:.7}'
+			/* Icon becomes a circular play-style badge on the dark poster. */
+			. '.faz-placeholder--video .faz-placeholder-icon{width:62px;height:auto;opacity:1;margin:0 0 14px;background:none;filter:none;box-shadow:none;transition:transform .15s ease}'
+			. '.faz-placeholder--video:hover .faz-placeholder-icon{transform:scale(1.08)}'
+			. '.faz-placeholder .faz-placeholder-msg{margin:0 0 20px;font-size:14px;line-height:22px;max-width:340px;color:inherit;padding:0;letter-spacing:normal;word-spacing:normal}'
+			. '.faz-placeholder-svcname{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#51565e;margin:0 0 10px}.faz-placeholder--video .faz-placeholder-msg{color:#41454b}'
+			. '.faz-placeholder .faz-placeholder-btn{background:#0d6efd;color:#fff;border:none;padding:11px 28px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;transition:background .2s,transform .1s,box-shadow .2s;letter-spacing:.3px;line-height:normal;display:inline-block;text-decoration:none}'
+			. '.faz-placeholder .faz-placeholder-btn:hover{background:#0b5ed7;transform:translateY(-1px)}'
+			/* On the dark poster a solid white pill reads as the clear CTA. */
+			. '.faz-placeholder--video .faz-placeholder-btn{background:var(--faz-svc-color,#ff0000);color:#fff;font-weight:700;box-shadow:0 4px 12px rgba(0,0,0,.18)}'
+			. '.faz-placeholder--video .faz-placeholder-btn:hover{background:var(--faz-svc-color,#ff0000);filter:brightness(.92);transform:translateY(-1px);box-shadow:0 6px 16px rgba(0,0,0,.25)}'
+			. '.faz-placeholder .faz-placeholder-btn:active{transform:translateY(0)}'
+			. '.faz-placeholder .faz-placeholder-btn:focus-visible{outline:2px solid #0b5ed7;outline-offset:2px}'
+			. '.faz-placeholder--video .faz-placeholder-btn:focus-visible{outline-color:var(--faz-svc-color,#ff0000)}'
+			. '.faz-placeholder--social{min-height:120px}';
+	}
+}

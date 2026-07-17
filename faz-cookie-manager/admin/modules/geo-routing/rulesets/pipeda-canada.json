@@ -1,0 +1,57 @@
+{
+  "$schema": "../schemas/ruleset.schema.json",
+  "id": "pipeda-canada",
+  "version": "1.0.0",
+  "display_name": "PIPEDA — Canada",
+  "law_references": [
+    "PIPEDA"
+  ],
+  "applies_to": {
+    "countries": [
+      "CA"
+    ]
+  },
+  "model": "hybrid",
+  "native_lang": "en",
+  "official_resources_url": [
+    "https://www.priv.gc.ca/"
+  ],
+  "signals": {
+    "tcf_v22": false,
+    "gpp": {
+      "enabled": false,
+      "section": null
+    },
+    "gpc_honored": true,
+    "gpc_required": false,
+    "dnt_honored": false,
+    "cmv2": {
+      "ad_storage": "denied-until-action",
+      "analytics_storage": "denied-until-action",
+      "ad_user_data": "denied-until-action",
+      "ad_personalization": "denied-until-action",
+      "personalization_storage": "granted",
+      "functionality_storage": "granted",
+      "security_storage": "granted"
+    }
+  },
+  "ui": {
+    "equal_weight_buttons": true,
+    "donotsell_link_required": false,
+    "sensitive_separate_optin": false,
+    "revisit_widget_required": true,
+    "default_categories": {
+      "necessary": "granted-locked",
+      "functional": "granted",
+      "analytics": "denied-until-action",
+      "marketing": "denied-until-action",
+      "profiling": "denied-until-action"
+    }
+  },
+  "cross_border_notes": null,
+  "_meta": {
+    "behavior_review_date": "2026-06-09",
+    "next_review_due": "2027-06-09",
+    "notes": "Hybrid consent: implied consent for analytics/functional, express opt-in (denied-until-action) for marketing/profiling and ad_* CMv2 signals per OPC 'meaningful consent' guidance (behavioural advertising/cross-site tracking require express consent). GPC honored as a withdrawal/objection signal. CASL parallelo per email."
+  }
+}

@@ -1,0 +1,14 @@
+{
+    "id": "google-maps",
+    "name": "Google Maps",
+    "description": "Blocks Google Maps embeds and API. Shows a placeholder with a link to open in Google Maps.",
+    "category": "functional",
+    "patterns": [
+        "maps.googleapis.com",
+        "maps.google.com",
+        "google.com/maps",
+        "new google.maps.",
+        "wp-google-maps"
+    ],
+    "cookies": []
+}

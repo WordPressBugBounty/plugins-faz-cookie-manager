@@ -1,0 +1,12 @@
+{
+    "id": "typeform",
+    "name": "Typeform",
+    "description": "Blocks Typeform embeds, widgets, or third-party content until consent is granted.",
+    "category": "functional",
+    "patterns": [
+        "form.typeform.com",
+        "embed.typeform.com",
+        "renderer.typeform.com"
+    ],
+    "cookies": []
+}
