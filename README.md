@@ -1,0 +1,1 @@
+# plugins-faz-cookie-manager
