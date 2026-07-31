@@ -16,10 +16,10 @@
  * Plugin Name:       FAZ Cookie Manager
  * Plugin URI:        https://github.com/fabiodalez-dev/faz-cookie-manager
  * Description:       A comprehensive GDPR/CCPA cookie consent manager with built-in cookie scanner, local consent logging, Google Consent Mode v2, and IAB TCF v2.3 support.
- * Version:           1.24.0
+ * Version:           1.25.0
  * Requires at least: 5.0
  * Tested up to:      7.0
- * Stable tag:        1.24.0
+ * Stable tag:        1.25.0
  * Requires PHP:      7.4
  * Author:            Fabio D'Alessandro
  * Author URI:        https://fabiodalez.it/
@@ -51,13 +51,12 @@ if ( ! defined( 'WPINC' ) ) {
 	die;
 }
 
-define( 'FAZ_VERSION', '1.24.0' );
+define( 'FAZ_VERSION', '1.25.0' );
 define( 'FAZ_PLUGIN_BASENAME', plugin_basename( __FILE__ ) );
 define( 'FAZ_PLUGIN_BASEPATH', plugin_dir_path( __FILE__ ) );
 define( 'FAZ_PLUGIN_FILENAME', __FILE__ );
 define( 'FAZ_POST_TYPE', 'cookielawinfo' );
 define( 'FAZ_DEFAULT_LANGUAGE', faz_set_default_language() );
-
 /** Stub for backward compat — cloud URLs removed. */
 if ( ! defined( 'FAZ_APP_URL' ) ) {
 	define( 'FAZ_APP_URL', '' );
@@ -415,6 +414,34 @@ function faz_maybe_invalidate_stale_consent_cookie() {
 
 add_action( 'init', 'faz_maybe_invalidate_stale_consent_cookie', 1 );
 
+/**
+ * Drop the cached banner when the site address changes.
+ *
+ * The rendered banner is cached in faz_banner_template with absolute plugin
+ * asset URLs baked in, so moving the site to a different address leaves the
+ * cache pointing at the old one — the browser then requests the icon from the
+ * previous host. This catches the deliberate move (Settings → General, WP-CLI,
+ * multisite domain edit). A restored database bypasses update_option entirely,
+ * which is why Frontend also repairs a stale origin at render time. Reported as
+ * issue #195 after a WPVivid restore from a localhost build.
+ *
+ * Loads the helper defensively: it lives in a plain-function file, not a class,
+ * so the autoloader will not pull it in on its own.
+ *
+ * @return void
+ */
+function faz_flush_banner_template_on_address_change() {
+	if ( ! function_exists( 'faz_clear_banner_template_cache' ) ) {
+		require_once FAZ_PLUGIN_BASEPATH . 'includes/class-i18n-helpers.php';
+	}
+	if ( function_exists( 'faz_clear_banner_template_cache' ) ) {
+		faz_clear_banner_template_cache();
+	}
+}
+
+add_action( 'update_option_siteurl', 'faz_flush_banner_template_on_address_change' );
+add_action( 'update_option_home', 'faz_flush_banner_template_on_address_change' );
+
 require_once FAZ_PLUGIN_BASEPATH . 'class-autoloader.php';
 
 $autoloader = new \FazCookie\Autoloader();
@@ -492,6 +519,14 @@ $faz_loader->run();
 // module toggle); the admin tab is wired in admin/class-admin.php
 // alongside the other module pages.
 \FazCookie\Admin\Modules\Cookie_Policy_Generator\Cookie_Policy_Generator::get_instance()->init();
+
+// Register the scanner's WP-Cron hooks on EVERY request, not only inside the
+// admin/REST module loader. wp-cron.php runs in a front-end context where the
+// admin modules are never loaded, so a scan scheduled from the admin would fire
+// its cron event with no callback attached and silently do nothing. Registering
+// here (a pair of cheap add_action calls) guarantees the loopback cron worker
+// has the handler.
+\FazCookie\Admin\Modules\Scanner\Includes\Controller::register_cron_hook();
 
 /**
  * Force every /faz/v1/* REST response out of the LiteSpeed / CDN cache.

@@ -15,6 +15,7 @@ use stdClass;
 use FazCookie\Includes\Rest_Controller;
 use FazCookie\Admin\Modules\Settings\Includes\Settings;
 use FazCookie\Admin\Modules\Settings\Includes\Controller;
+use FazCookie\Admin\Modules\Settings\Includes\Onboarding;
 use FazCookie\Admin\Modules\Gcm\Includes\Gcm_Settings;
 use FazCookie\Admin\Modules\Cookies\Api\Cookies_API;
 use FazCookie\Includes\Notice;
@@ -179,6 +180,150 @@ class Api extends Rest_Controller {
 				),
 			)
 		);
+		register_rest_route(
+			$this->namespace,
+			'/' . $this->rest_base . '/onboarding',
+			array(
+				array(
+					'methods'             => WP_REST_Server::CREATABLE,
+					'callback'            => array( $this, 'complete_onboarding' ),
+					'permission_callback' => array( $this, 'create_item_permissions_check' ),
+					'args'                => array(
+						'law'              => array(
+							'required'          => true,
+							'type'              => 'string',
+							'enum'              => Onboarding::LAWS,
+							'sanitize_callback' => 'sanitize_key',
+							'validate_callback' => 'rest_validate_request_arg',
+						),
+						// The optional step selections. Structural validation
+						// happens at the REST boundary; the value-level
+						// allowlists live in Onboarding::apply_options() and
+						// Settings::sanitize, so nothing here is trusted alone.
+						'language'         => array(
+							'type'              => 'string',
+							'sanitize_callback' => 'sanitize_text_field',
+							'validate_callback' => 'rest_validate_request_arg',
+						),
+						'banner_control'   => array(
+							'type'                 => 'object',
+							'properties'           => array_fill_keys(
+								Onboarding::BANNER_CONTROL_KEYS,
+								array( 'type' => 'boolean' )
+							),
+							'additionalProperties' => false,
+							'validate_callback'    => 'rest_validate_request_arg',
+						),
+						'gcm'              => array(
+							'type'                 => 'object',
+							'properties'           => array(
+								'enabled' => array( 'type' => 'boolean' ),
+							),
+							'additionalProperties' => false,
+							'validate_callback'    => 'rest_validate_request_arg',
+						),
+						'microsoft'        => array(
+							'type'                 => 'object',
+							'properties'           => array(
+								'uet_consent_mode' => array( 'type' => 'boolean' ),
+								'clarity_consent'  => array( 'type' => 'boolean' ),
+							),
+							'additionalProperties' => false,
+							'validate_callback'    => 'rest_validate_request_arg',
+						),
+						'iab'              => array(
+							'type'                 => 'object',
+							'properties'           => array(
+								'enabled'      => array( 'type' => 'boolean' ),
+								'cmp_id'       => array( 'type' => 'integer', 'minimum' => 0, 'maximum' => 4095 ),
+								'publisher_cc' => array( 'type' => 'string', 'pattern' => '^[A-Za-z]{0,2}$' ),
+							),
+							'additionalProperties' => false,
+							'validate_callback'    => 'rest_validate_request_arg',
+						),
+						'geolocation'      => array(
+							'type'                 => 'object',
+							'properties'           => array(
+								'geo_targeting'    => array( 'type' => 'boolean' ),
+								'target_regions'   => array(
+									'type'  => 'array',
+									'items' => array( 'type' => 'string', 'enum' => Onboarding::REGIONS ),
+								),
+								'default_behavior' => array( 'type' => 'string', 'enum' => array( 'show_banner', 'no_banner' ) ),
+							),
+							'additionalProperties' => false,
+							'validate_callback'    => 'rest_validate_request_arg',
+						),
+						'payment_gateways' => array(
+							// Map { gateway => bool } (canonical: explicit state of
+							// every gateway the wizard showed) or legacy string list.
+							'type'              => array( 'object', 'array' ),
+							'validate_callback' => 'rest_validate_request_arg',
+						),
+					),
+				),
+			)
+		);
+		register_rest_route(
+			$this->namespace,
+			'/' . $this->rest_base . '/onboarding/recommendations',
+			array(
+				array(
+					'methods'             => WP_REST_Server::READABLE,
+					'callback'            => array( $this, 'get_onboarding_recommendations' ),
+					'permission_callback' => array( $this, 'create_item_permissions_check' ),
+				),
+			)
+		);
+	}
+
+	/**
+	 * Finish the guided setup wizard.
+	 *
+	 * Applies the chosen jurisdiction to the default banner (opt-in for GDPR,
+	 * opt-out notice model for CCPA, the more-protective opt-in + US Do-Not-Sell
+	 * entry point for "both"), re-asserts the accountability baseline (banner
+	 * visible + consent logging), and persists the onboarding completion flags.
+	 * All compliance-critical logic lives in the Onboarding helper so it can be
+	 * unit-tested directly.
+	 *
+	 * @param WP_REST_Request $request Full details about the request.
+	 * @return WP_Error|WP_REST_Response
+	 */
+	public function complete_onboarding( $request ) {
+		$law = $request->get_param( 'law' );
+		$law = is_scalar( $law ) ? sanitize_key( (string) $law ) : '';
+		if ( ! in_array( $law, Onboarding::LAWS, true ) ) {
+			return new WP_Error(
+				'faz_invalid_onboarding_law',
+				__( 'Choose a valid privacy law before finishing setup.', 'faz-cookie-manager' ),
+				array( 'status' => 400 )
+			);
+		}
+
+		$options = array();
+		foreach ( array( 'language', 'banner_control', 'gcm', 'microsoft', 'iab', 'geolocation', 'payment_gateways' ) as $key ) {
+			$value = $request->get_param( $key );
+			if ( null !== $value ) {
+				$options[ $key ] = $value;
+			}
+		}
+
+		$onboarding = new Onboarding();
+		$result     = $onboarding->finish( $law, $options );
+
+		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * Environment-aware wizard suggestions: detected cache plugin, Google tags,
+	 * WooCommerce, payment gateways, and the site language. Read-only.
+	 *
+	 * @return \WP_REST_Response
+	 */
+	public function get_onboarding_recommendations() {
+		$onboarding = new Onboarding();
+		return rest_ensure_response( $onboarding->get_recommendations() );
 	}
 	/**
 	 * Get a collection of items.

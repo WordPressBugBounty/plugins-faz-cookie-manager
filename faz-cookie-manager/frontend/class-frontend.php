@@ -14,11 +14,13 @@ namespace FazCookie\Frontend;
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
 use FazCookie\Admin\Modules\Banners\Includes\Controller;
+use FazCookie\Admin\Modules\Banners\Includes\Banner;
 use FazCookie\Admin\Modules\Settings\Includes\Settings;
 use FazCookie\Admin\Modules\Gcm\Includes\Gcm_Settings;
 use FazCookie\Frontend\Modules\Consent_Logger\Consent_Logger;
 use FazCookie\Frontend\Modules\Banner_Rest\Banner_Rest;
 use FazCookie\Includes\Geolocation;
+use FazCookie\Includes\Ab_Test;
 use FazCookie\Includes\Gvl;
 use FazCookie\Includes\Known_Providers;
 use FazCookie\Includes\Cookie_Table_Shortcode;
@@ -398,7 +400,7 @@ class Frontend {
 			// Inject template CSS as a proper inline style (nonce-compatible; no unsafe-inline needed).
 			// Utility rules appended AFTER boost_css_specificity() so they are NOT
 			// scoped inside #faz-consent — these classes are used on elements outside
-			// the banner container (consent-bridge iframe, age-gate overlay, blocked embeds).
+			// the banner container (consent-bridge iframe, blocked embeds).
 			// `_fazAddPlaceholder` inserts `.video-placeholder-{normal,youtube}` next
 			// to blocked iframes (outside #faz-consent), so the scoped template.json
 			// rules never reach them. Without this floor, placeholders for lazy-loaded
@@ -416,8 +418,15 @@ class Frontend {
 			$css .= '#faz-consent{border-style:none}';
 			$css .= '.faz-hidden{display:none!important;visibility:hidden!important}'
 				. '.faz-consent-bridge{width:0;height:0;border:0}'
-				. '.faz-age-gate-overlay{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6)}'
-				. '.faz-age-gate-modal{background:#fff;border-radius:8px;padding:24px 32px;max-width:420px;text-align:center}'
+				// Inline age-confirmation row (GDPR Art. 8) injected by script.js
+				// above the accept surfaces. Inherits the banner's text direction
+				// (RTL support) from its container. The [hidden] attribute keeps
+				// the validation message out of the flow until an un-affirmed
+				// accept reveals it.
+				. '.faz-age-confirm{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;margin:0 0 12px;font-size:13px;line-height:1.4}'
+				. '.faz-age-confirm-cb{margin:2px 0 0;flex:0 0 auto}'
+				. '.faz-age-confirm-label{cursor:pointer}'
+				. '.faz-age-confirm-error{flex-basis:100%;margin:2px 0 0;color:#b00020;font-size:12px}'
 				. '.video-placeholder-normal,.video-placeholder-youtube{min-height:200px;display:flex;align-items:center;justify-content:center;width:100%;max-width:100%;box-sizing:border-box}';
 			$css_handle = $this->plugin_name . '-css';
 			wp_register_style( $css_handle, false, array(), $this->version );
@@ -619,6 +628,13 @@ class Frontend {
 									// category-level summary. When per-service consent is off there
 									// are no svc.*/ck.* entries and this adds nothing.
 									"try{var cm=document.cookie.match(/fazcookie-consent=([^;]+)/);if(cm){var cv=cm[1];try{cv=decodeURIComponent(cv)}catch(er){}cv.split(',').forEach(function(pr){var ci=pr.indexOf(':');if(ci<1)return;var ck=pr.substring(0,ci);if(ck.indexOf('svc.')===0||ck.indexOf('ck.')===0){c[ck]=pr.substring(ci+1)}})}}catch(er){}" .
+										// Age-gate accountability (GDPR Art. 5(2)/7(1)): when the
+										// visitor affirmed they meet the digital age of consent, fold
+										// the reserved meta.age_affirmed:yes key into the logged
+										// categories map so the record demonstrates the age was
+										// affirmed at consent time. get_consent_stats() skips the
+										// meta.* prefix so it never appears as a phantom category.
+										"if(d.ageAffirmed===true){c['meta.age_affirmed']='yes'}" .
 									"return c})()," .
 								"url:safeUrl," .
 								"banner_slug:_fazConsentLog.bannerSlug||''," .
@@ -824,6 +840,17 @@ class Frontend {
 		$visitor_country = $this->is_cache_compatibility_enabled() ? '' : $this->get_visitor_country();
 		$this->banner    = Controller::get_instance()->get_active_banner_for_country( $visitor_country );
 
+		// A/B testing of banner variants (Settings → Banner Control): when the
+		// admin has enabled the test with 2+ valid variants, replace the
+		// normally-selected banner with the visitor's persistently-assigned
+		// variant. No-op (returns the banner above) when the feature is off,
+		// under-configured, or Cache Compatibility Mode is on. Runs BEFORE the
+		// runtime law-routing block below so, in the common configuration
+		// (runtime geo-routing off → $runtime_ruleset is null → that block is
+		// skipped), the chosen variant is what ships; when runtime geo-routing
+		// IS active, jurisdiction compliance still wins over the A/B preference.
+		$this->banner = $this->maybe_apply_ab_test( $this->banner, $visitor_country );
+
 		// Runtime geo-routing (flag-gated): the resolved ruleset's MODEL decides
 		// which consent regime actually applies to this visitor. Prefer the
 		// active banner whose applicableLaw matches that model so the UI the
@@ -871,6 +898,110 @@ class Frontend {
 	}
 
 	/**
+	 * Apply the banner-variant A/B test to the selected banner.
+	 *
+	 * When Settings → Banner Control → A/B test is enabled and lists two or
+	 * more slugs that still resolve to ACTIVE banner rows, the visitor is
+	 * assigned one variant via a random split and that variant's banner replaces
+	 * the default selection. No experiment cookie is written before consent.
+	 * Once the visitor acts, the existing strictly-necessary consent record's
+	 * scoped banner slug keeps the assignment stable and the consent log records
+	 * which variant produced the decision (accountability).
+	 *
+	 * Compliance: the test only ever chooses among banner rows the admin
+	 * already created, each independently compliant (equal-weight buttons,
+	 * opt-in categories). It cannot author a dark pattern.
+	 *
+	 * Cache Compatibility Mode: a per-visitor SERVER-side random split is
+	 * fundamentally incompatible with full-page caching — the first anonymous
+	 * visitor's variant would be baked into the cached HTML and then served to
+	 * everyone, silently ending the experiment and making the persisted cookie
+	 * disagree with the served banner. So when that mode is on we skip the
+	 * split entirely and serve the normally-selected banner. (A future
+	 * cache-safe variant would have to run the split client-side in script.js;
+	 * until then A/B testing simply requires Cache Compatibility Mode off.)
+	 *
+	 * @since 1.25.0
+	 * @param Banner|false $default_banner  The banner selected before A/B.
+	 * @param string       $visitor_country Resolved visitor country. Used to keep
+	 *                                      variant selection within the same
+	 *                                      geo-eligibility as the normal banner
+	 *                                      selection: filters candidates through
+	 *                                      Ab_Test::is_banner_geo_eligible()
+	 *                                      (target_countries + ruleSet) so an A/B
+	 *                                      experiment can never surface a variant
+	 *                                      that normal routing would have hidden
+	 *                                      or excluded for this visitor.
+	 * @return Banner|false The variant banner, or $default_banner unchanged.
+	 */
+	private function maybe_apply_ab_test( $default_banner, $visitor_country ) {
+		// See docblock: no server-side split under Cache Compatibility Mode.
+		if ( false === $default_banner || $this->is_cache_compatibility_enabled() ) {
+			return $default_banner;
+		}
+
+		$ab = $this->settings->get( 'banner_control', 'ab_test' );
+		if ( ! is_array( $ab ) || empty( $ab['status'] ) ) {
+			return $default_banner;
+		}
+
+		$configured = ( isset( $ab['variants'] ) && is_array( $ab['variants'] ) ) ? $ab['variants'] : array();
+		if ( count( $configured ) < 2 ) {
+			return $default_banner;
+		}
+
+		// Re-validate the configured slugs against the LIVE banner rows so a
+		// variant whose banner was deleted or deactivated after setup drops out.
+		$controller = Controller::get_instance();
+		$valid      = $controller->filter_active_variant_slugs( $configured );
+		if ( count( $valid ) < 2 ) {
+			return $default_banner;
+		}
+
+		// An experiment may vary presentation, never the legal/geo regime. Keep
+		// only active banners with the same law + Do-Not-Sell model as the banner
+		// selected by normal routing, and which are eligible for this visitor.
+		// Without this gate a US-targeted CCPA variant could replace an EU GDPR
+		// banner (or a country-restricted variant could make is_geo_blocked() hide
+		// the notice entirely), turning an A/B setting into a compliance override.
+		$required_model = Ab_Test::experiment_model( $default_banner );
+		$compatible     = array();
+		foreach ( $valid as $slug ) {
+			$candidate = $controller->get_active_banner_by_slug( $slug );
+			if ( false === $candidate || Ab_Test::experiment_model( $candidate ) !== $required_model ) {
+				continue;
+			}
+			// Geo scope (target_countries) + ruleSet eligibility go through ONE
+			// shared implementation with the REST language-swap path
+			// (Ab_Test::is_banner_geo_eligible) so the initial server render and a
+			// later REST swap can never resolve a different variant for the same
+			// visitor. Case is normalised on both country and targets.
+			if ( ! Ab_Test::is_banner_geo_eligible( $candidate, $visitor_country ) ) {
+				continue;
+			}
+			$compatible[ $slug ] = $candidate;
+		}
+		$valid = array_keys( $compatible );
+		if ( count( $valid ) < 2 ) {
+			return $default_banner;
+		}
+
+		// Reuse the assignment already present in the strictly-necessary consent
+		// record. Creating a standalone A/B cookie before the visitor acts would
+		// itself be non-essential tracking under opt-in regimes. Before any action
+		// the split is intentionally stateless; the selected banner is still
+		// recorded with the eventual consent and becomes sticky from then on.
+		$consent       = function_exists( 'faz_parse_consent_cookie' ) ? faz_parse_consent_cookie() : array();
+		$stored_banner = isset( $consent['__scope.banner'] ) ? sanitize_title( (string) $consent['__scope.banner'] ) : '';
+		$chosen        = Ab_Test::pick_variant( $valid, $stored_banner, wp_rand( 0, count( $valid ) - 1 ) );
+		if ( '' === $chosen ) {
+			return $default_banner;
+		}
+
+		return isset( $compatible[ $chosen ] ) ? $compatible[ $chosen ] : $default_banner;
+	}
+
+	/**
 	 * Check if the banner should be blocked for this visitor based on geo rules.
 	 *
 	 * @return bool True if the banner should NOT be shown.
@@ -879,7 +1010,21 @@ class Frontend {
 		if ( ! $this->banner ) {
 			return false;
 		}
-		$settings = $this->banner->get_settings();
+		return $this->is_banner_geo_blocked( $this->banner, $this->get_visitor_country() );
+	}
+
+	/**
+	 * Check one banner's ruleSet against an already-resolved visitor country.
+	 *
+	 * Shared by the normal post-selection guard and A/B candidate filtering so
+	 * an experiment cannot choose a banner that the normal geo path would hide.
+	 *
+	 * @param Banner $banner  Banner to evaluate.
+	 * @param string $country ISO-3166 alpha-2 country code, or ''.
+	 * @return bool True when the banner must not be shown.
+	 */
+	private function is_banner_geo_blocked( $banner, $country ) {
+		$settings = $banner->get_settings();
 		$inner    = isset( $settings['settings'] ) && is_array( $settings['settings'] ) ? $settings['settings'] : array();
 		$rules    = isset( $inner['ruleSet'] ) && is_array( $inner['ruleSet'] ) ? $inner['ruleSet'] : array();
 		if ( empty( $rules ) ) {
@@ -893,7 +1038,6 @@ class Frontend {
 		// Without this, a ruleSet like [{code:ALL}, {code:US}] would emit
 		// no-cache headers but the runtime check on $rules[0] only would
 		// still let the first rule decide, asymmetrically.
-		$country = $this->get_visitor_country();
 		foreach ( $rules as $rule ) {
 			if ( ! is_array( $rule ) ) {
 				continue;
@@ -1214,6 +1358,7 @@ class Frontend {
 			'au' => array( 'AU' ),
 			'jp' => array( 'JP' ),
 			'ch' => array( 'CH' ),
+			'za' => array( 'ZA' ),
 		);
 
 		foreach ( $regions as $region ) {
@@ -1287,6 +1432,16 @@ class Frontend {
 			}
 		}
 
+		// Same class of defect one level up: the cached HTML carries the plugin
+		// origin (scheme + host + port) that was current when it was generated,
+		// so a site restored at a different address keeps requesting assets from
+		// the old one. A backup restore rewrites the siteurl row directly, so
+		// the update_option_siteurl hook in the bootstrap never fires — this is
+		// the net that catches it. Issue #195: a WPVivid restore of a localhost
+		// build left the live site asking https://localhost for the revisit
+		// icon, which browsers surface as a local-network access prompt.
+		$html = $this->repair_stale_asset_origin( $html );
+
 		// `<script type="text/template">` is the W3C-recommended way to
 		// embed inert HTML templates in the page (browsers do NOT execute
 		// it — `type` is not `text/javascript` or `module`). The banner
@@ -1299,6 +1454,86 @@ class Frontend {
 		echo wp_kses( $html, faz_allowed_html() );
 		echo '</script>';
 	}
+
+	/**
+	 * Rewrite plugin-asset URLs left over from a previous site address.
+	 *
+	 * The cached banner HTML embeds absolute URLs to this plugin's own assets
+	 * (the revisit icon, the close icon). They are generated from
+	 * FAZ_PLUGIN_URL, so they carry whatever origin the site had when the
+	 * template was built. Restore that database at a different address —
+	 * localhost build → live server, staging → production — and the cache
+	 * keeps pointing at the old origin: the browser then issues a
+	 * cross-origin request for the icon, which for a localhost origin trips
+	 * the private-network access prompt (issue #195).
+	 *
+	 * Only URLs whose path matches this plugin's own directory are touched,
+	 * and only when their origin differs from the current one, so a CDN or
+	 * asset-rewriting layer that already produced a different (and correct)
+	 * origin is left alone: FAZ_PLUGIN_URL reflects that rewrite too, so the
+	 * origins match and nothing happens.
+	 *
+	 * Repairs the stored option as well, so the work happens once rather than
+	 * on every request.
+	 *
+	 * @param string $html Cached banner HTML.
+	 * @return string HTML with a current asset origin.
+	 */
+	private function repair_stale_asset_origin( $html ) {
+		if ( ! is_string( $html ) || '' === $html || ! defined( 'FAZ_PLUGIN_URL' ) ) {
+			return (string) $html;
+		}
+
+		$current = wp_parse_url( FAZ_PLUGIN_URL );
+		if ( empty( $current['scheme'] ) || empty( $current['host'] ) || empty( $current['path'] ) ) {
+			return $html;
+		}
+		$current_origin = $current['scheme'] . '://' . $current['host']
+			. ( empty( $current['port'] ) ? '' : ':' . $current['port'] );
+		$plugin_path    = $current['path'];
+
+		// Collect the distinct origins the cached HTML uses for OUR assets.
+		$pattern = '#(https?://[^/"\'\s>]+)' . preg_quote( $plugin_path, '#' ) . '#i';
+		if ( ! preg_match_all( $pattern, $html, $matches ) ) {
+			return $html;
+		}
+		$stale = array_values( array_unique( array_diff( $matches[1], array( $current_origin ) ) ) );
+		if ( ! $stale ) {
+			return $html;
+		}
+
+		$rewrite = static function ( $subject ) use ( $stale, $plugin_path, $current_origin ) {
+			foreach ( $stale as $origin ) {
+				$subject = str_replace( $origin . $plugin_path, $current_origin . $plugin_path, $subject );
+			}
+			return $subject;
+		};
+
+		$html = $rewrite( $html );
+
+		// Persist the repair so later requests skip this entirely.
+		$cache_key = apply_filters( 'faz_banner_template_cache_key', 'faz_banner_template' );
+		$stored    = get_option( $cache_key, array() );
+		if ( is_array( $stored ) ) {
+			$repaired = false;
+			foreach ( $stored as $lang => $tpl ) {
+				if ( ! isset( $tpl['html'] ) || ! is_string( $tpl['html'] ) ) {
+					continue;
+				}
+				$fixed = $rewrite( $tpl['html'] );
+				if ( $fixed !== $tpl['html'] ) {
+					$stored[ $lang ]['html'] = $fixed;
+					$repaired                = true;
+				}
+			}
+			if ( $repaired ) {
+				update_option( $cache_key, $stored );
+			}
+		}
+
+		return $html;
+	}
+
 	/**
 	 * Get gcm data
 	 *
@@ -1737,6 +1972,11 @@ class Frontend {
 		$banner          = $this->banner;
 		$banner_settings = $banner->get_settings();
 
+		// Age gate (GDPR Art. 8) minimum age. Sanitizer clamps the persisted
+		// value to 13-18; default 16. Resolved once here so it feeds both the
+		// _ageGate store and the sprintf'd age-confirmation label below.
+		$age_min = isset( $settings['age_gate']['min_age'] ) ? absint( $settings['age_gate']['min_age'] ) : 16;
+
 		// Consent-cookie lifetime, with a law-aware hard cap applied here so the
 		// EFFECTIVE expiry can never exceed the legal maximum regardless of any
 		// larger value an admin saved (the UI allows up to 10 years). The
@@ -1812,6 +2052,11 @@ class Frontend {
 				'cookie_consent_label'                  => __( 'Cookie consent', 'faz-cookie-manager' ),
 				'vendor_consent_label'                  => __( 'Vendor consent', 'faz-cookie-manager' ),
 				'third_party_cookie_note'               => __( 'These cookies are set by the embedded service on its own domain and are controlled by allowing or blocking the embed above — they cannot be removed individually.', 'faz-cookie-manager' ),
+				// Age gate (GDPR Art. 8). The number is sprintf'd server-side so
+				// the label is correct per-locale with no JS string concatenation.
+				// translators: %d is the minimum digital age of consent.
+				'age_confirm_label'                     => sprintf( __( 'I confirm I am at least %d years old', 'faz-cookie-manager' ), $age_min ),
+				'age_confirm_error'                     => __( 'Please confirm you meet the minimum age to accept optional cookies.', 'faz-cookie-manager' ),
 			),
 			'_rtl'          => $this->is_rtl(),
 			'_language'     => faz_current_language(),
@@ -1970,15 +2215,24 @@ class Frontend {
 			$store['_cookieScripts'] = $cookie_scripts;
 		}
 
-		// Age gate (GDPR Art. 8).
+		// Age gate (GDPR Art. 8). Site-wide (not per-visitor/geo), so it is safe
+		// to bake into full-page caches; the checkbox is injected client-side
+		// from this JSON, so it is cache-safe and never baked into cached markup.
 		$age_gate = array(
 			'enabled' => ! empty( $settings['age_gate']['enabled'] ),
-			'minAge'  => isset( $settings['age_gate']['min_age'] ) ? absint( $settings['age_gate']['min_age'] ) : 16,
+			'minAge'  => $age_min,
 		);
 		$store['_ageGate'] = $age_gate;
 
 		// GTM Data Layer toggle.
 		$store['_gtmDataLayer'] = ! empty( $settings['banner_control']['gtm_datalayer'] );
+		// Anti-adblock banner resilience toggle. Emitted ONLY when true so the
+		// _fazConfig blob stays byte-identical for every default-off install
+		// (no behaviour change, no cache-diff). Site-wide static flag, safe
+		// under cache-compatibility mode.
+		if ( ! empty( $settings['banner_control']['adblock_resilience'] ) ) {
+			$store['_adblockResilience'] = true;
+		}
 		// Advanced Consent Mode (#165): mirror the server-side gtag exemption to
 		// the client blocker so dynamically-injected Google tags (which bypass
 		// the output buffer) are also allowed to load before consent.
@@ -2665,6 +2919,18 @@ class Frontend {
 		if ( ! empty( $noscript_stash ) ) {
 			$html = strtr( $html, $noscript_stash );
 		}
+
+		// 7. Hide social/widget embed containers that depend on blocked scripts
+		// (Facebook/Instagram/Twitter/X, Smash Balloon Instagram Feed, Elementor
+		// video widgets). filter_content_blocking() already runs these same two
+		// detectors for the_content/widget_text/widget_block_content, but an
+		// embed placed OUTSIDE post content - a theme-builder header/footer, a
+		// global (non-widget-area) template part, or any markup a page builder
+		// renders directly into the page - never passes through those narrower
+		// filters and only ever reaches the page here, in the full-page buffer.
+		// Without this, such an embed is never detected at all.
+		$html = $this->process_social_embeds( $html, $blocked_categories );
+		$html = $this->process_elementor_video_widgets( $html, $blocked_categories );
 
 		return $html;
 	}
@@ -4033,6 +4299,18 @@ class Frontend {
 			}
 		}
 
+		// A pattern that already ends on a separator carries its own right-hand
+		// boundary: `js.hs-scripts.com/` cannot be a prefix of a longer domain
+		// label, because the slash has closed it. Demanding another separator
+		// after it means the pattern can only ever match at the very end of a
+		// URL — so a perfectly ordinary `js.hs-scripts.com/12345.js` was left
+		// unblocked, the next character being `1`. Twenty of the shipped
+		// provider definitions carry at least one pattern in this shape.
+		$last_char = substr( $target, $index + $length - 1, 1 );
+		if ( '' !== $last_char && preg_match( '/[\/.:\?#=&]/', $last_char ) ) {
+			return true;
+		}
+
 		$after_pos = $index + $length;
 		if ( $after_pos < strlen( $target ) ) {
 			$after = substr( $target, $after_pos, 1 );
@@ -4360,14 +4638,22 @@ class Frontend {
 	 * @return string Modified attributes string.
 	 */
 	private function set_script_type_plain( $attrs ) {
-		if ( preg_match( '/type\s*=\s*["\']([^"\']*)["\']/i', $attrs, $tm ) ) {
+		$type_match = preg_match( '/type\s*=\s*["\']([^"\']*)["\']/i', $attrs, $tm );
+		if ( 1 === $type_match ) {
 			$original = $tm[1];
-			$attrs    = preg_replace( '/type\s*=\s*["\'][^"\']*["\']/i', 'type="text/plain"', $attrs );
+			$replaced = preg_replace( '/type\s*=\s*["\'][^"\']*["\']/i', 'type="text/plain"', $attrs );
+			if ( null === $replaced ) {
+				return self::script_attrs_type_plain_without_regex( $attrs );
+			}
+			$attrs = $replaced;
 			// Preserve non-default types (e.g. "module") so JS can restore them.
 			if ( 'text/plain' !== $original && 'text/javascript' !== $original && '' !== $original ) {
 				$attrs .= ' data-faz-original-type="' . esc_attr( $original ) . '"';
 			}
 			return $attrs;
+		}
+		if ( false === $type_match ) {
+			return self::script_attrs_type_plain_without_regex( $attrs );
 		}
 		return $attrs . ' type="text/plain"';
 	}
@@ -4917,7 +5203,6 @@ class Frontend {
 			'.faz-hide',
 			'.faz-hidden',
 			'.faz-modal',
-			'.faz-age-gate',
 			'.faz-consent-bridge',
 			'#faz-cookie-wall',
 		);
@@ -4945,7 +5230,7 @@ class Frontend {
 			'.faz-service-',
 		);
 
-		return preg_replace_callback(
+		$scoped = preg_replace_callback(
 			'/([^{}]+?)(\{)/',
 			function ( $m ) use ( $container_classes, $sibling_prefixes, $modal_prefixes ) {
 				$raw = $m[1];
@@ -5017,6 +5302,7 @@ class Frontend {
 			},
 			$css
 		);
+		return is_string( $scoped ) ? $scoped : $css;
 	}
 
 	/**
@@ -5537,20 +5823,7 @@ class Frontend {
 				}
 
 				if ( $should_block ) {
-					// Replace any type attribute with text/plain, saving the original.
-					if ( preg_match( '/type\s*=\s*[\'"]([^\'"]*)[\'"]/', $tag, $type_match ) ) {
-						$original_type = $type_match[1];
-						$tag = preg_replace( '/type\s*=\s*[\'"][^\'"]*[\'"]/', 'type="text/plain"', $tag, 1 );
-						if ( 'text/plain' !== $original_type && 'text/javascript' !== $original_type ) {
-							$tag = str_replace( '<script ', '<script data-faz-original-type="' . esc_attr( $original_type ) . '" ', $tag );
-						}
-					} else {
-						$tag = str_replace( '<script ', '<script type="text/plain" ', $tag );
-					}
-					// Add category attribute.
-					if ( false === strpos( $tag, 'data-faz-category' ) ) {
-						$tag = str_replace( '<script ', '<script data-faz-category="' . esc_attr( $category ) . '" ', $tag );
-					}
+					$tag = $this->block_script_tag_safely( $tag, $category, 'script handle ' . $handle );
 				}
 				break;
 			}
@@ -5672,18 +5945,7 @@ class Frontend {
 			}
 
 			if ( $should_block ) {
-				$tag = preg_replace_callback(
-					'/<script\b([^>]*)>/i',
-					function ( $mm ) use ( $category ) {
-						$new_attrs = $this->set_script_type_plain( $mm[1] );
-						if ( false === strpos( $new_attrs, 'data-faz-category' ) ) {
-							$new_attrs .= ' data-faz-category="' . esc_attr( $category ) . '"';
-						}
-						return '<script' . $new_attrs . '>';
-					},
-					$tag,
-					1
-				);
+				$tag = $this->block_script_tag_safely( $tag, $category, 'inline script handle ' . $handle );
 			}
 			break;
 		}
@@ -5737,10 +5999,7 @@ class Frontend {
 				}
 
 				if ( $should_block ) {
-					$tag = preg_replace( '/(^|\s)href\s*=\s*/i', '$1data-faz-href=', $tag, 1 );
-					if ( false === strpos( $tag, 'data-faz-category' ) ) {
-						$tag = str_replace( '<link ', '<link data-faz-category="' . esc_attr( $category ) . '" ', $tag );
-					}
+					$tag = self::block_link_tag_without_regex( $tag, $category );
 				}
 				break;
 			}
@@ -6085,6 +6344,11 @@ class Frontend {
 		// Hide social embed containers that depend on blocked scripts.
 		$content = $this->process_social_embeds( $content, $blocked_categories );
 
+		// Hide Elementor video widgets (they render an EMPTY .elementor-video
+		// wrapper server-side and build the real iframe client-side from
+		// data-settings, so the generic <iframe> blocker above never sees one).
+		$content = $this->process_elementor_video_widgets( $content, $blocked_categories );
+
 		return $content;
 	}
 
@@ -6243,7 +6507,7 @@ class Frontend {
 			}
 
 			// Insert a placeholder BEFORE the social element, and hide the element.
-			$content = preg_replace_callback(
+			$result = preg_replace_callback(
 				'#(<(?:div|blockquote|span)\b)([^>]*class\s*=\s*["\'][^"\']*\b' . preg_quote( $class, '#' ) . '\b[^"\']*["\'][^>]*)>#i',
 				function ( $m ) use ( $category, $info ) {
 					// Skip if already processed.
@@ -6257,9 +6521,174 @@ class Frontend {
 				},
 				$content
 			);
+			// preg_replace_callback() returns null on a PCRE error. Preserve the
+			// original HTML so content filters and the full-page output buffer can
+			// never turn the response into an empty page.
+			if ( null !== $result ) {
+				$content = $result;
+			} else {
+				error_log( '[FAZ Cookie Manager] PCRE error ' . preg_last_error() . ' in process_social_embeds (' . $class . ')' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			}
+		}
+
+		// Smash Balloon Instagram Feed renders as <div id="sb_instagram" ...>
+		// (or "sb_instagram_<n>" when multiple feeds are on one page) rather
+		// than a class-based embed like the ones above, so it needs an
+		// id-anchored match instead of a class-anchored one. Same block/
+		// placeholder logic otherwise - mirrors the Known_Providers entry
+		// "smash-balloon-instagram" (distinct from the generic "instagram"
+		// oEmbed entry above, since it is blocked by its own script pattern).
+		$social_ids = array(
+			'sb_instagram' => array( 'service_id' => 'smash-balloon-instagram', 'label' => 'Instagram', 'category' => 'marketing' ),
+		);
+
+		foreach ( $social_ids as $id_prefix => $info ) {
+			if ( false === stripos( $content, $id_prefix ) ) {
+				continue;
+			}
+
+			$category     = $info['category'];
+			$should_block = in_array( $category, $blocked_categories, true );
+
+			// Per-service consent check: override category-level decision.
+			$service_consent = $this->get_service_consent();
+			if ( ! empty( $service_consent ) && ! empty( $info['service_id'] ) ) {
+				$svc_key = $info['service_id'];
+				if ( isset( $service_consent[ $svc_key ] ) ) {
+					if ( 'yes' === $service_consent[ $svc_key ] ) {
+						$should_block = false;
+					} elseif ( 'no' === $service_consent[ $svc_key ] ) {
+						$should_block = true;
+					}
+				}
+			}
+
+			if ( ! $should_block ) {
+				continue;
+			}
+
+			// Insert a placeholder BEFORE the widget container, and hide it.
+			$result = preg_replace_callback(
+				'#(<(?:div|blockquote|span)\b)([^>]*\bid\s*=\s*["\']' . preg_quote( $id_prefix, '#' ) . '[^"\']*["\'][^>]*)>#i',
+				function ( $m ) use ( $category, $info ) {
+					// Skip if already processed.
+					if ( false !== strpos( $m[2], 'data-faz-category' ) ) {
+						return $m[0];
+					}
+					$placeholder = Placeholder_Builder::build_social( $info['service_id'], $info['label'], $category );
+					// Placeholder before + hidden original element.
+					$blocked = $m[1] . $m[2] . ' data-faz-category="' . esc_attr( $category ) . '">';
+					return $placeholder . self::faz_add_hidden_class( $blocked );
+				},
+				$content
+			);
+			// A PCRE failure returns null. filter_content_blocking() is hooked
+			// to the_content / widget_text / widget_block_content, and a null
+			// return there does not pass the content through — it renders as an
+			// empty string, silently blanking the post body. Keep the unblocked
+			// HTML instead, matching the scripts/iframes passes in
+			// filter_content_blocking().
+			if ( null !== $result ) {
+				$content = $result;
+			} else {
+				error_log( '[FAZ Cookie Manager] PCRE error ' . preg_last_error() . ' in process_social_embeds (' . $id_prefix . ')' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			}
 		}
 
 		return $content;
+	}
+
+	/**
+	 * Process Elementor "Video" widgets.
+	 *
+	 * Elementor's native Video widget renders an EMPTY `<div class="elementor-video">`
+	 * server-side and builds the real iframe entirely client-side, reading the
+	 * source URL from the `youtube_url` / `vimeo_url` / … key inside the
+	 * ancestor widget's `data-settings` JSON attribute - never from a `src`
+	 * attribute. The generic <iframe> blocker (process_iframe_tag) therefore
+	 * never sees anything to match, because there is no iframe in the initial
+	 * HTML at all. Detect the widget wrapper directly instead: parse its
+	 * data-settings JSON for the embed URL, resolve the provider the same way
+	 * the iframe blocker does, and gate the whole wrapper - mirroring
+	 * process_social_embeds() (placeholder before + faz-hidden original).
+	 *
+	 * @param string $content            HTML content.
+	 * @param array  $blocked_categories Blocked category slugs.
+	 * @return string Modified content.
+	 */
+	private function process_elementor_video_widgets( $content, $blocked_categories ) {
+		if ( false === stripos( $content, 'elementor-widget-video' ) ) {
+			return $content;
+		}
+
+		$result = preg_replace_callback(
+			'#<div\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\belementor-widget-video\b)(?=[^>]*\bdata-settings\s*=)([^>]*)>#i',
+			function ( $m ) use ( $blocked_categories ) {
+				$attrs = $m[1];
+
+				// Skip if already processed.
+				if ( false !== strpos( $attrs, 'data-faz-category' ) ) {
+					return '<div' . $attrs . '>';
+				}
+
+				$raw_settings = $this->extract_tag_attr( $attrs, 'data-settings' );
+				if ( '' === $raw_settings ) {
+					return '<div' . $attrs . '>';
+				}
+
+				// data-settings is HTML-entity-encoded JSON (Elementor escapes it
+				// for the attribute) - decode entities before json_decode.
+				$settings = json_decode( html_entity_decode( $raw_settings, ENT_QUOTES ), true );
+				if ( ! is_array( $settings ) ) {
+					return '<div' . $attrs . '>';
+				}
+
+				// The Video widget stores the source URL under one of these keys
+				// depending on the selected "video_type".
+				$url = '';
+				foreach ( array( 'youtube_url', 'vimeo_url', 'dailymotion_url', 'external_url' ) as $key ) {
+					if ( ! empty( $settings[ $key ] ) ) {
+						$url = (string) $settings[ $key ];
+						break;
+					}
+				}
+				if ( '' === $url ) {
+					return '<div' . $attrs . '>';
+				}
+
+				$service_id = Placeholder_Builder::detect_service_from_url( $url );
+				if ( 'default' === $service_id ) {
+					return '<div' . $attrs . '>'; // Self-hosted / unrecognised source - nothing to gate.
+				}
+
+				$known    = Known_Providers::get_all();
+				$category = isset( $known[ $service_id ]['category'] ) ? $known[ $service_id ]['category'] : 'marketing';
+
+				$should_block = in_array( $category, $blocked_categories, true );
+
+				// Per-service consent check: override category-level decision.
+				$service_consent = $this->get_service_consent();
+				if ( isset( $service_consent[ $service_id ] ) ) {
+					if ( 'yes' === $service_consent[ $service_id ] ) {
+						$should_block = false;
+					} elseif ( 'no' === $service_consent[ $service_id ] ) {
+						$should_block = true;
+					}
+				}
+
+				if ( ! $should_block ) {
+					return '<div' . $attrs . '>';
+				}
+
+				$label       = Placeholder_Builder::get_service_name( $service_id );
+				$placeholder = Placeholder_Builder::build_social( $service_id, $label, $category );
+				$blocked     = '<div' . $attrs . ' data-faz-category="' . esc_attr( $category ) . '">';
+				return $placeholder . self::faz_add_hidden_class( $blocked );
+			},
+			$content
+		);
+
+		return null !== $result ? $result : $content;
 	}
 
 	/**
@@ -6282,12 +6711,225 @@ class Frontend {
 	 * @return string
 	 */
 	private static function faz_add_hidden_class( string $html ): string {
+		// Every branch coalesces to $html because preg_replace() returns null on
+		// a PCRE error, and this method declares a non-nullable string return —
+		// so an unguarded null would be a TypeError, i.e. a fatal on the front
+		// end, rather than merely a missing class. Returning the markup
+		// unchanged only costs the hidden class: the element is still a blocked
+		// placeholder, so nothing is exposed.
 		if ( preg_match( '/\bclass\s*=\s*"/', $html ) ) {
-			return preg_replace( '/\bclass\s*=\s*"([^"]*)"/i', 'class="$1 faz-hidden"', $html, 1 );
+			return preg_replace( '/\bclass\s*=\s*"([^"]*)"/i', 'class="$1 faz-hidden"', $html, 1 ) ?? $html;
 		}
 		if ( preg_match( '/\bclass\s*=\s*\'([^\']*)\'/i', $html ) ) {
-			return preg_replace( '/\bclass\s*=\s*\'([^\']*)\'/i', 'class=\'$1 faz-hidden\'', $html, 1 );
+			return preg_replace( '/\bclass\s*=\s*\'([^\']*)\'/i', 'class=\'$1 faz-hidden\'', $html, 1 ) ?? $html;
 		}
-		return preg_replace( '/(<\w+)(\s|>)/', '$1 class="faz-hidden"$2', $html, 1 );
+		return preg_replace( '/(<\w+)(\s|>)/', '$1 class="faz-hidden"$2', $html, 1 ) ?? $html;
+	}
+
+	/**
+	 * Neutralise one script tag and retain the original markup on PCRE failure.
+	 *
+	 * @param string $tag      Complete script tag.
+	 * @param string $category Consent category.
+	 * @param string $context  Diagnostic context for the error log.
+	 * @return string
+	 */
+	private function block_script_tag_safely( string $tag, string $category, string $context ): string {
+		$blocked = preg_replace_callback(
+			'/<script\b([^>]*)>/i',
+			function ( $match ) use ( $category ) {
+				$new_attrs = $this->set_script_type_plain( $match[1] );
+				if ( false === strpos( $new_attrs, 'data-faz-category' ) ) {
+					$new_attrs .= ' data-faz-category="' . esc_attr( $category ) . '"';
+				}
+				return '<script' . $new_attrs . '>';
+			},
+			$tag,
+			1
+		);
+		if ( null !== $blocked ) {
+			return $blocked;
+		}
+
+		// Returning null from a WordPress tag filter removes the resource
+		// entirely. Keep the tag inert instead, without relying on PCRE again.
+		$error = preg_last_error();
+		$tag   = self::block_script_tag_without_regex( $tag, $category );
+		error_log( '[FAZ Cookie Manager] PCRE error ' . $error . ' while blocking ' . $context ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		return $tag;
+	}
+
+	/**
+	 * Fail-closed script neutralisation for the rare case where PCRE itself is
+	 * unavailable (for example, an exhausted backtrack limit).
+	 *
+	 * This deliberately uses only string operations. Injecting text/plain
+	 * before the existing attributes makes the script inert, while preserving
+	 * a non-default original type lets the frontend restore modules and other
+	 * specialised script types after consent.
+	 *
+	 * @param string $tag      Complete script tag.
+	 * @param string $category Consent category.
+	 * @return string
+	 */
+	private static function block_script_tag_without_regex( string $tag, string $category ): string {
+		$script_pos = stripos( $tag, '<script' );
+		if ( false === $script_pos ) {
+			return $tag;
+		}
+
+		$open_end    = strpos( $tag, '>', $script_pos );
+		$opening_tag = false === $open_end
+			? substr( $tag, $script_pos )
+			: substr( $tag, $script_pos, $open_end - $script_pos + 1 );
+		$attrs       = substr( $opening_tag, strlen( '<script' ), -1 );
+		$replacement = '<script' . self::script_attrs_type_plain_without_regex( $attrs );
+		if ( '' !== $category && false === stripos( $opening_tag, 'data-faz-category' ) ) {
+			$replacement = '<script data-faz-category="' . esc_attr( $category ) . '"' . substr( $replacement, strlen( '<script' ) );
+		}
+
+		return substr_replace( $tag, $replacement . '>', $script_pos, strlen( $opening_tag ) );
+	}
+
+	/**
+	 * Prefix script attributes with an inert type without using PCRE.
+	 *
+	 * @param string $attrs Script attributes.
+	 * @return string
+	 */
+	private static function script_attrs_type_plain_without_regex( string $attrs ): string {
+		$opening_tag  = '<script' . $attrs . '>';
+		$original_type = self::script_type_without_regex( $opening_tag );
+		$replacement   = ' type="text/plain"';
+		if ( '' !== $original_type
+			&& 'text/plain' !== strtolower( $original_type )
+			&& 'text/javascript' !== strtolower( $original_type )
+			&& false === stripos( $attrs, 'data-faz-original-type' ) ) {
+			$replacement .= ' data-faz-original-type="' . esc_attr( $original_type ) . '"';
+		}
+		return $replacement . $attrs;
+	}
+
+	/**
+	 * Rename a stylesheet href without PCRE so a regex failure cannot remove
+	 * the entire link tag from WordPress output.
+	 *
+	 * @param string $tag      Complete link tag.
+	 * @param string $category Consent category.
+	 * @return string
+	 */
+	private static function block_link_tag_without_regex( string $tag, string $category ): string {
+		$link_pos = stripos( $tag, '<link' );
+		if ( false === $link_pos ) {
+			return $tag;
+		}
+		$open_end = strpos( $tag, '>', $link_pos );
+		$opening  = false === $open_end
+			? substr( $tag, $link_pos )
+			: substr( $tag, $link_pos, $open_end - $link_pos + 1 );
+		$href_pos = self::attribute_name_position_without_regex( $opening, 'href' );
+		if ( false !== $href_pos ) {
+			$tag = substr_replace( $tag, 'data-faz-href', $link_pos + $href_pos, strlen( 'href' ) );
+		}
+		if ( false === stripos( $opening, 'data-faz-category' ) ) {
+			$tag = substr_replace(
+				$tag,
+				'<link data-faz-category="' . esc_attr( $category ) . '"',
+				$link_pos,
+				strlen( '<link' )
+			);
+		}
+		return $tag;
+	}
+
+	/**
+	 * Locate a standalone attribute name in an opening HTML tag.
+	 *
+	 * @param string $opening_tag Opening tag.
+	 * @param string $attribute   Attribute name.
+	 * @return int|false
+	 */
+	private static function attribute_name_position_without_regex( string $opening_tag, string $attribute ) {
+		$length = strlen( $opening_tag );
+		$cursor = 0;
+		$attr_length = strlen( $attribute );
+		while ( $cursor < $length ) {
+			$pos = stripos( $opening_tag, $attribute, $cursor );
+			if ( false === $pos ) {
+				return false;
+			}
+			$before = $pos > 0 ? $opening_tag[ $pos - 1 ] : '';
+			$after  = $pos + $attr_length < $length ? $opening_tag[ $pos + $attr_length ] : '';
+			if ( ctype_space( $before ) && ( '=' === $after || ctype_space( $after ) ) ) {
+				$value_pos = $pos + $attr_length;
+				while ( $value_pos < $length && ctype_space( $opening_tag[ $value_pos ] ) ) {
+					$value_pos++;
+				}
+				if ( $value_pos < $length && '=' === $opening_tag[ $value_pos ] ) {
+					return $pos;
+				}
+			}
+			$cursor = $pos + $attr_length;
+		}
+		return false;
+	}
+
+	/**
+	 * Read the opening script tag's type attribute without PCRE.
+	 *
+	 * Handles quoted and unquoted HTML attribute values and ignores names such
+	 * as data-type. It is intentionally narrow: the normal path uses the common
+	 * attribute helpers; this parser exists only for the PCRE-failure fallback.
+	 *
+	 * @param string $opening_tag Opening script tag.
+	 * @return string
+	 */
+	private static function script_type_without_regex( string $opening_tag ): string {
+		$length = strlen( $opening_tag );
+		$cursor = 0;
+		while ( $cursor < $length ) {
+			$pos = stripos( $opening_tag, 'type', $cursor );
+			if ( false === $pos ) {
+				return '';
+			}
+
+			$attribute_pos = self::attribute_name_position_without_regex( $opening_tag, 'type' );
+			if ( false === $attribute_pos || $attribute_pos !== $pos ) {
+				$cursor = $pos + 4;
+				continue;
+			}
+
+			$value_pos = $pos + 4;
+			while ( $value_pos < $length && ctype_space( $opening_tag[ $value_pos ] ) ) {
+				$value_pos++;
+			}
+			if ( $value_pos >= $length || '=' !== $opening_tag[ $value_pos ] ) {
+				$cursor = $pos + 4;
+				continue;
+			}
+			$value_pos++;
+			while ( $value_pos < $length && ctype_space( $opening_tag[ $value_pos ] ) ) {
+				$value_pos++;
+			}
+			if ( $value_pos >= $length ) {
+				return '';
+			}
+
+			$quote = $opening_tag[ $value_pos ];
+			if ( '"' === $quote || "'" === $quote ) {
+				$value_pos++;
+				$value_end = strpos( $opening_tag, $quote, $value_pos );
+				return false === $value_end ? '' : substr( $opening_tag, $value_pos, $value_end - $value_pos );
+			}
+
+			$value_end = $value_pos;
+			while ( $value_end < $length
+				&& ! ctype_space( $opening_tag[ $value_end ] )
+				&& '>' !== $opening_tag[ $value_end ] ) {
+				$value_end++;
+			}
+			return substr( $opening_tag, $value_pos, $value_end - $value_pos );
+		}
+		return '';
 	}
 }

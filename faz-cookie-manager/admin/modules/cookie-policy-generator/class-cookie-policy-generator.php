@@ -34,7 +34,7 @@ class Cookie_Policy_Generator {
 	 * defined in includes/class-cookie-policy-shortcode.php. The legacy
 	 * shortcode accepts site_name / contact / show_table attributes and
 	 * renders a canned five-section policy in the active WP locale; the
-	 * `_complete` shortcode is jurisdiction-aware (GDPR / CCPA / LGPD) and
+	 * `_complete` shortcode is jurisdiction-aware (GDPR / CCPA / LGPD / POPIA) and
 	 * pulls its data from the admin form (Spec 002). Both stay supported —
 	 * `_complete` is the human-readable suffix chosen to make the migration
 	 * path obvious for operators upgrading from the canned legacy version.
@@ -103,8 +103,9 @@ class Cookie_Policy_Generator {
 	 * `[faz_cookie_policy_complete]` shortcode callback.
 	 *
 	 * Attributes:
-	 *   - lang         (en, it, fr, de, es, pt-BR, bg, cs) — override visitor locale
-	 *   - jurisdiction (gdpr-strict, ccpa-california, lgpd-brazil)
+	 *   - lang         (any valid BCP-47 code) — override visitor locale; when
+	 *                    no template ships, the jurisdiction fallback is used
+	 *   - jurisdiction (gdpr-strict, ccpa-california, lgpd-brazil, popia-southafrica)
 	 *
 	 * Both are optional. Without them the renderer falls back to WP get_locale
 	 * + admin default jurisdiction.

@@ -20,6 +20,8 @@ namespace FazCookie\Admin\Modules\Cookie_Policy_Generator\Api;
 
 use FazCookie\Admin\Modules\Cookie_Policy_Generator\Includes\Generator;
 use FazCookie\Admin\Modules\Cookie_Policy_Generator\Includes\Renderer;
+use FazCookie\Admin\Modules\Cookie_Policy_Generator\Includes\Section_Overrides;
+use FazCookie\Admin\Modules\Cookie_Policy_Generator\Includes\Template_Translations;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_Error;
@@ -86,6 +88,33 @@ class Cookie_Policy_Api {
 			'methods'             => 'GET',
 			'callback'            => array( $this, 'suggest_services' ),
 			'permission_callback' => array( $this, 'check_admin_read' ),
+		) );
+
+		// GET /cookie-policy/scaffold — the section list for one
+		// (jurisdiction, language) pair, so the editor can show what it is
+		// about to replace. Read-only; the admin cannot edit a section they
+		// cannot see.
+		register_rest_route( $ns, "/{$base}/scaffold", array(
+			'methods'             => 'GET',
+			'callback'            => array( $this, 'get_scaffold' ),
+			'permission_callback' => array( $this, 'check_admin_read' ),
+			'args'                => array(
+				'jurisdiction' => array(
+					'type'              => 'string',
+					'required'          => true,
+					'validate_callback' => static function ( $value ) {
+						return in_array( (string) $value, Generator::JURISDICTIONS, true );
+					},
+				),
+				'lang'         => array(
+					'type'              => 'string',
+					'required'          => true,
+					'validate_callback' => static function ( $value ) {
+						$language = Generator::normalize_language_code( $value );
+						return '' !== $language && in_array( $language, Generator::policy_languages(), true );
+					},
+				),
+			),
 		) );
 
 		// GET /cookie-policy/detected-services — same scan-derived list
@@ -166,6 +195,50 @@ class Cookie_Policy_Api {
 	}
 
 	/**
+	 * List the sections of the effective scaffold for one jurisdiction and
+	 * language, together with any override already stored for each.
+	 *
+	 * `template_lang` reports which bundled file actually supplied the text.
+	 * It differs from the requested language whenever the plugin ships no
+	 * template for it — a language registered for translation, for instance —
+	 * and the editor says so rather than letting the admin wonder why the
+	 * English wording is in front of them.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function get_scaffold( WP_REST_Request $request ) {
+		$jurisdiction = (string) $request->get_param( 'jurisdiction' );
+		$lang         = Generator::normalize_language_code( $request->get_param( 'lang' ) );
+
+		$path = Generator::resolve_template_path( $jurisdiction, $lang );
+		if ( ! $path || ! is_readable( $path ) ) {
+			return new WP_Error(
+				'faz_scaffold_missing',
+				__( 'No policy template is available for that jurisdiction and language.', 'faz-cookie-manager' ),
+				array( 'status' => 404 )
+			);
+		}
+
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- reading a bundled template from disk.
+		$scaffold = (string) file_get_contents( $path );
+		$scaffold = Template_Translations::apply( $jurisdiction, $lang, $scaffold );
+
+		$settings = array_replace_recursive( $this->default_settings(), (array) get_option( self::OPTION, array() ) );
+
+		return new WP_REST_Response(
+			array(
+				'jurisdiction'  => $jurisdiction,
+				'lang'          => $lang,
+				'template_lang' => basename( $path, '.md' ),
+				'sections'      => Section_Overrides::describe( $jurisdiction, $lang, $scaffold, $settings ),
+				'warnings'      => Section_Overrides::placeholder_warnings( $jurisdiction, $lang, $scaffold, $settings ),
+			),
+			200
+		);
+	}
+
+	/**
 	 * GET /cookie-policy/settings.
 	 */
 	public function get_settings() {
@@ -184,6 +257,10 @@ class Cookie_Policy_Api {
 	public function set_settings( WP_REST_Request $request ) {
 		$body = (array) $request->get_json_params();
 		$clean = $this->sanitize_settings( $body );
+		$missing = Generator::missing_required_settings( (string) $clean['jurisdiction'], $clean );
+		if ( $missing ) {
+			return $this->missing_required_error( $missing );
+		}
 		update_option( self::OPTION, $clean, false );
 		return new WP_REST_Response( array( 'saved' => true, 'data' => $clean ), 200 );
 	}
@@ -198,13 +275,30 @@ class Cookie_Policy_Api {
 	 * @param WP_REST_Request $request
 	 */
 	public function preview( WP_REST_Request $request ) {
-		$body = (array) $request->get_json_params();
+		$body     = (array) $request->get_json_params();
 		$override = isset( $body['settings'] ) && is_array( $body['settings'] )
 			? $this->sanitize_settings( $body['settings'] )
 			: null;
+		$settings = null !== $override
+			? $override
+			: (array) get_option( self::OPTION, array() );
+		$requested_jurisdiction = isset( $body['jurisdiction'] ) && is_scalar( $body['jurisdiction'] )
+			? sanitize_text_field( (string) $body['jurisdiction'] )
+			: '';
+		if ( ! in_array( $requested_jurisdiction, Generator::JURISDICTIONS, true ) ) {
+			$requested_jurisdiction = '';
+		}
+		$saved_jurisdiction = isset( $settings['jurisdiction'] ) && is_scalar( $settings['jurisdiction'] )
+			? (string) $settings['jurisdiction']
+			: '';
+		$jurisdiction = '' !== $requested_jurisdiction ? $requested_jurisdiction : $saved_jurisdiction;
+		$missing      = Generator::missing_required_settings( $jurisdiction, $settings );
+		if ( $missing ) {
+			return $this->missing_required_error( $missing );
+		}
 
 		$filter = null;
-		if ( $override ) {
+		if ( null !== $override ) {
 			// Temporarily swap the option so Renderer reads the preview payload.
 			// We use a filter — no DB write happens; pre_option_<key> short-circuits get_option.
 			$filter = function ( $value ) use ( $override ) {
@@ -224,12 +318,30 @@ class Cookie_Policy_Api {
 			);
 			$html = Renderer::render( $atts );
 		} finally {
-			if ( $filter ) {
+			if ( null !== $filter ) {
 				remove_filter( 'pre_option_' . self::OPTION, $filter );
 			}
 		}
 
 		return new WP_REST_Response( array( 'html' => $html ), 200 );
+	}
+
+	/**
+	 * Build the REST error returned when a jurisdiction-specific policy would
+	 * otherwise be rendered with mandatory declarations removed.
+	 *
+	 * @param string[] $missing Missing settings dot-paths.
+	 * @return WP_Error
+	 */
+	private function missing_required_error( array $missing ) {
+		return new WP_Error(
+			'faz_cookie_policy_missing_required',
+			__( 'Complete all fields required for the selected jurisdiction before saving or previewing the Cookie Policy.', 'faz-cookie-manager' ),
+			array(
+				'status' => 400,
+				'fields' => array_values( $missing ),
+			)
+		);
 	}
 
 	/**
@@ -269,7 +381,7 @@ class Cookie_Policy_Api {
 			'retention_months'     => 12,
 			'privacy_policy_url'   => '',
 			'language_priority'    => array( 'en', 'it', 'fr', 'de', 'es', 'pt-BR' ),
-			'section_overrides'    => array(), // section_id → free-form markdown
+			'section_overrides'    => array(), // jurisdiction → language → section index → anchor/text
 			// Admin-editable disclaimer (1.16.2). `show=true` + empty `text`
 			// reproduces the pre-1.16.2 behaviour: standard FAZ disclaimer in
 			// the active language. Set `show=false` to hide entirely.
@@ -293,19 +405,22 @@ class Cookie_Policy_Api {
 		if ( isset( $in['jurisdiction'] ) && in_array( $in['jurisdiction'], Generator::JURISDICTIONS, true ) ) {
 			$out['jurisdiction'] = (string) $in['jurisdiction'];
 		}
-		if ( isset( $in['default_lang'] ) && ( '' === $in['default_lang'] || in_array( $in['default_lang'], Generator::LANGUAGES, true ) ) ) {
-			$out['default_lang'] = (string) $in['default_lang'];
+		if ( isset( $in['default_lang'] ) ) {
+			$default_lang = '' === $in['default_lang'] ? '' : Generator::normalize_language_code( $in['default_lang'] );
+			if ( '' === $in['default_lang'] || in_array( $default_lang, Generator::policy_languages(), true ) ) {
+				$out['default_lang'] = $default_lang;
+			}
 		}
 
 		$company = is_array( $in['company'] ?? null ) ? $in['company'] : array();
 		$out['company']['name']     = $this->trim_clip( $company['name'] ?? '', 200 );
 		$out['company']['address']  = $this->trim_clip( $company['address'] ?? '', 500 );
-		$out['company']['email']    = sanitize_email( (string) ( $company['email'] ?? '' ) );
+		$out['company']['email']    = sanitize_email( is_scalar( $company['email'] ?? null ) ? (string) $company['email'] : '' );
 		$out['company']['registry'] = $this->trim_clip( $company['registry'] ?? '', 100 );
 
 		$dpo = is_array( $in['dpo'] ?? null ) ? $in['dpo'] : array();
 		$out['dpo']['name']    = $this->trim_clip( $dpo['name'] ?? '', 200 );
-		$out['dpo']['email']   = sanitize_email( (string) ( $dpo['email'] ?? '' ) );
+		$out['dpo']['email']   = sanitize_email( is_scalar( $dpo['email'] ?? null ) ? (string) $dpo['email'] : '' );
 		$out['dpo']['address'] = $this->trim_clip( $dpo['address'] ?? '', 500 );
 
 		// Allowlist of recognised third-party services. Kept FLAT here for
@@ -342,14 +457,15 @@ class Cookie_Policy_Api {
 			'onesignal', 'pushwoosh', 'fcm',
 		);
 		$services = is_array( $in['third_party_services'] ?? null ) ? $in['third_party_services'] : array();
+		$services = array_filter( $services, 'is_scalar' );
 		$out['third_party_services'] = array_values( array_intersect( $allowed_services, array_map( 'sanitize_text_field', $services ) ) );
 
-		if ( isset( $in['retention_months'] ) ) {
+		if ( isset( $in['retention_months'] ) && is_scalar( $in['retention_months'] ) ) {
 			$months = (int) $in['retention_months'];
 			$out['retention_months'] = max( 1, min( 120, $months ) );
 		}
 
-		if ( isset( $in['privacy_policy_url'] ) ) {
+		if ( isset( $in['privacy_policy_url'] ) && is_scalar( $in['privacy_policy_url'] ) ) {
 			$url = esc_url_raw( (string) $in['privacy_policy_url'] );
 			if ( '' !== $url && filter_var( $url, FILTER_VALIDATE_URL ) ) {
 				$out['privacy_policy_url'] = $url;
@@ -359,8 +475,9 @@ class Cookie_Policy_Api {
 		if ( isset( $in['language_priority'] ) && is_array( $in['language_priority'] ) ) {
 			$cleaned = array();
 			foreach ( $in['language_priority'] as $l ) {
-				if ( is_string( $l ) && in_array( $l, Generator::LANGUAGES, true ) && ! in_array( $l, $cleaned, true ) ) {
-					$cleaned[] = $l;
+				$language = is_string( $l ) ? Generator::normalize_language_code( $l ) : '';
+				if ( in_array( $language, Generator::policy_languages(), true ) && ! in_array( $language, $cleaned, true ) ) {
+					$cleaned[] = $language;
 				}
 			}
 			if ( ! empty( $cleaned ) ) {
@@ -394,24 +511,23 @@ class Cookie_Policy_Api {
 			}
 		}
 
-		if ( isset( $in['section_overrides'] ) && is_array( $in['section_overrides'] ) ) {
-			$cleaned = array();
-			foreach ( $in['section_overrides'] as $k => $v ) {
-				if ( ! is_string( $k ) || ! is_string( $v ) ) {
-					continue;
+		if ( isset( $in['section_overrides'] ) ) {
+			// Keyed by jurisdiction AND language: a flat key would mean editing
+			// the English GDPR policy silently rewrote the Italian POPIA one.
+			// Section bodies are Markdown that REPLACES a template section, so
+			// they need newlines and lists intact — trim_clip() runs
+			// sanitize_text_field(), which collapses whitespace and strips
+			// newlines, hence the multiline-safe variant here.
+			$out['section_overrides'] = Section_Overrides::sanitize(
+				$in['section_overrides'],
+				Generator::JURISDICTIONS,
+				Generator::policy_languages(),
+				// Closure, not array($this,'…'): trim_clip_multiline() is private,
+				// so a plain callable would be uninvokable from another class.
+				function ( $value, $max ) {
+					return $this->trim_clip_multiline( $value, $max );
 				}
-				$key = preg_replace( '/[^a-z0-9_]/', '', strtolower( $k ) );
-				if ( '' === $key || strlen( $key ) > 64 ) {
-					continue;
-				}
-				// Section overrides are markdown bodies that REPLACE a template
-				// section — they need newlines, lists, paragraphs intact.
-				// trim_clip() uses sanitize_text_field() which collapses
-				// whitespace and strips newlines; for this field we use the
-				// multiline-safe variant.
-				$cleaned[ $key ] = $this->trim_clip_multiline( $v, 5000 );
-			}
-			$out['section_overrides'] = $cleaned;
+			);
 		}
 
 		return $out;

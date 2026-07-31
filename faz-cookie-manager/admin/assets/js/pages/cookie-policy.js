@@ -19,6 +19,12 @@
 	var root = document.getElementById('faz-cookie-policy-app');
 	if (!root) { return; }
 
+	// Every stored override, keyed [jurisdiction][lang][index]. Hydrated from
+	// the saved settings and serialised back WHOLE on save — serialising only
+	// the textareas currently on screen would wipe every other pair's text the
+	// first time someone saved while looking at a different one.
+	var sectionOverrides = {};
+
 	var REST_URL   = root.dataset.fazRestUrl || '';
 	var REST_NONCE = root.dataset.fazRestNonce || '';
 
@@ -41,6 +47,10 @@
 	// earlier /suggest-services response paint stale state over a newer
 	// one. Mirrors the GVL admin page's autoDetectRequestId (PR #127).
 	var autoDetectRequestId = 0;
+
+	// Discard an older scaffold response when the administrator switches the
+	// jurisdiction/language selectors before it returns.
+	var overrideRequestId = 0;
 
 	// Service IDs the admin manually UNTICKED during this session (since the
 	// last hydration / save). Auto-detect consults this so a re-run does not
@@ -163,10 +173,72 @@
 			if (el.type === 'number') { v = parseInt(v, 10); if (isNaN(v)) { v = 0; } }
 			setDeep(out, name, v);
 		});
+		out.section_overrides = sectionOverrides;
 		return out;
 	}
 
+	function syncJurisdictionRequirements() {
+		var jurisdiction = document.getElementById('cp-jurisdiction');
+		var popia = !!jurisdiction && jurisdiction.value === 'popia-southafrica';
+		[
+			'company.address', 'dpo.name', 'dpo.email', 'privacy_policy_url'
+		].forEach(function (name) {
+			var field = document.querySelector('[name="' + name + '"]');
+			if (!field) { return; }
+			field.required = popia;
+			if (popia) { field.setAttribute('aria-required', 'true'); }
+			else { field.removeAttribute('aria-required'); }
+		});
+	}
+
+	// Blocking a submit without saying so reproduces the exact "the button
+	// does nothing" symptom this page already ships a watchdog notice for:
+	// the form carries `novalidate`, so the browser prints nothing on its
+	// own, and reportValidity()'s bubble is transient and never appears for
+	// a control the browser cannot focus (inside a collapsed <details>, or
+	// hidden by a conflicting stylesheet). Always leave a persistent message
+	// in the status line, naming the first offending field, and move focus
+	// to it so keyboard and screen-reader users land on the problem.
+	function validateForm() {
+		var form = document.getElementById('faz-cookie-policy-form');
+		if (!form) { return true; }
+		syncJurisdictionRequirements();
+		if (form.checkValidity()) { return true; }
+
+		var invalid = form.querySelector(':invalid');
+		var label = '';
+		if (invalid) {
+			var labelEl = invalid.id ? form.querySelector('label[for="' + invalid.id + '"]') : null;
+			label = labelEl ? (labelEl.textContent || '').trim() : (invalid.name || '');
+		}
+		setStatus(
+			label
+				? t( 'requiredMissing', 'Fill in the required fields before saving' ) + ': ' + label
+				: t( 'requiredMissingGeneric', 'Fill in the required fields before saving.' ),
+			'error'
+		);
+		form.reportValidity();
+		if (invalid && typeof invalid.focus === 'function') {
+			// Reveal the field first when it sits inside a collapsed section,
+			// otherwise focus() is a no-op and the message has nothing to point at.
+			var wrapper = invalid.closest ? invalid.closest('details') : null;
+			if (wrapper && !wrapper.open) { wrapper.open = true; }
+			invalid.focus();
+		}
+		return false;
+	}
+
 	function writeForm(settings) {
+		// PHP serialises an empty array() as `[]`, and `typeof [] === 'object'`,
+		// so a naive check hands us an Array. Named properties CAN be set on an
+		// Array — and JSON.stringify() then drops every one of them, so the save
+		// would post an empty map with no error anywhere. Reject arrays explicitly.
+		var storedOverrides = settings && settings.section_overrides;
+		sectionOverrides = (storedOverrides && typeof storedOverrides === 'object' && !Array.isArray(storedOverrides))
+			? storedOverrides
+			: {};
+		renderOverrideSections(null);
+
 		// Scalar fields.
 		[
 			'company.name', 'company.address', 'company.email', 'company.registry',
@@ -196,6 +268,7 @@
 		// Programmatic .checked above does not fire 'change', so the map is
 		// not about to be repopulated by this write.
 		userUntickedServices = Object.create(null);
+		syncJurisdictionRequirements();
 	}
 
 	// ---------- services list (renders the checkboxes) ----------
@@ -548,6 +621,112 @@
 			});
 	}
 
+	/* ── Policy text overrides ── */
+
+	// Reach (or create) the bucket for one jurisdiction/language pair.
+	function overrideBucket(jurisdiction, lang, create) {
+		if (!sectionOverrides[jurisdiction]) {
+			if (!create) { return null; }
+			sectionOverrides[jurisdiction] = {};
+		}
+		if (!sectionOverrides[jurisdiction][lang]) {
+			if (!create) { return null; }
+			sectionOverrides[jurisdiction][lang] = {};
+		}
+		return sectionOverrides[jurisdiction][lang];
+	}
+
+	function setOverrideStatus(msg) {
+		var el = document.getElementById('cp-override-status');
+		if (el) { el.textContent = msg || ''; }
+	}
+
+	// One textarea per scaffold section. The shipped text is the *placeholder*,
+	// not the value: an empty box has to mean "keep what ships", so that a
+	// plugin update can still improve wording nobody deliberately replaced.
+	function renderOverrideSections(data) {
+		var host = document.getElementById('cp-override-sections');
+		if (!host) { return; }
+		host.innerHTML = '';
+		if (!data || !Array.isArray(data.sections)) { return; }
+
+		if (data.template_lang && data.template_lang !== data.lang) {
+			var note = document.createElement('p');
+			note.className = 'faz-help';
+			note.textContent = (FAZ_I18N.overrideFallback || 'No template ships for this language, so the sections below show the bundled fallback. What you write is still stored against the language you picked.');
+			host.appendChild(note);
+		}
+		if (Array.isArray(data.warnings)) {
+			data.warnings.forEach(function (warning) {
+				if (typeof warning !== 'string' || warning.trim() === '') { return; }
+				var notice = document.createElement('div');
+				notice.className = 'notice notice-warning inline';
+				var message = document.createElement('p');
+				message.textContent = warning;
+				notice.appendChild(message);
+				host.appendChild(notice);
+			});
+		}
+
+		var bucket = overrideBucket(data.jurisdiction, data.lang, false) || {};
+
+		data.sections.forEach(function (section) {
+			var wrap = document.createElement('div');
+			wrap.className = 'faz-form-group';
+
+			var label = document.createElement('label');
+			label.setAttribute('for', 'cp-override-' + section.index);
+			label.textContent = section.anchor || ('#' + section.index);
+			wrap.appendChild(label);
+
+			var ta = document.createElement('textarea');
+			ta.id = 'cp-override-' + section.index;
+			ta.className = 'faz-textarea';
+			ta.rows = 6;
+			ta.placeholder = section.shipped;
+			var stored = bucket[String(section.index)];
+			ta.value = (stored && stored.text) ? stored.text : '';
+
+			ta.addEventListener('input', function () {
+				var target = overrideBucket(data.jurisdiction, data.lang, true);
+				if (ta.value.trim() === '') {
+					// Clearing the box removes the override rather than storing an
+					// empty string, which would blank the section instead.
+					delete target[String(section.index)];
+				} else {
+					// The anchor travels with the text so the server can detect a
+					// scaffold that moved under it and fall back to shipped wording.
+					target[String(section.index)] = { anchor: section.anchor, text: ta.value };
+				}
+			});
+
+			wrap.appendChild(ta);
+			host.appendChild(wrap);
+		});
+	}
+
+	function loadOverrideSections() {
+		var jEl = document.getElementById('cp-override-jurisdiction');
+		var lEl = document.getElementById('cp-override-lang');
+		if (!jEl || !lEl) { return; }
+		overrideRequestId += 1;
+		var myReqId = overrideRequestId;
+		var jurisdiction = jEl.value;
+		var lang = lEl.value;
+		setOverrideStatus(FAZ_I18N.overrideLoading || 'Loading…');
+		api('GET', 'scaffold?jurisdiction=' + encodeURIComponent(jurisdiction) + '&lang=' + encodeURIComponent(lang))
+			.then(function (data) {
+				if (myReqId !== overrideRequestId || jEl.value !== jurisdiction || lEl.value !== lang) { return; }
+				renderOverrideSections(data);
+				setOverrideStatus('');
+			})
+			.catch(function (err) {
+				if (myReqId !== overrideRequestId || jEl.value !== jurisdiction || lEl.value !== lang) { return; }
+				renderOverrideSections(null);
+				setOverrideStatus((err && err.message) || FAZ_I18N.overrideLoadFailed || 'Could not load the sections.');
+			});
+	}
+
 	function init() {
 	  try {
 		// Initial render runs sync (badges absent because detected set is
@@ -558,6 +737,11 @@
 		// data at all). Both rendering passes preserve the checkbox
 		// state because writeForm() runs after the second render.
 		renderServicesList();
+		var jurisdictionSelect = document.getElementById('cp-jurisdiction');
+		if (jurisdictionSelect) {
+			jurisdictionSelect.addEventListener('change', syncJurisdictionRequirements);
+			syncJurisdictionRequirements();
+		}
 
 		// Bind + disable Auto-detect BEFORE the Promise.all fires. If
 		// the user clicks the button during hydration, writeForm(settings)
@@ -570,6 +754,20 @@
 			autoDetectBtn.disabled = true;
 			autoDetectBtn.addEventListener('click', autoDetectServices);
 		}
+
+		var overrideLoadBtn = document.getElementById('cp-override-load');
+		if (overrideLoadBtn) {
+			overrideLoadBtn.addEventListener('click', loadOverrideSections);
+		}
+		['cp-override-jurisdiction', 'cp-override-lang'].forEach(function (id) {
+			var selector = document.getElementById(id);
+			if (!selector) { return; }
+			selector.addEventListener('change', function () {
+				overrideRequestId += 1;
+				renderOverrideSections(null);
+				setOverrideStatus('');
+			});
+		});
 
 		// Track the admin's manual tick/untick of service checkboxes so
 		// Auto-detect can skip a detected service the admin deliberately
@@ -652,6 +850,7 @@
 				setStatus(t( 'loadFailed', 'Settings did not load — reload the page before saving.' ), 'error');
 				return;
 			}
+			if (!validateForm()) { return; }
 			var payload = readForm();
 			setStatus(t( 'saving', 'Saving…' ), '');
 			api('POST', 'settings', payload)
@@ -667,6 +866,7 @@
 		});
 
 		document.getElementById('cp-preview-btn').addEventListener('click', function () {
+			if (!validateForm()) { return; }
 			// Race-condition guard: if the user clicks Preview multiple times
 			// quickly the responses may resolve out of order. We capture the
 			// pre-increment id and only commit results whose id is still the

@@ -14,6 +14,27 @@ defined( 'ABSPATH' ) || exit;
 
 $rest_nonce = wp_create_nonce( 'wp_rest' );
 $rest_url   = esc_url( rest_url( 'faz/v1/cookie-policy/' ) );
+
+$faz_cp_generator = '\\FazCookie\\Admin\\Modules\\Cookie_Policy_Generator\\Includes\\Generator';
+$faz_cp_languages = $faz_cp_generator::policy_languages();
+$faz_cp_language_names = array();
+$faz_cp_language_controller = \FazCookie\Admin\Modules\Languages\Includes\Controller::get_instance();
+foreach ( $faz_cp_language_controller->get_languages() as $faz_cp_language_name => $faz_cp_language_code ) {
+	$faz_cp_canonical_code = $faz_cp_generator::normalize_language_code( $faz_cp_language_code );
+	if ( '' !== $faz_cp_canonical_code ) {
+		$faz_cp_language_names[ $faz_cp_canonical_code ] = (string) $faz_cp_language_name;
+	}
+}
+$faz_cp_bundled_language_names = array(
+	'en'    => __( 'English', 'faz-cookie-manager' ),
+	'it'    => __( 'Italian', 'faz-cookie-manager' ),
+	'fr'    => __( 'French', 'faz-cookie-manager' ),
+	'de'    => __( 'German', 'faz-cookie-manager' ),
+	'es'    => __( 'Spanish', 'faz-cookie-manager' ),
+	'pt-BR' => __( 'Portuguese (Brazil)', 'faz-cookie-manager' ),
+	'bg'    => __( 'Bulgarian', 'faz-cookie-manager' ),
+	'cs'    => __( 'Czech', 'faz-cookie-manager' ),
+);
 ?>
 <div id="faz-cookie-policy-app"
      data-faz-rest-url="<?php echo esc_url( $rest_url ); ?>"
@@ -75,13 +96,13 @@ $rest_url   = esc_url( rest_url( 'faz/v1/cookie-policy/' ) );
 			</div>
 			<div class="faz-card-body">
 				<div class="faz-form-group">
-					<label for="cp-dpo-name"><?php esc_html_e( 'DPO / Encarregado / Privacy Officer name', 'faz-cookie-manager' ); ?></label>
+					<label for="cp-dpo-name"><?php esc_html_e( 'DPO / Encarregado / Information Officer name', 'faz-cookie-manager' ); ?></label>
 					<input type="text" id="cp-dpo-name" name="dpo.name" class="faz-input">
 				</div>
 				<div class="faz-form-group">
-					<label for="cp-dpo-email"><?php esc_html_e( 'DPO email', 'faz-cookie-manager' ); ?></label>
+					<label for="cp-dpo-email"><?php esc_html_e( 'DPO / Encarregado / Information Officer email', 'faz-cookie-manager' ); ?></label>
 					<input type="email" id="cp-dpo-email" name="dpo.email" class="faz-input">
-					<div class="faz-help"><?php esc_html_e( 'Mandatory for LGPD (Art. 41) and recommended for GDPR.', 'faz-cookie-manager' ); ?></div>
+					<div class="faz-help"><?php esc_html_e( 'Mandatory for LGPD (Art. 41). Under POPIA, the head of a public or private body is the Information Officer by default; name and contact email are required by this POPIA template. Recommended for GDPR where no DPO is legally required.', 'faz-cookie-manager' ); ?></div>
 				</div>
 			</div>
 		</div>
@@ -98,6 +119,7 @@ $rest_url   = esc_url( rest_url( 'faz/v1/cookie-policy/' ) );
 						<option value="gdpr-strict"><?php esc_html_e( 'GDPR (EU / EEA / UK)', 'faz-cookie-manager' ); ?></option>
 						<option value="ccpa-california"><?php esc_html_e( 'CCPA / CPRA (California, USA)', 'faz-cookie-manager' ); ?></option>
 						<option value="lgpd-brazil"><?php esc_html_e( 'LGPD (Brazil)', 'faz-cookie-manager' ); ?></option>
+						<option value="popia-southafrica"><?php esc_html_e( 'POPIA (South Africa)', 'faz-cookie-manager' ); ?></option>
 					</select>
 					<div class="faz-help"><?php esc_html_e( 'Override per shortcode call with [faz_cookie_policy_complete jurisdiction="..."].', 'faz-cookie-manager' ); ?></div>
 				</div>
@@ -136,6 +158,61 @@ $rest_url   = esc_url( rest_url( 'faz/v1/cookie-policy/' ) );
 			</details>
 		</div>
 
+		<!-- 4b. Policy text — ADVANCED. Collapsed by default: the shipped
+		     sections are reviewed and most sites should leave them alone.
+		     Exists because the operator is the one who knows their own
+		     processing, and because a policy may be needed in a language the
+		     plugin ships no template for. -->
+		<div class="faz-card">
+			<details>
+				<summary class="faz-card-header" style="cursor:pointer; list-style:revert;">
+					<h3 style="display:inline-block; margin:0;">
+						<?php esc_html_e( 'Policy text', 'faz-cookie-manager' ); ?>
+						<span style="font-weight:normal; font-size:12px; color:#666; margin-left:6px;">
+							<?php esc_html_e( '— advanced, optional', 'faz-cookie-manager' ); ?>
+						</span>
+					</h3>
+				</summary>
+				<div class="faz-card-body">
+					<div class="faz-help" style="margin-bottom:.75rem;">
+						<?php echo wp_kses_post( __( '<strong>You probably don\'t need this.</strong> The shipped sections are reviewed starting points. Fill a box only to replace that section with your own wording — placeholders such as <code>{{COMPANY_NAME}}</code> keep working inside it. Text you write here is <strong>your</strong> document, so review the disclaimer setting below accordingly. Leave a box empty to keep the shipped text.', 'faz-cookie-manager' ) ); ?>
+					</div>
+					<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:.75rem;">
+						<div class="faz-form-group" style="margin:0;">
+							<label for="cp-override-jurisdiction"><?php esc_html_e( 'Jurisdiction', 'faz-cookie-manager' ); ?></label>
+							<select id="cp-override-jurisdiction" class="faz-select">
+								<option value="gdpr-strict"><?php esc_html_e( 'GDPR (EU / EEA / UK)', 'faz-cookie-manager' ); ?></option>
+								<option value="ccpa-california"><?php esc_html_e( 'CCPA / CPRA (California, USA)', 'faz-cookie-manager' ); ?></option>
+								<option value="lgpd-brazil"><?php esc_html_e( 'LGPD (Brazil)', 'faz-cookie-manager' ); ?></option>
+								<option value="popia-southafrica"><?php esc_html_e( 'POPIA (South Africa)', 'faz-cookie-manager' ); ?></option>
+							</select>
+						</div>
+						<div class="faz-form-group" style="margin:0;">
+							<label for="cp-override-lang"><?php esc_html_e( 'Language', 'faz-cookie-manager' ); ?></label>
+							<select id="cp-override-lang" class="faz-select">
+								<?php
+								foreach ( $faz_cp_languages as $faz_cp_lang ) {
+									$faz_cp_label = $faz_cp_bundled_language_names[ $faz_cp_lang ]
+										?? ( $faz_cp_language_names[ $faz_cp_lang ] ?? $faz_cp_lang );
+									printf(
+										'<option value="%1$s">%2$s (%1$s)</option>',
+										esc_attr( $faz_cp_lang ),
+										esc_html( $faz_cp_label )
+									);
+								}
+								?>
+							</select>
+						</div>
+						<button class="faz-btn faz-btn-secondary faz-btn-sm" id="cp-override-load" type="button">
+							<?php esc_html_e( 'Load sections', 'faz-cookie-manager' ); ?>
+						</button>
+						<span id="cp-override-status" aria-live="polite" aria-atomic="true" style="color:var(--faz-text-secondary);font-size:12px;"></span>
+					</div>
+					<div id="cp-override-sections" class="faz-form-group"></div>
+				</div>
+			</details>
+		</div>
+
 		<!-- 5. Cookies link (read-only — list pulled at render time) -->
 		<div class="faz-card">
 			<div class="faz-card-header">
@@ -163,11 +240,12 @@ $rest_url   = esc_url( rest_url( 'faz/v1/cookie-policy/' ) );
 			</div>
 			<div class="faz-card-body">
 				<div class="faz-form-group">
-					<label for="cp-retention-months"><?php esc_html_e( 'Default retention period (months)', 'faz-cookie-manager' ); ?></label>
+					<label for="cp-retention-months"><?php esc_html_e( 'Declared fallback retention period (months)', 'faz-cookie-manager' ); ?></label>
 					<input type="number" id="cp-retention-months" name="retention_months" class="faz-input" min="1" max="120" step="1" value="12" style="max-width:8em;">
+					<div class="faz-help"><?php esc_html_e( 'Used only as a policy declaration when no shorter cookie-specific period applies. It does not change consent-log or third-party analytics retention settings.', 'faz-cookie-manager' ); ?></div>
 				</div>
 				<div class="faz-form-group">
-					<label for="cp-privacy-policy-url"><?php esc_html_e( 'Separate Privacy Policy URL (optional)', 'faz-cookie-manager' ); ?></label>
+					<label for="cp-privacy-policy-url"><?php esc_html_e( 'Separate Privacy Policy URL (required for POPIA)', 'faz-cookie-manager' ); ?></label>
 					<input type="url" id="cp-privacy-policy-url" name="privacy_policy_url" class="faz-input" placeholder="<?php echo esc_attr__( 'https://example.com/privacy', 'faz-cookie-manager' ); ?>">
 				</div>
 			</div>
@@ -183,14 +261,17 @@ $rest_url   = esc_url( rest_url( 'faz/v1/cookie-policy/' ) );
 					<label for="cp-default-lang"><?php esc_html_e( 'Force a specific language (otherwise follows visitor locale)', 'faz-cookie-manager' ); ?></label>
 					<select id="cp-default-lang" name="default_lang" class="faz-select">
 						<option value=""><?php esc_html_e( 'Follow visitor locale (recommended)', 'faz-cookie-manager' ); ?></option>
-						<option value="en"><?php esc_html_e( 'English', 'faz-cookie-manager' ); ?></option>
-						<option value="it"><?php esc_html_e( 'Italian', 'faz-cookie-manager' ); ?></option>
-						<option value="fr"><?php esc_html_e( 'French', 'faz-cookie-manager' ); ?></option>
-						<option value="de"><?php esc_html_e( 'German', 'faz-cookie-manager' ); ?></option>
-						<option value="es"><?php esc_html_e( 'Spanish', 'faz-cookie-manager' ); ?></option>
-						<option value="pt-BR"><?php esc_html_e( 'Portuguese (Brazil)', 'faz-cookie-manager' ); ?></option>
-						<option value="bg"><?php esc_html_e( 'Bulgarian', 'faz-cookie-manager' ); ?></option>
-						<option value="cs"><?php esc_html_e( 'Czech', 'faz-cookie-manager' ); ?></option>
+						<?php
+						foreach ( $faz_cp_languages as $faz_cp_lang ) {
+							$faz_cp_label = $faz_cp_bundled_language_names[ $faz_cp_lang ]
+								?? ( $faz_cp_language_names[ $faz_cp_lang ] ?? $faz_cp_lang );
+							printf(
+								'<option value="%1$s">%2$s (%1$s)</option>',
+								esc_attr( $faz_cp_lang ),
+								esc_html( $faz_cp_label )
+							);
+						}
+						?>
 					</select>
 				</div>
 			</div>
