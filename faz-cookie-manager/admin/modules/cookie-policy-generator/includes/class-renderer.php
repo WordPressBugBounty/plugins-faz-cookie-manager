@@ -21,9 +21,25 @@
 
 namespace FazCookie\Admin\Modules\Cookie_Policy_Generator\Includes;
 
+use FazCookie\Includes\Cookie_Content_I18n;
+
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
+
+// The renderer is routinely loaded by hand (unit suites, CLI tools) with no
+// autoloader and no plugin bootstrap, so every class the render pipeline hard-
+// depends on is pulled in here: loading this one file has to be enough to
+// render. Document_Registry::build() reads its coordinates off Generator and
+// Template_Translations, so requiring only the two registry files would move
+// the old "Class not found" fatal from render() into the registry instead of
+// removing it.
+require_once __DIR__ . '/class-generator.php';
+require_once __DIR__ . '/class-template-translations.php';
+require_once __DIR__ . '/class-section-overrides.php';
+require_once __DIR__ . '/class-document-config.php';
+require_once __DIR__ . '/class-document-registry.php';
+require_once dirname( __DIR__, 4 ) . '/includes/class-cookie-content-i18n.php';
 
 /**
  * Cookie policy renderer.
@@ -72,7 +88,34 @@ class Renderer {
 	 * @return string HTML (already wp_kses_post'd, safe to echo).
 	 */
 	public static function render( $atts = array() ) {
-		$settings = (array) get_option( self::SETTINGS_OPTION, array() );
+		$doc = Document_Registry::get( 'cookie-policy' );
+		if ( ! $doc instanceof Document_Config ) {
+			// Unreachable while the registry is the hardcoded array it is today,
+			// but render() is a shortcode callback: a missing document must
+			// degrade to an empty string on a public page, never to a TypeError
+			// that takes the whole post down with it.
+			return '';
+		}
+		return self::render_for( $doc, $atts );
+	}
+
+	/**
+	 * Render one registered document.
+	 *
+	 * This is render()'s pipeline, with every cookie-policy-specific coordinate
+	 * (settings option, template tree, gettext catalogue, mandatory fields,
+	 * token builder, wrapper class) read from the document config instead of
+	 * being hardcoded. For the cookie policy the two paths are byte-identical —
+	 * pinned by tests/unit/test-cookie-policy-golden-render.php.
+	 *
+	 * @param Document_Config      $doc  Document to render.
+	 * @param array<string,string> $atts Shortcode attributes:
+	 *                                   - 'lang' (optional)
+	 *                                   - 'jurisdiction' (optional)
+	 * @return string HTML (already kses'd, safe to echo).
+	 */
+	public static function render_for( Document_Config $doc, $atts = array() ) {
+		$settings = (array) get_option( $doc->option(), array() );
 
 		// Merge a minimal structural baseline so substitution doesn't trip on
 		// missing keys when the option is absent. See baseline_defaults() —
@@ -86,17 +129,17 @@ class Renderer {
 		$lang = self::resolve_lang( $atts, $settings );
 
 		// FR-03 step 2: resolve jurisdiction.
-		$jurisdiction = self::resolve_jurisdiction( $atts, $settings );
+		$jurisdiction = self::resolve_jurisdiction( $atts, $settings, $doc );
 		// Validate the jurisdiction that will actually be rendered. A shortcode
 		// override changes the legal regime, but it must never bypass that
 		// regime's mandatory fields (notably the POPIA operator and Information
 		// Officer details).
-		if ( Generator::missing_required_settings( $jurisdiction, $settings ) ) {
+		if ( $doc->missing_required_settings( $jurisdiction, $settings ) ) {
 			return self::incomplete_configuration_notice();
 		}
 
 		// FR-03 step 3: load scaffold.
-		$template_path = Generator::resolve_template_path( $jurisdiction, $lang );
+		$template_path = Generator::resolve_template_path( $jurisdiction, $lang, $doc );
 		if ( null === $template_path ) {
 			// NFR-03 graceful no-op + admin notice.
 			return self::no_template_notice( $jurisdiction, $lang );
@@ -113,7 +156,7 @@ class Renderer {
 		if ( '' === $scaffold ) {
 			return self::no_template_notice( $jurisdiction, $lang );
 		}
-		$scaffold = Template_Translations::apply( $jurisdiction, $lang, $scaffold );
+		$scaffold = Template_Translations::apply( $jurisdiction, $lang, $scaffold, $doc );
 
 		// Administrator-authored sections win over both the bundled template and
 		// any translation: an explicit editorial decision is the most specific
@@ -123,7 +166,7 @@ class Renderer {
 		$scaffold = Section_Overrides::apply( $jurisdiction, $lang, $scaffold, $settings );
 
 		// FR-03 step 5: build data.
-		$data = self::build_data( $settings, $jurisdiction, $lang );
+		$data = $doc->build_data( $settings, $jurisdiction, $lang );
 
 		// FR-03 step 6+7: substitute + convert.
 		//
@@ -137,7 +180,7 @@ class Renderer {
 		// sentinel back for the real HTML. Standalone-line sentinels get the
 		// surrounding `<p>` wrapper stripped so the injected block sits at the
 		// right nesting level.
-		$html_tokens   = array_intersect_key( $data, array_flip( Generator::HTML_TOKENS ) );
+		$html_tokens   = array_intersect_key( $data, array_flip( $doc->html_tokens() ) );
 		$data_for_md   = $data;
 		foreach ( array_keys( $html_tokens ) as $token_name ) {
 			$data_for_md[ $token_name ] = Generator::html_token_sentinel( $token_name );
@@ -212,7 +255,7 @@ class Renderer {
 		$policy_version = self::register_version_meta( $template_path, $data, $scaffold );
 
 		// Wrap in <article> per NFR-02-X accessibility.
-		$wrapper_open  = '<article class="faz-cookie-policy" lang="' . esc_attr( $lang )
+		$wrapper_open  = '<article class="' . esc_attr( $doc->wrapper_class() ) . '" lang="' . esc_attr( $lang )
 			. '" data-jurisdiction="' . esc_attr( $jurisdiction )
 			. '" data-faz-policy-version="' . esc_attr( $policy_version ) . '">';
 		$wrapper_close = '</article>';
@@ -304,31 +347,42 @@ class Renderer {
 	}
 
 	/**
-	 * Resolve effective jurisdiction. Explicit > admin default > gdpr-strict.
+	 * Resolve effective jurisdiction. Explicit > admin default > first supported.
 	 *
-	 * @param array $atts
-	 * @param array $settings
+	 * The final fallback is the document's FIRST declared jurisdiction — for the
+	 * cookie policy that is 'gdpr-strict', the same value this method returned
+	 * when it was hardcoded.
+	 *
+	 * @param array           $atts
+	 * @param array           $settings
+	 * @param Document_Config $doc Document being rendered.
 	 * @return string
 	 */
-	private static function resolve_jurisdiction( array $atts, array $settings ) {
-		if ( ! empty( $atts['jurisdiction'] ) && in_array( $atts['jurisdiction'], Generator::JURISDICTIONS, true ) ) {
+	private static function resolve_jurisdiction( array $atts, array $settings, Document_Config $doc ) {
+		$jurisdictions = $doc->jurisdictions();
+		if ( ! empty( $atts['jurisdiction'] ) && in_array( $atts['jurisdiction'], $jurisdictions, true ) ) {
 			return (string) $atts['jurisdiction'];
 		}
-		if ( ! empty( $settings['jurisdiction'] ) && in_array( $settings['jurisdiction'], Generator::JURISDICTIONS, true ) ) {
+		if ( ! empty( $settings['jurisdiction'] ) && in_array( $settings['jurisdiction'], $jurisdictions, true ) ) {
 			return (string) $settings['jurisdiction'];
 		}
-		return 'gdpr-strict';
+		return (string) $jurisdictions[0];
 	}
 
 	/**
 	 * Build the substitution-data array.
+	 *
+	 * Internal API: public only because Document_Registry registers it as the
+	 * cookie policy's `data_builder` callable, which PHP cannot invoke on a
+	 * private method from outside the class. Not part of the plugin's public
+	 * surface — call it through Document_Config::build_data().
 	 *
 	 * @param array  $settings    Admin form payload.
 	 * @param string $jurisdiction
 	 * @param string $lang
 	 * @return array<string,string>
 	 */
-	private static function build_data( array $settings, $jurisdiction, $lang ) {
+	public static function build_data( array $settings, $jurisdiction, $lang ) {
 		$company = (array) ( $settings['company'] ?? array() );
 		$dpo     = (array) ( $settings['dpo'] ?? array() );
 
@@ -512,8 +566,8 @@ class Renderer {
 					// i18n JSON objects on the same schema as categories.
 					$name     = (string) ( $row['cookie_name'] ?? '' );
 					$domain   = (string) ( $row['cookie_domain'] ?? '' );
-					$duration = self::decode_i18n_text( $row['cookie_duration'] ?? '', $lang );
-					$desc     = self::decode_i18n_text( $row['cookie_description'] ?? '', $lang );
+					$duration = self::decode_cookie_i18n_text( $row['cookie_duration'] ?? '', $lang, $name, 'duration', $domain );
+					$desc     = self::decode_cookie_i18n_text( $row['cookie_description'] ?? '', $lang, $name, 'description', $domain );
 					$parts[]  = '<tr>';
 					$parts[]  = '<td data-label="' . $col_cookie . '"><code>' . esc_html( $name ) . '</code></td>';
 					$parts[]  = '<td data-label="' . $col_domain . '">' . ( '' !== $domain ? esc_html( $domain ) : '&mdash;' ) . '</td>';
@@ -584,6 +638,64 @@ class Renderer {
 			}
 		}
 		return '';
+	}
+
+	/**
+	 * Decode a cookie i18n value and consult the bundled field fallback before
+	 * falling back to a different stored language.
+	 *
+	 * @param mixed  $value Cookie DB value.
+	 * @param string $lang  Requested policy language.
+	 * @param string $slug  Cookie name/slug.
+	 * @param string $key   description|duration.
+	 * @param string $domain Cookie domain used by domain-constrained catalogue entries.
+	 * @return string
+	 */
+	private static function decode_cookie_i18n_text( $value, $lang, $slug, $key, $domain = '' ) {
+		$decoded = array();
+		if ( is_array( $value ) ) {
+			$decoded = $value;
+		} elseif ( is_string( $value ) && '' !== $value && '{' === $value[0] ) {
+			$candidate = json_decode( $value, true );
+			$decoded   = is_array( $candidate ) ? $candidate : array();
+		}
+
+		if ( isset( $decoded[ $lang ] ) && is_string( $decoded[ $lang ] ) && '' !== $decoded[ $lang ] ) {
+			$translated = Cookie_Content_I18n::translate( $slug, $key, $decoded[ $lang ], $lang, $domain );
+			return '' !== $translated ? $translated : $decoded[ $lang ];
+		}
+
+		$source  = '';
+		$default = function_exists( 'faz_default_language' ) ? faz_default_language() : 'en';
+		foreach ( array( $default, 'en' ) as $source_lang ) {
+			if ( isset( $decoded[ $source_lang ] ) && is_string( $decoded[ $source_lang ] ) && '' !== $decoded[ $source_lang ] ) {
+				$source = $decoded[ $source_lang ];
+				break;
+			}
+		}
+		if ( '' === $source ) {
+			foreach ( $decoded as $entry ) {
+				if ( is_string( $entry ) && '' !== $entry ) {
+					$source = $entry;
+					break;
+				}
+			}
+		}
+		if ( empty( $decoded ) && is_string( $value ) && ( '' === $value || '{' !== $value[0] ) ) {
+			$source = $value;
+		}
+
+		// Plain legacy strings are values in the site's default language. Keep
+		// custom administrator wording intact when rendering that language, and
+		// consult the bundled catalogue only for a different missing language.
+		$normalized_lang    = strtolower( str_replace( '_', '-', (string) $lang ) );
+		$normalized_default = strtolower( str_replace( '_', '-', (string) $default ) );
+		if ( empty( $decoded ) && '' !== $source && $normalized_lang === $normalized_default ) {
+			return $source;
+		}
+
+		$translated = Cookie_Content_I18n::translate( $slug, $key, $source, $lang, $domain );
+		return '' !== $translated ? $translated : self::decode_i18n_text( $value, $lang );
 	}
 
 	/**

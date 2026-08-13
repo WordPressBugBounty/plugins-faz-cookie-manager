@@ -67,7 +67,29 @@ defined( 'ABSPATH' ) || exit;
 				</label>
 				<div class="faz-help"><?php esc_html_e( 'When enabled, visitors can accept or reject individual services (e.g., Google Analytics, YouTube) instead of entire categories. Services detected by the scanner are shown immediately, and embedded providers blocked at runtime are revealed when the browser sees them on the page. This keeps the preference center present-aware but makes it more complex.', 'faz-cookie-manager' ); ?></div>
 			</div>
-			<div class="faz-form-group">
+			<?php
+			/*
+			 * Gated on its parent because Settings::sanitize() forces
+			 * per_cookie_consent off whenever per_service_consent is off. Left
+			 * ungated, the admin could tick a nested-cookie mode that the server
+			 * silently discarded, get the generic "Settings saved successfully."
+			 * toast, and keep looking at an enabled toggle for the rest of the
+			 * session — the one thing a settings screen must never do.
+			 *
+			 * Hiding alone DOES keep it out of the payload: FAZ.serializeForm()
+			 * skips any [data-path] whose [data-show-if] wrapper computes to
+			 * display:none (faz-admin.js). An earlier version of this comment
+			 * claimed the opposite. Corrected rather than deleted, because a
+			 * comment that misdescribes the serializer is how somebody later adds
+			 * a redundant guard, or removes a load-bearing one.
+			 *
+			 * data-clear-when-hidden is still needed, for a different reason: the
+			 * box keeps its ticked state while hidden, so re-enabling the parent
+			 * would restore a choice the server had already discarded. See
+			 * settings.js applyShowIf().
+			 */
+			?>
+			<div class="faz-form-group" data-show-if="banner_control.per_service_consent" data-clear-when-hidden>
 				<label class="faz-toggle">
 					<input type="checkbox" data-path="banner_control.per_cookie_consent">
 					<span class="faz-toggle-track"></span>
@@ -159,7 +181,7 @@ defined( 'ABSPATH' ) || exit;
 			<div class="faz-form-group">
 				<label><?php esc_html_e( 'Script Blocking Exceptions', 'faz-cookie-manager' ); ?></label>
 				<textarea class="faz-textarea" data-path="script_blocking.whitelist_patterns" rows="3" placeholder="<?php esc_attr_e( 'One per line: googleapis.com/youtube/v3, recaptcha, my-inline-script-id', 'faz-cookie-manager' ); ?>"></textarea>
-				<div class="faz-help"><?php echo wp_kses_post( __( 'Scripts that should never be blocked, even before consent. One per line. Accepts three types of pattern:<br>- <strong>URL fragment</strong> (contains <code>.</code> or <code>/</code>): matched against the script\'s <code>src</code> or related URL attribute, e.g. <code>googleapis.com/youtube/v3</code>.<br>- <strong>Script ID</strong> (no dots/slashes): matched against the <code>id</code> attribute of the script tag, e.g. <code>my-product-form-data</code>.<br>- <strong>CSS class</strong> (no dots/slashes): matched against the script\'s <code>class</code> attribute, e.g. <code>recaptcha</code>.<br>These exceptions bypass blocking entirely. Use them only for scripts that genuinely do not set tracking cookies. <strong>Be specific</strong> to avoid accidentally unblocking trackers.<br><strong>Tip:</strong> You can also add <code>class="faz-skip"</code> directly to any script tag to exclude it without adding anything here — no configuration needed.', 'faz-cookie-manager' ) ); ?></div>
+				<div class="faz-help"><?php echo wp_kses_post( __( 'Scripts that should never be blocked, even before consent. One per line. Accepts three types of pattern:<br>- <strong>URL fragment</strong> (contains <code>.</code> or <code>/</code>): matched against the script\'s <code>src</code> or related URL attribute, e.g. <code>googleapis.com/youtube/v3</code>.<br>- <strong>Script ID</strong> (no dots/slashes): matched against the <code>id</code> attribute of the script tag, e.g. <code>my-product-form-data</code>.<br>- <strong>CSS class</strong> (no dots/slashes): matched against the script\'s <code>class</code> attribute, e.g. <code>recaptcha</code>.<br>- <strong>How IDs and classes match:</strong> whole words, plus their hyphen or underscore children. <code>recaptcha</code> matches <code>recaptcha</code>, <code>recaptcha-badge</code> and <code>recaptcha_frame</code>, but not <code>myrecaptcha</code>. Ending a pattern with <code>-</code> or <code>_</code> (e.g. <code>wp-</code>) matches <em>every</em> word starting with it, which is much broader — prefer the exact ID or class wherever you can.<br>These exceptions bypass blocking entirely. Use them only for scripts that genuinely do not set tracking cookies. <strong>Be specific</strong> to avoid accidentally unblocking trackers.<br><strong>Tip:</strong> You can also add <code>class="faz-skip"</code> directly to any script tag to exclude it without adding anything here — no configuration needed.', 'faz-cookie-manager' ) ); ?></div>
 			</div>
 			<div class="faz-form-group">
 				<label class="faz-toggle">
@@ -464,6 +486,113 @@ defined( 'ABSPATH' ) || exit;
 		</div>
 	</div>
 	<?php endif; ?>
+
+	<div class="faz-card">
+		<div class="faz-card-header">
+			<h3><?php esc_html_e( 'Footer legal links', 'faz-cookie-manager' ); ?></h3>
+		</div>
+		<div class="faz-card-body">
+			<div class="faz-form-group">
+				<label class="faz-toggle">
+					<input type="checkbox" data-path="legal_links.enabled">
+					<span class="faz-toggle-track"></span>
+					<span class="faz-toggle-label"><?php esc_html_e( 'Show legal links in the footer', 'faz-cookie-manager' ); ?></span>
+				</label>
+				<div class="faz-help"><?php esc_html_e( 'Off by default. When enabled, the pages you select below are printed as a small navigation block in your theme footer (via wp_footer). The markup is identical for every visitor — it does not depend on consent, login state or country — so it stays safe to serve from a page cache.', 'faz-cookie-manager' ); ?></div>
+			</div>
+			<div class="faz-form-group">
+				<label><?php esc_html_e( 'Pages to link', 'faz-cookie-manager' ); ?></label>
+				<?php
+				// Server-rendered on purpose: the list is static for the request,
+				// so saveSettings() never has to guard against an async list that
+				// has not loaded yet (unlike the A/B-test variant checkboxes).
+				// NOTE: these inputs deliberately carry NO data-path — FAZ.serializeForm
+				// must skip them; settings.js collects them through its own serializer.
+				//
+				// 'number' bounds both the query and the DOM: without it a site with
+				// thousands of published pages pays for an unbounded query and then
+				// renders two inputs per page into this screen. 200 is far above what
+				// a legal-links footer needs (the stored list is capped at 20) while
+				// still covering ordinary sites in full.
+				//
+				// Stored selections are rendered FIRST even when they are unpublished,
+				// deleted, or outside this query's first 200 rows. Every persisted link
+				// therefore has a visible checkbox the operator can remove.
+				$faz_stored_settings = get_option( 'faz_settings', array() );
+				$faz_stored_items    = isset( $faz_stored_settings['legal_links']['link_items'] ) && is_array( $faz_stored_settings['legal_links']['link_items'] )
+					? $faz_stored_settings['legal_links']['link_items']
+					: array();
+				$faz_legal_pages = get_pages(
+					array(
+						'post_status' => 'publish',
+						'number'      => 200,
+					)
+				);
+				$faz_legal_rows = array();
+				$faz_selected_ids = array();
+				foreach ( $faz_stored_items as $faz_stored_item ) {
+					$faz_page_id = isset( $faz_stored_item['page_id'] ) ? absint( $faz_stored_item['page_id'] ) : 0;
+					if ( ! $faz_page_id || isset( $faz_selected_ids[ $faz_page_id ] ) ) {
+						continue;
+					}
+					$faz_selected_ids[ $faz_page_id ] = true;
+					$faz_post = get_post( $faz_page_id );
+					if ( ! $faz_post || 'page' !== $faz_post->post_type ) {
+						/* translators: %d: WordPress page ID. */
+						$faz_title = sprintf( __( 'Page #%d (unavailable)', 'faz-cookie-manager' ), $faz_page_id );
+					} else {
+						if ( '' !== trim( (string) $faz_post->post_title ) ) {
+							$faz_title = $faz_post->post_title;
+						} else {
+							/* translators: %d: WordPress page ID. */
+							$faz_title = sprintf( __( 'Page #%d (untitled)', 'faz-cookie-manager' ), $faz_page_id );
+						}
+						if ( 'publish' !== $faz_post->post_status ) {
+							$faz_status = get_post_status_object( $faz_post->post_status );
+							$faz_title .= sprintf(
+								' (%s)',
+								$faz_status && isset( $faz_status->label ) ? $faz_status->label : $faz_post->post_status
+							);
+						}
+					}
+					$faz_legal_rows[] = array(
+						'id'       => $faz_page_id,
+						'title'    => $faz_title,
+						'label'    => isset( $faz_stored_item['label'] ) ? (string) $faz_stored_item['label'] : '',
+						'selected' => true,
+					);
+				}
+				foreach ( $faz_legal_pages as $faz_legal_page ) {
+					if ( isset( $faz_selected_ids[ $faz_legal_page->ID ] ) ) {
+						continue;
+					}
+					$faz_legal_rows[] = array(
+						'id'       => $faz_legal_page->ID,
+						'title'    => $faz_legal_page->post_title,
+						'label'    => '',
+						'selected' => false,
+					);
+				}
+				?>
+				<?php if ( empty( $faz_legal_rows ) ) : ?>
+					<div class="faz-help"><?php esc_html_e( 'No published pages yet. Publish your Cookie Policy or Privacy Policy page first.', 'faz-cookie-manager' ); ?></div>
+				<?php else : ?>
+					<div id="faz-legal-links-pages" style="max-height:260px;overflow:auto;padding:8px;border-radius:6px;background:var(--faz-bg-secondary);">
+						<?php foreach ( $faz_legal_rows as $faz_legal_row ) : ?>
+							<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+								<label class="faz-checkbox" style="flex:1;min-width:0;">
+									<input type="checkbox" class="faz-legal-link-page" value="<?php echo esc_attr( $faz_legal_row['id'] ); ?>" <?php checked( $faz_legal_row['selected'] ); ?>>
+									<span style="margin-left:6px;"><?php echo esc_html( $faz_legal_row['title'] ); ?></span>
+								</label>
+								<input type="text" class="faz-input faz-input-sm faz-legal-link-label" data-page-id="<?php echo esc_attr( $faz_legal_row['id'] ); ?>" value="<?php echo esc_attr( $faz_legal_row['label'] ); ?>" placeholder="<?php esc_attr_e( 'Custom label (optional)', 'faz-cookie-manager' ); ?>" style="max-width:220px;">
+							</div>
+						<?php endforeach; ?>
+					</div>
+					<div class="faz-help"><?php esc_html_e( 'Selected links appear first in their saved order. Leave the label empty to use the page title. Unpublished or unavailable selections stay visible here so you can remove them; they are never printed in the footer.', 'faz-cookie-manager' ); ?></div>
+				<?php endif; ?>
+			</div>
+		</div>
+	</div>
 
 	<div class="faz-card">
 		<div class="faz-card-header">

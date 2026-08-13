@@ -162,6 +162,7 @@ if ( $faz_force_remove_all || faz_should_remove_on_uninstall() || is_multisite()
 				'faz_pageviews_db_version',
 				'faz_missing_tables',
 				'faz_migration_options',
+				'faz_privacy_content_snapshot',
 				'faz_banner_template',
 				'faz_gvl_data',
 				'faz_gvl_meta',
@@ -178,7 +179,10 @@ if ( $faz_force_remove_all || faz_should_remove_on_uninstall() || is_multisite()
 				'faz_migrations_version',
 				'faz_cookie_definitions',
 				'faz_cookie_definitions_meta',
+				'faz_cookie_definitions_bundled_meta',
 				'faz_file_write_access',
+				'faz_legal_doc_acknowledged',
+				'faz_legal_doc_material_pending',
 			);
 			foreach ( $faz_options as $option_name ) {
 				delete_option( $option_name );
