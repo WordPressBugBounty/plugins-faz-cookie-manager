@@ -43,6 +43,18 @@ defined( 'ABSPATH' ) || exit;
 					<?php esc_html_e( 'Edit the display name and description for each cookie category. Names and descriptions are shown to visitors in the cookie preference center.', 'faz-cookie-manager' ); ?>
 				<?php endif; ?>
 			</div>
+			<div class="faz-field faz-category-language-field">
+				<label for="faz-category-language"><?php esc_html_e( 'Language', 'faz-cookie-manager' ); ?></label>
+				<select id="faz-category-language" class="faz-select" aria-describedby="faz-category-language-help">
+					<?php
+					$faz_category_languages = array_flip( \FazCookie\Admin\Modules\Languages\Includes\Controller::get_instance()->get_languages() );
+					foreach ( faz_selected_languages() as $faz_category_lang ) :
+						?>
+						<option value="<?php echo esc_attr( $faz_category_lang ); ?>" <?php selected( $faz_category_lang, faz_default_language() ); ?>><?php echo esc_html( $faz_category_languages[ $faz_category_lang ] ?? $faz_category_lang ); ?></option>
+					<?php endforeach; ?>
+				</select>
+				<p id="faz-category-language-help" class="faz-help"><?php esc_html_e( 'Choose a language to translate category names and descriptions. Save Categories saves changes in every language, not just this one.', 'faz-cookie-manager' ); ?></p>
+			</div>
 			<div class="faz-table-wrap">
 				<table class="faz-table" id="faz-category-edit-table" data-show-ccpa="<?php echo esc_attr( $faz_show_ccpa_col ? '1' : '0' ); ?>">
 					<thead>
@@ -146,6 +158,15 @@ defined( 'ABSPATH' ) || exit;
 						// coverage is headers-only and the strip says so.
 						?>
 						<div id="faz-visitor-check-bar" style="display:none" class="faz-stale-bar" role="status" aria-live="polite" aria-atomic="true"></div>
+						<?php
+						// The observations the last import set aside, each with
+						// the domain and lifetime the scan measured and a button
+						// to declare it. Whether the administrator's browser and
+						// a visitor's browser receive the same cookie depends on
+						// site configuration no crawl can observe (#243), so the
+						// decision is offered here rather than guessed.
+						?>
+						<div id="faz-set-aside-bar" style="display:none" class="faz-stale-bar" role="status" aria-live="polite" aria-atomic="true"></div>
 						<div class="faz-table-wrap">
 						<table class="faz-table" id="faz-cookies-table">
 							<thead>
