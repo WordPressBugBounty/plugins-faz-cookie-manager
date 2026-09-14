@@ -4,7 +4,7 @@ Donate link: https://buymeacoffee.com/fabiodalez
 Tags: cookie, gdpr, ccpa, consent, privacy
 Requires at least: 5.0
 Tested up to: 7.1
-Stable tag: 1.30.0
+Stable tag: 1.31.0
 Requires PHP: 7.4
 License: GPL-3.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
@@ -398,6 +398,16 @@ https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/blob/main/CHANGELOG.md
 and on the GitHub Releases page:
 https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/releases
 
+= 1.31.0 =
+* Fixed: Consent Logs no longer reports "Failed to load consent logs." on sites that have logs (#284): the page formatted dates with the WordPress locale (de_DE), which the browser rejects, and the error was mistaken for a failed request. The Dashboard and geo-routing timestamps shared the flaw.
+* Fixed: Per-cookie grants obey GPC and Do Not Sell server-side; old GPC exception markers cannot return after the signal is switched off and on without a new choice.
+* Fixed: Visitors sending Global Privacy Control can open a blocked map or video by clicking Accept on it. Only that service is granted: the category stays denied, Accept All cannot re-grant it, and a Do Not Sell request still wins.
+* Fixed: Legacy Functional sale/sharing defaults are corrected, with an admin notice when changed. Sites without a Do Not Sell surface can also have saved/imported flags reset; the now-visible controls let administrators restore intentional classifications.
+* Fixed: Under opt-in laws, GPC alone leaves the unanswered banner available on later pages. Under opt-out laws, or after an explicit Do Not Sell request, the banner is not re-offered. The signal is no longer re-sent as a new consent on every page.
+* Fixed: The GPC exception can be withdrawn from the preference centre, is created through the embed’s Accept handler, and is enforced identically by the browser, the server and the AMP bridge; a standing Do Not Sell request binds the AMP endpoints too.
+* Fixed: The Functional migration now also covers sites with no Do Not Sell link, where the controls were hidden, and says so with an admin notice; the consent log marks records created by a privacy signal rather than by an answer.
+* Fixed: The Sale / Sharing column is shown on every site, and the Respect GPC note explains what is actually enforced: a GPC signal is honoured whether the switch is on or off.
+
 = 1.30.0 =
 * Added: Footer consent links with [faz_cookie_settings type="link"] and configurable banner button radius (#191).
 * Added: Cookie Policy templates in Dutch and Croatian, plus Russian and Ukrainian banner and category translations.
@@ -513,18 +523,6 @@ https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/releases
 * Added: "Box (centered)" banner type - positions the consent box in the centre of the screen via CSS transform, a common pattern on European sites.
 * Added: "Dim the page behind the banner" option - a semi-transparent overlay greys out the page to draw attention to the banner. The overlay is a visual cue only (pointer-events: none) and never blocks reading, scrolling, or clicking, so it does not act as a cookie wall. Available for Box corner, Box centered, and Full-width Banner types; automatically disabled for the Classic layout.
 * Changed: geo-routing admin clarity - corrected the misleading "automatic per-country" copy (runtime rule-set application is off; the catalogue is preview/reference only, while per-country banner selection still works), exposed the runtime off-state in the geo status endpoint, and finished i18n of the Pipeline-status panel.
-
-= 1.22.0 =
-* Added: inline-CSS url()/@import blocking before consent — a Google Fonts @font-face src url() or @import in a <style> tag previously reached the provider with consent denied; any url()/@import pointing at a blocked provider in a denied category is now neutralised (inert data: placeholder, restored on consent). Server-rendered <style> and direct runtime HTMLStyleElement writes are covered by default; a new opt-in "Advanced inline CSS URL blocking" setting (default off) additionally hooks page-builder/CSS-in-JS channels (innerHTML/insertAdjacentHTML, CharacterData incl. nodeValue/replaceWith, replaceChildren/insertAdjacentText, Constructable Stylesheets/insertRule).
-* Added: wider runtime resource blocking for <img>/<iframe>/<link>/<source> (extends #163/#167) — beyond the src/href property setters, the setAttribute('src'|'href'|'srcset') path and the srcset property setter are gated, blocked <source> src/srcset are parked, and the MutationObserver also parks parsed img/link/source.
-* Added: Advanced Consent Mode for Google Consent Mode v2 (#165) — opt-in (default off); the Google tag stack (gtag.js/GA4/Ads) may load before consent with a synchronous denied consent default, while non-Google trackers and the GTM container stay blocked.
-* Added: manual service registration from the built-in catalogue (#161) — register a known provider's cookies into the declaration table from the Cookies page without a scan.
-* Fixed: map tiles, lazy-loaded embeds and runtime-injected stylesheets now blocked before consent (#163, #167). Leaflet/OpenStreetMap and Bricks Map tiles load as runtime <img>, Bricks lazy-load swaps a URL into iframe.src, and Web Font Loader injects a Google Fonts <link> at runtime — all bypassed the blocker. The src/href property setters are now gated on the image, iframe and link prototypes: a cross-origin resource matching a blocked provider in a denied category is parked until consent, then restored.
-* Fixed: banner chrome (Always Active, cookie-table headers) now translates on non-English single-language sites (#164); European Portuguese banner content corrected (#159).
-
-= 1.21.1 =
-* Fix: on full-page-cached sites with Cache Compatibility Mode enabled, the cookie banner could fail to appear on the first visit (and trackers could run) because the rendered page still varied per visitor and one cached copy is shared between everyone — a search-engine or cache-warming crawler produced a banner-less copy, or a wrong-jurisdiction/wrong-language copy, that the cache then served to all visitors. Under Cache Compatibility Mode the render is now fully visitor-invariant: the banner script is always enqueued (no bot/geo skip), the IAB TCF gdprApplies signal is conservative, AMP banner selection is country-neutral, and the banner language no longer reads cookie/session state from TranslatePress, Weglot or WPML "No language in URLs" mode (URL-based Polylang/WPML stay correct; the visitor's real language is still corrected client-side). Reported on gooloo.de.
-* Fix: the consent script-blocker no longer interferes with the WordPress 6.5+ Interactivity API (native type="module"/importmap scripts) or with optimiser-deferred scripts (LiteSpeed Cache / WP Rocket "Delay JS"), while still blocking trackers — including a tracker shipped as a module or restored in place by the optimiser.
 
 
 = Older versions =

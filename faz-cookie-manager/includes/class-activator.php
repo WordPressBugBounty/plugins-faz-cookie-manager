@@ -118,7 +118,7 @@ class Activator {
 	/**
 	 * Bump this only when adding/changing a migration in the sequence below.
 	 */
-	const MIGRATIONS_VERSION = '2026.08.25.1';
+	const MIGRATIONS_VERSION = '2026.09.11.1';
 
 	/**
 	 * Run all pending one-time data migrations in a single admin_init callback.
@@ -153,6 +153,7 @@ class Activator {
 			self::enable_gpc_on_ccpa_banners();
 			self::ensure_share_personal_data_column();
 			self::clear_necessary_optout_flags();
+			self::normalize_legacy_functional_optout_flags();
 			self::reset_stale_per_cookie_consent();
 			self::demote_bulky_autoloaded_options();
 			self::refresh_cookie_translation_caches();
@@ -670,6 +671,7 @@ class Activator {
 			// Matched loosely on purpose: an admin may have typed the host
 			// without the trailing path, or with a scheme. Any existing
 			// mention means the decision has already been made here.
+			// phpcs:ignore PluginCheck.CodeAnalysis.Offloading.OffloadedContent -- Matching a third-party challenge URL in the consent whitelist; this string does not load a plugin asset.
 			if ( false !== stripos( $pattern, 'gstatic.com/recaptcha' ) ) {
 				$has_gstatic = true;
 			}
@@ -679,6 +681,7 @@ class Activator {
 			return;
 		}
 
+		// phpcs:ignore PluginCheck.CodeAnalysis.Offloading.OffloadedContent -- Matching a third-party challenge URL in the consent whitelist; this string does not load a plugin asset.
 		$patterns[] = 'www.gstatic.com/recaptcha/';
 		$settings['script_blocking']['whitelist_patterns'] = array_values( $patterns );
 		update_option( 'faz_settings', $settings );
@@ -2200,9 +2203,11 @@ class Activator {
 		// sell/share=0 on existing installs can't clobber a legitimate admin
 		// choice. functional / wordpress-internal are seeded to 0 for NEW
 		// installs (Category_Controller::load_default), but they are NOT
-		// force-reset on existing installs — an admin may have deliberately
-		// flagged a functional cookie as shared, and a migration must not
-		// silently overwrite that explicit classification.
+		// force-reset here — an admin may have deliberately flagged a
+		// functional cookie as shared, and a migration must not silently
+		// overwrite that explicit classification. The legacy functional row
+		// that was never edited is handled separately, and narrowly, by
+		// normalize_legacy_functional_optout_flags().
 		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- $table is $wpdb->prefix + literal "faz_cookie_categories" (escaped via esc_sql); slug bound via %s; one-shot idempotent migration write.
 		$result = $wpdb->query(
 			$wpdb->prepare(
@@ -2218,6 +2223,102 @@ class Activator {
 		if ( $result > 0 ) {
 			Category_Controller::get_instance()->delete_cache();
 		}
+	}
+
+	/**
+	 * Un-flag the Functional category as sold/shared on installs that never
+	 * chose that flag.
+	 *
+	 * Installs created before 1.17.2 seeded every category from the schema
+	 * default, sell_personal_data = share_personal_data = 1, so Functional was
+	 * marked as sold and shared. Nobody decided that: 1.17.2 changed the seed
+	 * for new installs to 0/0 and left existing rows alone.
+	 *
+	 * It became visible through Global Privacy Control. A visitor whose browser
+	 * sends GPC (Brave by default, privacy-focused Firefox builds such as Zen
+	 * and Waterfox) has every sale/share category switched off, so on those
+	 * sites the Functional category — a map, a video player, a chat widget —
+	 * was denied to them and could not be accepted. A Functional embed is not a
+	 * "sale" (no consideration) nor "sharing" (no cross-context behavioural
+	 * advertising, Cal. Civ. Code 1798.140(ah)).
+	 *
+	 * Two rules decide whether the value is the schema's or a person's.
+	 *
+	 * On a site with no Do-Not-Sell surface the flags cannot be a decision at
+	 * all: until this release the Cookies screen HID the Sale / Sharing column
+	 * exactly there, so nobody could set them, and `share_personal_data` was
+	 * added to the schema later by an ALTER with DEFAULT 1 that stamped every
+	 * existing row without touching its dates. Those rows are reset whatever
+	 * their dates say — which is the reporter's population, a GDPR site whose
+	 * Functional category had been flagged since before 1.17.2 and whose
+	 * administrator had edited the row at some point for an unrelated reason.
+	 *
+	 * Where the column WAS visible (an active banner exposes the opt-out), the
+	 * dates are the only evidence: Category_Controller::create_item() writes
+	 * date_created and date_modified from the same value, and every save
+	 * through the editor or the REST API goes through update_item(), which
+	 * advances date_modified. So date_modified = date_created means the row was
+	 * never saved. A row that was edited is left exactly as it is; the Cookies
+	 * screen now explains the effect of the flag instead.
+	 *
+	 * It runs ONCE per install (`faz_normalize_legacy_functional_optout_done`).
+	 * run_pending_migrations() replays the whole list on every future
+	 * MIGRATIONS_VERSION bump, and a settings import inserts rows without their
+	 * dates (both then read 0000-00-00), so without the marker a Functional 1/1
+	 * an administrator deliberately imported would be reset by some later
+	 * release that had nothing to do with it.
+	 */
+	public static function normalize_legacy_functional_optout_flags() {
+		if ( get_option( 'faz_normalize_legacy_functional_optout_done' ) ) {
+			return;
+		}
+		global $wpdb;
+		$table = $wpdb->prefix . 'faz_cookie_categories';
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- one-time SHOW TABLES probe in the activation/upgrade path.
+		if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) !== $table ) {
+			return; // No table yet: retried on the next run, marker not set.
+		}
+		$has_optout_surface = false;
+		$banner_controller  = '\\FazCookie\\Admin\\Modules\\Banners\\Includes\\Controller';
+		if ( class_exists( $banner_controller ) ) {
+			$has_optout_surface = (bool) $banner_controller::get_instance()->has_do_not_sell_surface();
+		}
+		if ( $has_optout_surface ) {
+			// The administrator could see and set the toggles: only an untouched
+			// row is safe to reset.
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- $table is $wpdb->prefix + literal "faz_cookie_categories" (escaped via esc_sql); slug bound via %s; one-shot idempotent migration write.
+			$result = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE `" . esc_sql( $table ) . "` SET sell_personal_data = 0, share_personal_data = 0 WHERE slug = %s AND sell_personal_data = 1 AND share_personal_data = 1 AND date_modified = date_created",
+					'functional'
+				)
+			);
+		} else {
+			// No opt-out surface: the column was hidden, so whatever is stored
+			// came from the schema. Either flag being set is enough to match.
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- $table is $wpdb->prefix + literal "faz_cookie_categories" (escaped via esc_sql); slug bound via %s; one-shot idempotent migration write.
+			$result = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE `" . esc_sql( $table ) . "` SET sell_personal_data = 0, share_personal_data = 0 WHERE slug = %s AND ( sell_personal_data = 1 OR share_personal_data = 1 )",
+					'functional'
+				)
+			);
+		}
+		if ( false === $result ) {
+			// Throw so run_pending_migrations() does not bump the version and the
+			// normalisation is retried on the next admin load.
+			throw new \RuntimeException( 'FAZ: failed to normalise the legacy Functional opt-out flags; migration will retry.' );
+		}
+		if ( $result > 0 ) {
+			Category_Controller::get_instance()->delete_cache();
+			// Say it out loud. The change narrows what a Global Privacy Control
+			// signal blocks for this site's visitors, and an administrator who
+			// did want Functional treated as sharing must be able to find that
+			// out without reading a changelog. Arms the one-time notice in
+			// Admin::functional_optout_migration_notice().
+			update_option( 'faz_functional_optout_notice', '1', false );
+		}
+		update_option( 'faz_normalize_legacy_functional_optout_done', 1, false );
 	}
 
 	/**

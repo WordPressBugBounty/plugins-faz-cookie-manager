@@ -349,17 +349,9 @@
 			tdDesc.appendChild(descInput);
 			tr.appendChild(tdDesc);
 
-			// Sale / Sharing flags (CCPA/CPRA). The column is hidden entirely on
-			// pure-GDPR sites (no active banner with a Do-Not-Sell surface —
-			// data-show-ccpa="0" from the PHP view): the flags would drive
-			// nothing visitor-facing there. Skipping the cell also means
-			// saveCategoryEdits() never sends the flags, so stored values are
-			// preserved for a later law switch.
-			var catTable = document.getElementById('faz-category-edit-table');
-			if (catTable && catTable.getAttribute('data-show-ccpa') === '0') {
-				tbody.appendChild(tr);
-				return;
-			}
+			// Sale / Sharing flags (CCPA/CPRA). Shown on every site: besides the
+			// Do Not Sell opt-out they decide what a Global Privacy Control
+			// signal blocks, and GPC is enforced under every applicable law.
 			// The "necessary" category is never a sale or a share (it is exempt
 			// from the opt-out by definition), so we don't offer its toggles.
 			var tdSaleShare = document.createElement('td');
@@ -1584,8 +1576,7 @@
 		// 12-hour clock inside otherwise-Italian text. fazConfig.locale is the
 		// WP user_locale ('it_IT'), converted to a BCP-47 tag the way
 		// geo-routing.js and dashboard.js already do it.
-		var loc = (window.fazConfig && window.fazConfig.locale) || document.documentElement.lang;
-		loc = loc ? String(loc).replace(/_/g, '-') : undefined;
+		var loc = (window.FAZ && FAZ.locale) ? FAZ.locale() : undefined;
 		try {
 			return new Date(ts * 1000).toLocaleTimeString(loc, { hour: '2-digit', minute: '2-digit' });
 		} catch (e) {

@@ -5,12 +5,12 @@
 (function () {
 	'use strict';
 
-	// Same helper as dashboard.js / geo-routing.js: fazConfig.locale is the WP
-	// user_locale, so the log timestamps follow the administrative language
-	// rather than whatever the browser happens to be set to. undefined falls
-	// back to the runtime default, which is the previous behaviour.
+	// Log timestamps follow the administrative language rather than whatever
+	// the browser is set to. FAZ.locale() converts the WordPress user locale
+	// into a tag Intl accepts; this file used to read fazConfig.locale raw and
+	// hand 'de_DE' to toLocaleDateString(), which throws (issue #284).
 	function getLocale() {
-		return (typeof fazConfig !== 'undefined' && fazConfig.locale) || document.documentElement.lang || undefined;
+		return (window.FAZ && FAZ.locale) ? FAZ.locale() : undefined;
 	}
 
 	// i18n helper — looks up fazConfig.i18n.<key> with dot-notation, falls back to provided string.
@@ -180,9 +180,24 @@
 						// here is humanized. Unknown future meta.* keys degrade to an
 						// auto-humanized label.
 						var metaKey = k.slice(5);
-						var metaLabel = metaKey === 'age_affirmed'
-							? fazI18n('consentLogs.metaAgeAffirmed', 'Age affirmed')
-							: metaKey.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+						var metaLabel;
+						if (metaKey === 'age_affirmed') {
+							metaLabel = fazI18n('consentLogs.metaAgeAffirmed', 'Age affirmed');
+						} else if (metaKey.indexOf('gpc_exception.') === 0) {
+							// A service accepted on its own blocked embed while the
+							// visitor's browser sent Global Privacy Control.
+							// Function replacement: with a string, `$&`, `$'` and friends
+							// inside a service id would be re-interpreted by replace()
+							// and mangle the label.
+							metaLabel = fazI18n('consentLogs.metaGpcException', 'GPC exception: %s')
+								.replace('%s', function () { return metaKey.slice('gpc_exception.'.length); });
+						} else if (metaKey === 'signal_only') {
+							// The record was created by GPC or a Do Not Sell request
+							// and the visitor never answered the banner.
+							metaLabel = fazI18n('consentLogs.metaSignalOnly', 'Privacy signal, banner unanswered');
+						} else {
+							metaLabel = metaKey.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+						}
 						catBadge.className = 'faz-cat-pill faz-cat-audit';
 						catBadge.textContent = metaLabel;
 					} else {
