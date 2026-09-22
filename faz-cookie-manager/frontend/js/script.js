@@ -4,6 +4,13 @@
 if ( typeof window._fazConfig === 'undefined' && typeof window._fazCfg !== 'undefined' && window._fazCfg !== null ) {
     window._fazConfig = window._fazCfg;
 }
+// Optimisers may delay the small inline merge while the external configuration
+// and runtime are already available. Merge before any blocking decisions.
+if (window._fazConfig && window._fazStaticConfig) {
+    Object.keys(window._fazStaticConfig).forEach(function (key) {
+        if (!(key in window._fazConfig)) window._fazConfig[key] = window._fazStaticConfig[key];
+    });
+}
 const _fazStore = window._fazConfig;
 
 // Opt-out success message (US state laws / CCPA): after the visitor confirms an
@@ -5413,6 +5420,67 @@ function _fazIsAllowedScheme(url) {
     return scheme === 'http' || scheme === 'https';
 }
 
+/**
+ * Let libraries that were waiting on a restored script finish their own setup.
+ *
+ * A restored <script src> is a new element, so it downloads and runs AFTER the
+ * consent click that restored it has finished — while the consent events that
+ * other plugins react to are dispatched synchronously, inside that same click.
+ * A plugin that reacts to the event by calling into the library it depends on
+ * therefore finds the library missing, and nothing calls it again once the
+ * library arrives.
+ *
+ * WooCommerce Order Attribution is that case: its setOrderTracking(true) stores
+ * allowTracking and returns when window.sbjs (sourcebuster.js, blocked until
+ * consent) is not there yet. The landing page's UTM parameters are then never
+ * captured and the order is attributed to "Unknown".
+ *
+ * @param {HTMLScriptElement} clone The restored external script.
+ */
+function _fazWatchRestoredScript(clone) {
+    // Only a script that brings sourcebuster onto the page can have been waited
+    // on. When sbjs is already here, WooCommerce initialised it itself, and a
+    // second init would count an extra page view in sbjs_session.
+    var sbjsBefore = typeof window.sbjs !== 'undefined';
+    var attributionBefore = window.wc_order_attribution;
+    clone.addEventListener('load', function () {
+        if (sbjsBefore) return;
+        _fazReplayWooCommerceAttribution(attributionBefore);
+    });
+}
+
+/**
+ * Re-run WooCommerce's own tracking call once sourcebuster.js exists.
+ *
+ * Replays a decision WooCommerce already made — never makes one: it acts only
+ * when wc_order_attribution.params.allowTracking is true, which WooCommerce
+ * sets from its wc_order_attribution_allow_tracking filter and, with the WP
+ * Consent API, from the visitor's marketing consent. Runs at most once per page.
+ */
+var _fazWcAttributionReplayed = false;
+function _fazReplayWooCommerceAttribution(attributionBefore) {
+    if (_fazWcAttributionReplayed) return;
+    if (typeof window.sbjs === 'undefined') return;
+    // The first restored script to finish after sourcebuster exists decides,
+    // once for the page. From here on WooCommerce finds sbjs itself: a script
+    // of its own that runs later (an optimiser delaying order-attribution.js,
+    // or a consent change it hears) initialises it without help, and a second
+    // init would count an extra page view in sbjs_session.
+    _fazWcAttributionReplayed = true;
+    var wcoa = window.wc_order_attribution;
+    // WooCommerce localises this object and order-attribution.js then adds
+    // setOrderTracking to that same object; it never replaces it. So a missing
+    // method means its script has not run yet and will initialise on its own,
+    // and a different object is not the one that was waiting.
+    if (!wcoa || wcoa !== attributionBefore || typeof wcoa.setOrderTracking !== 'function') return;
+    if (!wcoa.params || wcoa.params.allowTracking !== true) return;
+    try {
+        wcoa.setOrderTracking(true);
+    } catch (e) {
+        // A third-party failure must not interrupt the consent flow.
+    }
+}
+
 function _fazBuildRestoredScript(script, extraSkipAttributes) {
     var scriptSrc = script.getAttribute('src') || script.src;
     var clone = scriptSrc
@@ -5456,6 +5524,7 @@ function _fazBuildRestoredScript(script, extraSkipAttributes) {
             }
         } else {
             clone.src = scriptSrc;
+            _fazWatchRestoredScript(clone);
         }
     } else {
         var inlineText = script.textContent || '';
@@ -5804,10 +5873,40 @@ function _fazUnblockServerSide() {
             if (next && next.getAttribute("data-faz-category") === cat) {
                 next.classList.remove('faz-hidden');
                 next.removeAttribute("data-faz-category");
+                if (next.hasAttribute('data-faz-bricks-map-options')) {
+                    next.setAttribute('data-bricks-map-options', next.getAttribute('data-faz-bricks-map-options'));
+                    next.removeAttribute('data-faz-bricks-map-options');
+                    // If Google's callback already ran with no eligible containers,
+                    // initialise the newly released map using Bricks' own entrypoint.
+                    _fazInitConsentedBricksMaps();
+                }
             }
             placeholder.remove();
         });
 }
+
+// Bricks' Google callback can arrive before its WP Rocket-delayed initializer.
+// Retry only when both dependencies exist and a consented container needs it.
+var _fazBricksMapInitPending = false;
+function _fazInitConsentedBricksMaps() {
+    if (_fazBricksMapInitPending || !window.google || !window.google.maps || typeof window.bricksMap !== 'function') return;
+    var maps = document.querySelectorAll('.brxe-map[data-bricks-map-options]');
+    var needed = Array.prototype.some.call(maps, function (map) {
+        var instances = window.bricksData && window.bricksData.googleMapInstances;
+        return !map.classList.contains('faz-hidden') && !(instances && instances[map.getAttribute('data-script-id') || map.id]) &&
+            !_fazShouldBlockResource('', 'https://maps.googleapis.com/maps/api/js', 'google-maps');
+    });
+    if (!needed) return;
+    _fazBricksMapInitPending = true;
+    try {
+        Promise.resolve(window.bricksMap()).catch(function () {}).then(function () {
+            _fazBricksMapInitPending = false;
+        });
+    } catch (e) { _fazBricksMapInitPending = false; }
+}
+document.addEventListener('load', function (event) {
+    if (event.target && event.target.id === 'bricks-map-js') _fazInitConsentedBricksMaps();
+}, true);
 
 function _fazAddProviderToList(node, cleanedHostname) {
     const nodeCategory =

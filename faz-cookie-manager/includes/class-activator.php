@@ -89,11 +89,16 @@ class Activator {
 	 */
 	public static function init() {
 		add_action( 'init', array( __CLASS__, 'check_version' ), 5 );
+		// Independently versioned schema: also upgrade when testing a branch
+		// whose release version has not been bumped yet.
+		add_action( 'init', array( '\FazCookie\Frontend\Includes\Embed_Inventory', 'maybe_create_table' ), 6 );
 		// Consolidate one-time migrations into a single admin_init callback
 		// to avoid 7 separate get_option() calls on every admin page load.
 		add_action( 'admin_init', array( __CLASS__, 'run_pending_migrations' ) );
 		add_action( 'faz_daily_cleanup', array( __CLASS__, 'run_retention_cleanup' ) );
 		add_action( 'faz_weekly_gvl_update', array( 'FazCookie\Includes\Gvl', 'cron_update' ) );
+		add_action( 'faz_weekly_definitions_update', array( 'FazCookie\Includes\Cookie_Definitions', 'cron_update' ) );
+		add_action( 'faz_after_update_settings', array( 'FazCookie\Includes\Cookie_Definitions', 'schedule_updates' ) );
 		add_action( 'faz_scheduled_scan', array( __CLASS__, 'run_scheduled_scan' ) );
 		add_action( 'faz_after_update_settings', array( __CLASS__, 'reschedule_auto_scan' ) );
 		// F009: keep the IAB unmatched-vendors transient fresh on every
@@ -118,7 +123,7 @@ class Activator {
 	/**
 	 * Bump this only when adding/changing a migration in the sequence below.
 	 */
-	const MIGRATIONS_VERSION = '2026.09.11.1';
+	const MIGRATIONS_VERSION = '2026.09.19.1';
 
 	/**
 	 * Run all pending one-time data migrations in a single admin_init callback.
@@ -154,6 +159,7 @@ class Activator {
 			self::ensure_share_personal_data_column();
 			self::clear_necessary_optout_flags();
 			self::normalize_legacy_functional_optout_flags();
+			self::move_sourcebuster_to_marketing();
 			self::reset_stale_per_cookie_consent();
 			self::demote_bulky_autoloaded_options();
 			self::refresh_cookie_translation_caches();
@@ -738,6 +744,7 @@ class Activator {
 			wp_schedule_event( time(), 'weekly', 'faz_weekly_gvl_update' );
 		}
 		self::schedule_auto_scan();
+		Cookie_Definitions::schedule_updates();
 	}
 
 	/**
@@ -824,6 +831,22 @@ class Activator {
 				}
 			}
 		);
+
+		// The placeholder inventory exists to corroborate consent-log rows, so
+		// it follows the consent-log window: once the row it could vouch for is
+		// gone, keeping a record of which pages carry which embeds serves no
+		// purpose. Housekeeping, not a compliance obligation — it stays silent.
+		if ( $retention > 0 ) {
+			self::run_cleanup_step(
+				'embed inventory retention',
+				false,
+				static function () use ( $retention ) {
+					if ( class_exists( '\\FazCookie\\Frontend\\Includes\\Embed_Inventory' ) ) {
+						\FazCookie\Frontend\Includes\Embed_Inventory::prune( $retention );
+					}
+				}
+			);
+		}
 
 		// Pageview analytics rows grow one-per-visit when tracking is enabled
 		// and previously had NO purge wired up at all, so the table (and every
@@ -1482,6 +1505,13 @@ class Activator {
 		// Pageviews table (standalone controller).
 		if ( class_exists( 'FazCookie\Admin\Modules\Pageviews\Includes\Controller' ) ) {
 			Pageviews_Controller::get_instance()->maybe_create_table();
+		}
+
+		// Placeholder inventory: which pages offer which blocked embed. Read
+		// when auditing a GPC exception, so it has to exist before the first
+		// one can be minted.
+		if ( class_exists( 'FazCookie\Frontend\Includes\Embed_Inventory' ) ) {
+			\FazCookie\Frontend\Includes\Embed_Inventory::maybe_create_table();
 		}
 	}
 
@@ -2319,6 +2349,104 @@ class Activator {
 			update_option( 'faz_functional_optout_notice', '1', false );
 		}
 		update_option( 'faz_normalize_legacy_functional_optout_done', 1, false );
+	}
+
+	/**
+	 * Move the Sourcebuster cookies to Marketing where nobody chose otherwise.
+	 *
+	 * WooCommerce Order Attribution asks for the WP Consent API's `marketing`
+	 * category, and since this release FAZ gates sourcebuster.js on Marketing
+	 * too. The cookies it writes, `sbjs_*`, used to be classified as Analytics —
+	 * the provider catalogue's old default and the Open Cookie Database's — and
+	 * every site that scanned them kept that category in its own cookie list.
+	 * The saved list is the first thing the runtime consults, so on those sites
+	 * a visitor who accepted Marketing alone got the script, WooCommerce wrote
+	 * the cookies, and FAZ's cookie cleanup deleted them again a moment later
+	 * because Analytics had not been accepted. Measured: seven cookies written,
+	 * gone within 200 ms. The script and its cookies must answer to one consent.
+	 *
+	 * A row is moved only when the scanner wrote it and nobody saved it since:
+	 * Cookie_Controller::create_item() has written date_created and
+	 * date_modified from the same real timestamp since 1.0.5, and every save
+	 * through the editor or the REST API advances date_modified — the evidence
+	 * normalize_legacy_functional_optout_flags() relies on too.
+	 *
+	 * Zero dates are NOT that evidence. The only writer that leaves them is the
+	 * settings import, which copies each row's category from the file and no
+	 * history with it, so an imported category may be another site's scan or
+	 * an administrator's deliberate choice, and nothing here can tell which.
+	 * Those rows are left alone, like a row an administrator saved, and both
+	 * are counted so the notice can say what their category now means. The
+	 * comparison is against a real date rather than the zero literal, which a
+	 * MySQL server in strict mode may refuse.
+	 *
+	 * Once per install (`faz_move_sourcebuster_marketing_done`), for the reason
+	 * the Functional migration gives: run_pending_migrations() replays the list
+	 * on every later MIGRATIONS_VERSION bump, and without the marker a category
+	 * set afterwards could be overruled by a release that had nothing to do
+	 * with it.
+	 */
+	public static function move_sourcebuster_to_marketing() {
+		if ( get_option( 'faz_move_sourcebuster_marketing_done' ) ) {
+			return;
+		}
+		global $wpdb;
+		$cookies    = $wpdb->prefix . 'faz_cookies';
+		$categories = $wpdb->prefix . 'faz_cookie_categories';
+		foreach ( array( $cookies, $categories ) as $table ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- one-time SHOW TABLES probe in the activation/upgrade path.
+			if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) !== $table ) {
+				return; // No table yet: retried on the next run, marker not set.
+			}
+		}
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- $categories is $wpdb->prefix + literal (escaped via esc_sql); slug bound via %s; one-shot migration read.
+		$marketing = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT category_id FROM `' . esc_sql( $categories ) . '` WHERE slug = %s', 'marketing' ) );
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- same table and justification as above.
+		$analytics = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT category_id FROM `' . esc_sql( $categories ) . '` WHERE slug = %s', 'analytics' ) );
+		if ( $marketing <= 0 ) {
+			// No Marketing category to move to: nothing this migration can do
+			// here, now or later.
+			update_option( 'faz_move_sourcebuster_marketing_done', 1, false );
+			return;
+		}
+		$like  = $wpdb->esc_like( 'sbjs_' ) . '%';
+		$moved = 0;
+		if ( $analytics > 0 ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- $cookies is $wpdb->prefix + literal (escaped via esc_sql); every value bound via prepare(); one-shot idempotent migration write.
+			$moved = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE `" . esc_sql( $cookies ) . "` SET category = %d WHERE name LIKE %s AND category = %d AND discovered = 1 AND date_modified = date_created AND date_created > '1970-01-01 00:00:00'",
+					$marketing,
+					$like,
+					$analytics
+				)
+			);
+			if ( false === $moved ) {
+				// Throw so run_pending_migrations() withholds the version marker
+				// and the move is retried on the next admin load.
+				throw new \RuntimeException( 'FAZ: failed to move the Sourcebuster cookies to Marketing; migration will retry.' );
+			}
+		}
+		// Rows somebody saved or imported in another category. Left alone, and
+		// counted so the notice can say that WooCommerce needs Marketing.
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- same table and justification as above.
+		$kept = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM `' . esc_sql( $cookies ) . '` WHERE name LIKE %s AND category <> %d', $like, $marketing ) );
+
+		if ( $moved > 0 ) {
+			Cookie_Controller::get_instance()->delete_cache();
+		}
+		if ( $moved > 0 || $kept > 0 ) {
+			// Arms the one-time notice in Admin::sourcebuster_marketing_notice().
+			update_option(
+				'faz_sourcebuster_marketing_notice',
+				array(
+					'moved' => (int) $moved,
+					'kept'  => $kept,
+				),
+				false
+			);
+		}
+		update_option( 'faz_move_sourcebuster_marketing_done', 1, false );
 	}
 
 	/**

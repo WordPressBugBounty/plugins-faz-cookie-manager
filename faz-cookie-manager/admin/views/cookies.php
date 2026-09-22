@@ -198,6 +198,31 @@ defined( 'ABSPATH' ) || exit;
 			</div>
 		</div>
 		<div class="faz-card-body">
+			<?php
+			$faz_refresh = get_option( 'faz_definitions_refresh_status', array() );
+			// The option is only ever written as an array (see Cookie_Definitions::
+			// cron_update()), but a manually-cleared or corrupted option could hand
+			// back anything get_option()'s $default doesn't cover. Reading a string
+			// key off a non-array silently returns null (or, on a string value,
+			// warns and reads a character), so confirm the shape first.
+			if ( is_array( $faz_refresh ) && ! empty( $faz_refresh['at'] ) ) :
+				$faz_refresh_format = get_option( 'date_format' ) . ' ' . get_option( 'time_format' );
+				if ( is_int( $faz_refresh['at'] ) ) {
+					// New records retain an unambiguous instant, including across DST.
+					$faz_refresh_when = date_i18n( $faz_refresh_format, $faz_refresh['at'] + faz_site_utc_offset( $faz_refresh['at'] ) );
+				} else {
+					// Legacy records already contain the site's local wall-clock time.
+					$faz_refresh_ts = strtotime( (string) $faz_refresh['at'] );
+					$faz_refresh_when = $faz_refresh_ts ? date_i18n( $faz_refresh_format, $faz_refresh_ts ) : (string) $faz_refresh['at'];
+				}
+				?>
+				<p class="faz-help" role="status">
+					<?php esc_html_e( 'Last automatic definitions update attempt:', 'faz-cookie-manager' ); ?>
+					<?php echo esc_html( $faz_refresh_when ); ?> —
+					<?php echo ! empty( $faz_refresh['success'] ) ? esc_html__( 'Successful', 'faz-cookie-manager' ) : esc_html__( 'Failed; existing definitions retained.', 'faz-cookie-manager' ); ?>
+					<?php if ( empty( $faz_refresh['success'] ) ) { echo esc_html( $faz_refresh['message'] ?? '' ); } ?>
+				</p>
+			<?php endif; ?>
 			<p><?php echo wp_kses_post( __( 'Cookie definitions are sourced from the <a href="https://github.com/fabiodalez-dev/Open-Cookie-Database" target="_blank" rel="noopener">Open Cookie Database</a> (Apache-2.0 license). These definitions power the auto-categorize feature.', 'faz-cookie-manager' ) ); ?></p>
 			<div id="faz-defs-status" style="margin-top:8px;font-size:13px;color:var(--faz-text-muted);"><?php esc_html_e( 'Loading status...', 'faz-cookie-manager' ); ?></div>
 		</div>

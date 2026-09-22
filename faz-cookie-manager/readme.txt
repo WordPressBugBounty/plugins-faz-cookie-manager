@@ -4,7 +4,7 @@ Donate link: https://buymeacoffee.com/fabiodalez
 Tags: cookie, gdpr, ccpa, consent, privacy
 Requires at least: 5.0
 Tested up to: 7.1
-Stable tag: 1.31.0
+Stable tag: 1.32.0
 Requires PHP: 7.4
 License: GPL-3.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
@@ -29,7 +29,7 @@ Most cookie consent plugins follow the same pattern: a free version with cripple
 * **Consent logging with CSV export** -- every consent is recorded locally in your database. Export anytime for audits.
 * **Google Consent Mode v2** -- all 7 consent signals sent to Google tags. No premium required.
 * **IAB TCF v2.3** -- full Transparency and Consent Framework API and UI. Operating as a recognised CMP needs your own registered IAB Europe CMP ID; without one the TCF interface stays inactive and no TC string is produced, so invalid signals are never broadcast to vendors.
-* **Script blocking** -- tag any script with `data-faz-tag` to hold it until its category is accepted.
+* **Script blocking** -- mark a script `type="text/plain" data-faz-category="analytics"` to hold it until that category is accepted; it runs on its own as soon as consent is granted, and on every later page load.
 * **Geo-targeting and 180+ languages** -- serve the right banner per region and translate every string, or use a built-in translation.
 * **Guided setup wizard** -- a first-run wizard detects your environment (multilingual plugin, page cache, WooCommerce, existing consent data) and configures jurisdiction-appropriate defaults, explaining each choice in plain language. Existing sites are treated as already set up and are never nagged.
 * **A/B test your consent banner** -- run two or more existing banners with a persistent random split and read the accept rate per variant. Only active, independently compliant banners take part, so improving your wording can never quietly become a dark pattern. Off by default.
@@ -96,7 +96,7 @@ In practice that means two banner rows rather than eight: one EU banner holding 
 
 Used to refresh the built-in cookie definitions snapshot for the optional auto-categorize feature.
 
-Triggered when: you click the definitions update action in the Cookies screen.
+Triggered when: you click the definitions update action in the Cookies screen, or once a week after explicitly enabling "Update cookie definitions weekly" in Settings. Automatic updates are off by default; disabling the option cancels scheduled downloads. Failed downloads retain the existing database. The bundled snapshot remains available without enabling network updates.
 
 Data sent: your server IP address and standard HTTP request headers.
 
@@ -247,7 +247,15 @@ Yes. The plugin sends all 7 consent signals (`ad_storage`, `analytics_storage`, 
 
 = Does the banner block cookies before consent? =
 
-Yes. Any script tagged with `data-faz-tag="category-name"` is blocked until the visitor grants consent for that category. This helps you implement consent-based blocking for ePrivacy/GDPR workflows.
+Yes. Known third-party scripts are blocked automatically. To gate one of your own, give it a non-executable type and name the category it belongs to:
+
+`<script type="text/plain" data-faz-category="analytics">/* your code */</script>`
+
+Both parts are required. The type is what stops the browser from running it before consent; `data-faz-category` is what the plugin looks for when it runs it afterwards. A script with only the type never runs at all — including after consent — and a script with only the attribute runs immediately, before any consent is given.
+
+The same pair works for iframes, images and stylesheets using `data-faz-src` or `data-faz-href` in place of the real attribute.
+
+Once consent is granted the plugin runs the script itself, on that page and on every later page load. You do not need to listen for `fazcookie_consent_update` to start it; that event is for your own code that has nothing to do with these tags.
 
 = How does the cookie scanner work? =
 
@@ -313,7 +321,7 @@ Listen for `fazcookie_consent_ready` on `document`. It announces the initial con
 
 `e.detail` is `{ accepted: [slug, ...], rejected: [slug, ...], action: 'init' | 'restore' | 'gpc' | 'update' }` -- `init` on a first visit before any choice, `restore` for a visitor whose choice was already stored, `gpc` when a Global Privacy Control signal was auto-applied, and `update` right after the visitor accepts, rejects or saves preferences. Register the listener before the plugin's script runs, for example from an inline `<script>` in the head.
 
-One caveat on timing: the event tells you the consent state, which is not the same as the plugin having already re-activated the scripts it was blocking. That unblock pass runs shortly afterwards. Your own code can act immediately; if you depend on a resource the plugin itself gated (a `data-faz-tag` script or iframe), wait for it rather than assuming it is live in the same tick.
+One caveat on timing: the event tells you the consent state, which is not the same as the plugin having already re-activated the scripts it was blocking. That unblock pass runs shortly afterwards. Your own code can act immediately; if you depend on a resource the plugin itself gated (a `data-faz-category` script or iframe), wait for it rather than assuming it is live in the same tick.
 
 Use `fazcookie_consent_update` instead when you want to react to a **change**: it fires when the visitor accepts, rejects or saves preferences, and not on a plain page load by someone who already decided. A snippet that sends an analytics event belongs there, or it would fire on every page view.
 
@@ -397,6 +405,19 @@ The full changelog (every release back to 1.0.0) lives at:
 https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/blob/main/CHANGELOG.md
 and on the GitHub Releases page:
 https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/releases
+
+= 1.32.0 =
+* Fix: GPC audit verdicts stop at revocation. Concurrent embed inventory writes preserve their first observation; malformed definition feeds retain the last usable dataset.
+* Fix: Bricks Google Maps widgets show consent placeholders and initialise after delayed scripts load. No artificial cookie record is needed to reveal a blocked map in per-service preferences.
+* Fix: Elementor Video widgets respect custom blocking categories, whitelist entries and faz-skip.
+* Fix: WooCommerce order attribution resumes when marketing consent restores Sourcebuster, without duplicate initialisation. Untouched scanned Sourcebuster cookies migrate from Analytics to Marketing; manually created, edited or imported classifications are preserved and flagged for review.
+* Fix: WP Rocket no longer delays FAZ's inline bootstrap or its consent logger; the runtime merges the loaded static configuration before blocking decisions.
+* Added: Publish a language-specific cookie policy page from the setup wizard (off by default). Repeated submissions reuse the page, languages without a template are unavailable, and a page that cannot be created no longer stops setup. Page-link fields now suggest published pages, with keyboard navigation and manual URL support.
+* Added: The consent log records whether the server would have served each GPC exception, so inconsistent markers can be identified after the fact (#285). A script on the page can write the same cookie values a real click writes, so the record claims consistency rather than authenticity.
+* Added: System Status lists the services that can be blocked without a visible placeholder (#279) — they set no cookies, and when a script or stylesheet of theirs is blocked before consent it simply does not load, so the symptom points at the theme or the cache instead of here.
+* Fixed: A GPC exception accepted within five minutes of saving preferences was never logged at all, because it does not change the consent status and the repeat throttle dropped it.
+* Fixed: The Dashboard no longer implies data will arrive when pageview tracking is off, and says that consent records are kept regardless.
+* Fixed: On sites with plain permalinks or query-string language URLs, consent-log rows recorded the home page; the parameters that identify the page are now kept.
 
 = 1.31.0 =
 * Fixed: Consent Logs no longer reports "Failed to load consent logs." on sites that have logs (#284): the page formatted dates with the WordPress locale (de_DE), which the browser rejects, and the error was mistaken for a failed request. The Dashboard and geo-routing timestamps shared the flaw.
@@ -508,22 +529,6 @@ https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/releases
 * Fixed: the setup wizard's scan reported a fraction of the cookies the Cookies page found. The browser engine is now shared by both surfaces, retries public paths through the admin origin when home/admin hosts differ, and refuses to import misleading server-only findings when no page is observable. Wizard completion is atomic across banner/GCM/settings, preserves same-model customisations on re-entry, uses the site locale and jurisdiction-aligned geo defaults, and safely normalises false-like REST values.
 * Fixed: a blocked Cookie Policy save now names the offending field, opens its section and focuses it, instead of doing nothing; background scans under a web SAPI run through WP-Cron with honest counts; third-country transfer labels resolve in the banner or policy language rather than the ambient request locale.
 
-= 1.24.0 =
-* Added: editable opt-out (Do Not Sell) modal text (#187) — a new "Opt-out (Do Not Sell) Text" card on the Cookie Banner > Preference Center tab edits the "Opt-out Preferences" popup's title, description and toggle label, per language, on CCPA / US State Laws (and Both) banners. Previously that copy was fixed to the bundled default. Translated into every bundled locale.
-* Added: FlyingPress cache integration (#125) — saving a banner/cookie/category/setting purges FlyingPress's cached HTML; country-dependent pages bypass its cache via flying_press_is_cacheable; the consent scripts are excluded from its JS delay/defer/minify so the banner is never held back.
-* Added: the Cookie Policy generator now flows through the WordPress gettext pipeline, so the policy honours the site locale and .mo overrides.
-* Changed: payment-gateway scripts are now a per-gateway opt-in (Settings > Script Blocking > Payment gateways) instead of an automatic allow-list. A payment SDK can track, so it stays blocked until consent unless the store owner enables that gateway or it is strictly necessary on a real WooCommerce checkout/cart (the marketing pixel stays blocked either way). Migration: if you use Stripe elements outside a WooCommerce checkout, enable Stripe there after updating.
-* Changed: the server-side cookie shredder moved to template_redirect (reliable checkout/cart conditionals), and an explicit per-service/per-cookie denial now wins over the admin cookie whitelist on both server and client.
-* Fixed: category toggles rendering as editable text fields when another active plugin filters wp_kses_allowed_html (#188) — the <input> allow-list no longer loses type="checkbox" regardless of filter order.
-* Fixed: banner/cookie saves not sticking on sites with a persistent object cache (Redis Object Cache, Memcached) — internal cache invalidation now rotates the transient prefix instead of scanning wp_options (#125).
-* Fixed: WPML, TranslatePress and Weglot banners showing only the default language under Cache Compatibility Mode — URL-keyed language negotiation (directory/domain) now resolves the per-URL language while staying cache-friendly.
-* Fixed: the per-service consent toggle now appears for JS-injected embeds on block-first sites (#134/#146); the consent banner no longer double-initialises under Cloudflare Rocket Loader (#185); the icon-only notice dismiss link is now labelled for screen readers.
-
-= 1.23.0 =
-* Added: "Box (centered)" banner type - positions the consent box in the centre of the screen via CSS transform, a common pattern on European sites.
-* Added: "Dim the page behind the banner" option - a semi-transparent overlay greys out the page to draw attention to the banner. The overlay is a visual cue only (pointer-events: none) and never blocks reading, scrolling, or clicking, so it does not act as a cookie wall. Available for Box corner, Box centered, and Full-width Banner types; automatically disabled for the Classic layout.
-* Changed: geo-routing admin clarity - corrected the misleading "automatic per-country" copy (runtime rule-set application is off; the catalogue is preview/reference only, while per-country banner selection still works), exposed the runtime off-state in the geo status endpoint, and finished i18n of the Pipeline-status panel.
-
 
 = Older versions =
-Older releases (1.18.1 and earlier) are listed in the full changelog on GitHub, linked at the top of this section.
+Older releases (1.24.0 and earlier) are listed in the full changelog on GitHub, linked at the top of this section.

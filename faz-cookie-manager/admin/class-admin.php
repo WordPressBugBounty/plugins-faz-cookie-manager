@@ -110,6 +110,7 @@ class Admin {
 		add_action( 'admin_notices', array( $this, 'redundant_geo_routing_notice' ) );
 		add_action( 'admin_notices', array( $this, 'geo_enforcement_migration_notice' ) );
 		add_action( 'admin_notices', array( $this, 'functional_optout_migration_notice' ) );
+		add_action( 'admin_notices', array( $this, 'sourcebuster_marketing_notice' ) );
 		add_action( 'wp_ajax_faz_dismiss_unmatched', array( $this, 'ajax_dismiss_unmatched_vendors' ) );
 		add_action( 'wp_ajax_faz_disable_redundant_geo_routing', array( $this, 'ajax_disable_redundant_geo_routing' ) );
 		add_action( 'wp_ajax_faz_dismiss_redundant_geo_routing', array( $this, 'ajax_dismiss_redundant_geo_routing' ) );
@@ -767,6 +768,34 @@ class Admin {
 						// accepted on its own blocked embed while sending GPC.
 						/* translators: %s: service identifier, e.g. google-maps */
 						'metaGpcException'         => __( 'GPC exception: %s', 'faz-cookie-manager' ),
+						// Label for meta.gpc_exception_served.<id> = yes: the server
+						// confirmed the GPC exception was actually honoured.
+						/* translators: %s: service identifier, e.g. google-maps */
+						'metaGpcExceptionVerified' => __( 'GPC exception: %s — verified', 'faz-cookie-manager' ),
+						// Label for meta.gpc_exception_served.<id> = no: the server
+						// could not confirm the GPC exception was honoured.
+						/* translators: %s: service identifier, e.g. google-maps */
+						'metaGpcExceptionUnverified' => __( 'GPC exception: %s — unverified', 'faz-cookie-manager' ),
+						// Label for meta.gpc_exception_carried.<id>: the GPC exception
+						// was carried over from a prior record.
+						/* translators: %s: service identifier, e.g. google-maps */
+						'metaGpcExceptionCarried'  => __( 'GPC exception: %s — carried', 'faz-cookie-manager' ),
+						// Label for meta.gpc_exception_carried.<id> = no: carried
+						// from an earlier row whose verdict was unverified.
+						/* translators: %s: service identifier, e.g. google-maps */
+						'metaGpcExceptionCarriedUnverified' => __( 'GPC exception: %s — carried, unverified', 'faz-cookie-manager' ),
+						// Label for meta.gpc_exception_carried.<id> = '': carried
+						// from an earlier row written before the server judged
+						// exceptions — recorded, but with no verdict either way.
+						/* translators: %s: service identifier, e.g. google-maps */
+						'metaGpcExceptionCarriedNeutral' => __( 'GPC exception: %s — carried, not judged', 'faz-cookie-manager' ),
+						// Tooltips (title) explaining each GPC-exception pill state.
+						'metaGpcExceptionTitle'    => __( 'The visitor\'s browser recorded this exception to Global Privacy Control; the server recorded no verdict on it in this row.', 'faz-cookie-manager' ),
+						'metaGpcExceptionVerifiedTitle' => __( 'The server found every circumstance this exception needs: the GPC signal, the grant in the consent cookie, and a blocked placeholder for this service on the page.', 'faz-cookie-manager' ),
+						'metaGpcExceptionUnverifiedTitle' => __( 'The server could not corroborate the circumstances this exception needs. This does not prove it was forged, only that it could not be confirmed.', 'faz-cookie-manager' ),
+						'metaGpcExceptionCarriedTitle' => __( 'Already recorded for this visitor in an earlier row and verified there; carried forward, not judged again.', 'faz-cookie-manager' ),
+						'metaGpcExceptionCarriedUnverifiedTitle' => __( 'Already recorded for this visitor in an earlier row the server could not corroborate; carried forward with that verdict, not judged again.', 'faz-cookie-manager' ),
+						'metaGpcExceptionCarriedNeutralTitle' => __( 'Already recorded for this visitor in an earlier row written before the server judged exceptions; carried forward with no verdict.', 'faz-cookie-manager' ),
 						// Label for meta.signal_only: the record was created by a
 						// privacy signal and the visitor never answered the banner.
 						'metaSignalOnly'           => __( 'Privacy signal, banner unanswered', 'faz-cookie-manager' ),
@@ -860,8 +889,17 @@ class Admin {
 						/* translators: %d: number of days. */
 						'rangeLastNDays'           => __( 'Last %d Days', 'faz-cookie-manager' ),
 					),
+					'pageSearch' => array(
+						'results' => __( 'Matching pages', 'faz-cookie-manager' ),
+						'searching' => __( 'Searching pages…', 'faz-cookie-manager' ),
+						'choose' => __( 'Use the arrow keys and Enter to choose a page.', 'faz-cookie-manager' ),
+						'empty' => __( 'No published pages found. You can enter a URL manually.', 'faz-cookie-manager' ),
+						'failed' => __( 'Page search is unavailable. You can enter a URL manually.', 'faz-cookie-manager' ),
+					),
 					// Guided setup wizard (admin/assets/js/pages/setup.js).
 					'setup'                    => array(
+						/* translators: %s: selected language name. */
+						'policy_language' => __( 'Cookie policy language: %s', 'faz-cookie-manager' ),
 						'scan_starting'             => __( 'Starting scan…', 'faz-cookie-manager' ),
 						'scan_failed'               => __( 'The scan could not be started. You can skip this step or run a full scan on the Cookies page.', 'faz-cookie-manager' ),
 						'scan_failed_notify'        => __( 'Cookie scan could not be started.', 'faz-cookie-manager' ),
@@ -2452,6 +2490,76 @@ class Admin {
 			'<p><a href="%s" class="button">%s</a></p>',
 			esc_url( $cookies_url ),
 			esc_html__( 'Open the cookie categories', 'faz-cookie-manager' )
+		);
+		echo '<a href="' . esc_url( $dismiss_url ) . '" aria-label="' . esc_attr__( 'Dismiss this notice', 'faz-cookie-manager' ) . '" style="position:absolute;top:0;right:0;padding:9px;text-decoration:none;color:#787c82">';
+		echo '<span class="dashicons dashicons-dismiss" aria-hidden="true"></span></a>';
+		echo '</div>';
+	}
+
+	/**
+	 * One-time notice: the Sourcebuster cookies now answer to Marketing.
+	 *
+	 * Armed by Activator::move_sourcebuster_to_marketing() when it moved rows,
+	 * or found rows saved or imported in another category. Both are
+	 * visitor-facing — they decide which consent keeps WooCommerce's order
+	 * attribution — so they are stated rather than left to a changelog.
+	 *
+	 * @return void
+	 */
+	public function sourcebuster_marketing_notice() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+		$state = get_option( 'faz_sourcebuster_marketing_notice' );
+		if ( ! is_array( $state ) ) {
+			return;
+		}
+		if ( isset( $_GET['faz_dismiss_sourcebuster_marketing'] )
+			&& wp_verify_nonce( sanitize_text_field( wp_unslash( $_GET['_faz_nonce'] ?? '' ) ), 'faz_dismiss_sourcebuster_marketing' ) ) {
+			delete_option( 'faz_sourcebuster_marketing_notice' );
+			return;
+		}
+		$moved = isset( $state['moved'] ) ? absint( $state['moved'] ) : 0;
+		$kept  = isset( $state['kept'] ) ? absint( $state['kept'] ) : 0;
+
+		$cookies_url = admin_url( 'admin.php?page=faz-cookie-manager-cookies' );
+		$dismiss_url = wp_nonce_url( add_query_arg( 'faz_dismiss_sourcebuster_marketing', '1' ), 'faz_dismiss_sourcebuster_marketing', '_faz_nonce' );
+
+		echo '<div class="notice notice-info" style="position:relative">';
+		echo '<p><strong>' . esc_html__( 'FAZ Cookie Manager — the Sourcebuster cookies (sbjs_*) now belong to Marketing', 'faz-cookie-manager' ) . '</strong></p>';
+		echo '<p>' . esc_html__( 'WooCommerce uses Sourcebuster to record where each visitor came from and links it to the order. WooCommerce asks for marketing consent for it, and FAZ now blocks it until Marketing is accepted. The cookies were classified as Analytics, so a visitor who accepted only Marketing had them deleted again and the order lost its source.', 'faz-cookie-manager' ) . '</p>';
+		if ( $moved > 0 ) {
+			echo '<p>' . esc_html(
+				sprintf(
+					/* translators: %d: number of cookies moved to the Marketing category. */
+					_n(
+						'This update moved %d Sourcebuster cookie from Analytics to Marketing. It had been classified by a scan, not by anyone here.',
+						'This update moved %d Sourcebuster cookies from Analytics to Marketing. They had been classified by a scan, not by anyone here.',
+						$moved,
+						'faz-cookie-manager'
+					),
+					$moved
+				)
+			) . '</p>';
+		}
+		if ( $kept > 0 ) {
+			echo '<p>' . esc_html(
+				sprintf(
+					/* translators: %d: number of cookies left in the category an administrator chose. */
+					_n(
+						'%d Sourcebuster cookie was saved or imported in another category, so it was left as it is. WooCommerce asks for marketing consent for Sourcebuster, and FAZ removes a cookie whose category the visitor has not accepted: check that its category in the cookie list is the one you intend.',
+						'%d Sourcebuster cookies were saved or imported in another category, so they were left as they are. WooCommerce asks for marketing consent for Sourcebuster, and FAZ removes a cookie whose category the visitor has not accepted: check that their category in the cookie list is the one you intend.',
+						$kept,
+						'faz-cookie-manager'
+					),
+					$kept
+				)
+			) . '</p>';
+		}
+		printf(
+			'<p><a href="%s" class="button">%s</a></p>',
+			esc_url( $cookies_url ),
+			esc_html__( 'Open the cookie list', 'faz-cookie-manager' )
 		);
 		echo '<a href="' . esc_url( $dismiss_url ) . '" aria-label="' . esc_attr__( 'Dismiss this notice', 'faz-cookie-manager' ) . '" style="position:absolute;top:0;right:0;padding:9px;text-decoration:none;color:#787c82">';
 		echo '<span class="dashicons dashicons-dismiss" aria-hidden="true"></span></a>';

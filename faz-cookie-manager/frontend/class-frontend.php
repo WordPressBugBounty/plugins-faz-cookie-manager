@@ -29,6 +29,7 @@ use FazCookie\Includes\Cookie_Policy_Shortcode;
 use FazCookie\Includes\Do_Not_Sell_Shortcode;
 use FazCookie\Includes\Cookie_Settings_Shortcode;
 use FazCookie\Frontend\Includes\Placeholder_Builder;
+use FazCookie\Frontend\Includes\Embed_Inventory;
 use FazCookie\Frontend\Includes\Geo_Runtime;
 /**
  * The public-facing functionality of the plugin.
@@ -221,6 +222,10 @@ class Frontend {
 		// scripts are actually allowed.
 		add_action( 'template_redirect', array( $this, 'shred_non_consented_cookies' ), 1 );
 		add_action( 'template_redirect', array( $this, 'start_output_buffer' ) );
+		// Register after the output-buffer flusher. Its shutdown callback can
+		// create placeholders, and the inventory must persist the final set —
+		// including an empty set when embeds were removed from this page.
+		add_action( 'template_redirect', array( Embed_Inventory::class, 'begin' ) );
 		// Optional server-cookie guard. Opening a dedicated buffer on init keeps
 		// headers pending until page, AJAX, REST and redirect callbacks have had a
 		// chance to emit Set-Cookie. The output callback then filters the final
@@ -288,6 +293,7 @@ class Frontend {
 			// WP Rocket exclude helpers — same intent.
 			add_filter( 'rocket_exclude_defer_js', array( $this, 'rocket_exclude_own_scripts' ) );
 			add_filter( 'rocket_delay_js_exclusions', array( $this, 'rocket_exclude_own_scripts' ) );
+			add_filter( 'rocket_delay_js_exclusions', array( $this, 'rocket_exclude_own_inline' ) );
 			add_filter( 'rocket_minify_excluded_external_js', array( $this, 'rocket_exclude_own_scripts' ) );
 			// `Load JavaScript deferred` wraps any matching inline <script> in a
 			// DOMContentLoaded callback. Our wp_localize_script payload emits a
@@ -807,13 +813,20 @@ class Frontend {
 						'token'          => $hmac_token,
 						'bannerSlug'     => $this->banner ? $this->banner->get_slug() : '',
 						'policyRevision' => isset( $faz_settings['general']['consent_revision'] ) ? max( 1, absint( $faz_settings['general']['consent_revision'] ) ) : 1,
+						// The page's identity as the placeholder inventory records
+						// it — the same function, for the same render — so the
+						// audit compares like with like. A browser-built URL kept
+						// only origin + path and dropped the routing parameters
+						// (?p=, ?lang=) the inventory keys on. It varies by page,
+						// never by visitor, so a cached copy stays correct.
+						'pageUrl'        => class_exists( Embed_Inventory::class ) ? Embed_Inventory::current_url() : '',
 					)
 				);
 					$inline_js = "document.addEventListener('fazcookie_consent_update',function(e){" .
 						"var d=e.detail||{};" .
 						"if(!d.action||d.action==='init')return;" .
 						"if(typeof _fazConsentLog==='undefined')return;" .
-						"var safeUrl=(function(){try{var current=new URL(window.location.href);return current.origin+current.pathname}catch(err){var origin=window.location.origin||(window.location.protocol+'//'+window.location.host);return origin+(window.location.pathname||'')}})();" .
+						"var safeUrl=(function(){if(_fazConsentLog.pageUrl)return _fazConsentLog.pageUrl;try{var current=new URL(window.location.href);return current.origin+current.pathname+current.search}catch(err){var origin=window.location.origin||(window.location.protocol+'//'+window.location.host);return origin+(window.location.pathname||'')+(window.location.search||'')}})();" .
 						"fetch(_fazConsentLog.restUrl,{" .
 							"method:'POST'," .
 							// keepalive so the request survives the navigation that
@@ -3826,8 +3839,12 @@ class Frontend {
 		// filters and only ever reaches the page here, in the full-page buffer.
 		// Without this, such an embed is never detected at all.
 		$html = $this->process_social_embeds( $html, $blocked_categories );
-		$html = $this->process_elementor_video_widgets( $html, $blocked_categories );
+		$html = $this->process_elementor_video_widgets( $html, $blocked_categories, $providers );
+		$html = $this->process_bricks_map_widgets( $html, $blocked_categories, $providers );
 
+		if ( ! $pcre_failed ) {
+			Embed_Inventory::complete_render();
+		}
 		return $html;
 	}
 
@@ -7346,7 +7363,10 @@ class Frontend {
 		if ( ! is_array( $excluded ) ) {
 			$excluded = array();
 		}
-		foreach ( array( '_fazConfig', '_fazCfg', '_fazGcm', '_fazTcfConfig' ) as $needle ) {
+		// _fazConsentLog marks both the logger's localised data and its
+		// listener: delayed, the listener is not yet attached when the visitor
+		// makes the first choice, and that decision never reaches the log.
+		foreach ( array( '_fazConfig', '_fazCfg', '_fazGcm', '_fazTcfConfig', '_fazStaticConfig', '_fazConsentLog' ) as $needle ) {
 			if ( ! in_array( $needle, $excluded, true ) ) {
 				$excluded[] = $needle;
 			}
@@ -8566,7 +8586,8 @@ class Frontend {
 		// Hide Elementor video widgets (they render an EMPTY .elementor-video
 		// wrapper server-side and build the real iframe client-side from
 		// data-settings, so the generic <iframe> blocker above never sees one).
-		$content = $this->process_elementor_video_widgets( $content, $blocked_categories );
+		$content = $this->process_elementor_video_widgets( $content, $blocked_categories, $providers );
+		$content = $this->process_bricks_map_widgets( $content, $blocked_categories, $providers );
 
 		return $content;
 	}
@@ -9009,16 +9030,17 @@ class Frontend {
 	 *
 	 * @param string $content            HTML content.
 	 * @param array  $blocked_categories Blocked category slugs.
+	 * @param array  $providers          Provider match table.
 	 * @return string Modified content.
 	 */
-	private function process_elementor_video_widgets( $content, $blocked_categories ) {
+	private function process_elementor_video_widgets( $content, $blocked_categories, $providers = array() ) {
 		if ( false === stripos( $content, 'elementor-widget-video' ) ) {
 			return $content;
 		}
 
 		$result = preg_replace_callback(
 			'#<div\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\belementor-widget-video\b)(?=[^>]*\bdata-settings\s*=)([^>]*)>#i',
-			function ( $m ) use ( $blocked_categories ) {
+			function ( $m ) use ( $blocked_categories, $providers ) {
 				$attrs = $m[1];
 
 				// Skip if already processed.
@@ -9056,8 +9078,46 @@ class Frontend {
 					return '<div' . $attrs . '>'; // Self-hosted / unrecognised source - nothing to gate.
 				}
 
-				$known    = Known_Providers::get_all();
-				$category = isset( $known[ $service_id ]['category'] ) ? $known[ $service_id ]['category'] : 'marketing';
+				// The widget is judged by the same rules as every other embed.
+				// Its wrapper carries the classes (Elementor's Advanced → CSS
+				// Classes lands here, faz-skip included) and the id. The video
+				// URL lives in data-settings as the editor typed it
+				// (youtube.com/watch?v=…, vimeo.com/123), while the browser
+				// loads the embed URL Elementor derives from it
+				// (youtube.com/embed/…, player.vimeo.com/video/…). A rule
+				// written for the plain iframe targets the latter, so both are
+				// presented as a src — the embed first, exactly as an iframe to
+				// it would be judged, then the stored URL.
+				$src_candidates = array();
+				foreach ( array_unique( array_filter( array( $this->elementor_video_embed_url( $service_id, $settings ), $url ) ) ) as $candidate ) {
+					$src_candidates[] = 'src="' . esc_attr( $candidate ) . '"';
+				}
+				if ( $this->is_whitelisted( $attrs, '' ) ) {
+					return '<div' . $attrs . '>';
+				}
+				foreach ( $src_candidates as $src_attrs ) {
+					if ( $this->is_whitelisted( $src_attrs, '' ) ) {
+						return '<div' . $attrs . '>';
+					}
+				}
+
+				// The category comes from the merged provider map — the saved
+				// cookie list, the catalogue, the admin's Script Blocking rules
+				// and the faz_blocking_rules filter — like a plain iframe to the
+				// same URL. Reading the catalogue alone made YouTube marketing
+				// here whatever the site had set. The catalogue remains the
+				// fallback when nothing in the map matches.
+				$category = false;
+				foreach ( $src_candidates as $src_attrs ) {
+					$category = $this->match_script_to_provider( $src_attrs, '', $providers );
+					if ( $category ) {
+						break;
+					}
+				}
+				if ( ! $category ) {
+					$known    = Known_Providers::get_all();
+					$category = isset( $known[ $service_id ]['category'] ) ? $known[ $service_id ]['category'] : 'marketing';
+				}
 
 				$should_block = in_array( $category, $blocked_categories, true );
 
@@ -9083,6 +9143,80 @@ class Frontend {
 			$content
 		);
 
+		return null !== $result ? $result : $content;
+	}
+
+	/**
+	 * The embed URL an Elementor Video widget loads in the browser.
+	 *
+	 * Elementor stores the URL as the editor typed it and builds the iframe
+	 * client-side from a fixed embed base per host. Only the base matters here:
+	 * provider patterns are host/path fragments, never video ids.
+	 *
+	 * @param string $service_id Service detected from the stored URL.
+	 * @param array  $settings   Decoded data-settings of the widget.
+	 * @return string Embed base URL, or '' when the host has none.
+	 */
+	private function elementor_video_embed_url( $service_id, array $settings ) {
+		switch ( $service_id ) {
+			case 'youtube':
+				$privacy = isset( $settings['yt_privacy'] ) && 'yes' === $settings['yt_privacy'];
+				return $privacy ? 'https://www.youtube-nocookie.com/embed/' : 'https://www.youtube.com/embed/';
+			case 'vimeo':
+				return 'https://player.vimeo.com/video/';
+			case 'dailymotion':
+				return 'https://www.dailymotion.com/embed/video/';
+		}
+		return '';
+	}
+
+	/**
+	 * Give Bricks' JavaScript Google Maps container the same consent UI as an iframe.
+	 * Keep its options inert until consent so Bricks cannot initialise it early.
+	 *
+	 * @param string $content HTML content.
+	 * @param array $blocked_categories Blocked category slugs.
+	 * @param array $providers Merged provider category map.
+	 * @return string
+	 */
+	private function process_bricks_map_widgets( $content, $blocked_categories, $providers ) {
+		if ( false === stripos( $content, 'data-bricks-map-options' ) ) {
+			return $content;
+		}
+		$result = preg_replace_callback(
+			'#<div\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\bbrxe-map\b)([^>]*)>#i',
+			function ( $m ) use ( $blocked_categories, $providers ) {
+				$attrs = $m[1];
+				if ( ! preg_match( '/\sdata-bricks-map-options\s*=/i', $attrs ) || false !== stripos( $attrs, 'data-faz-category' ) ) {
+					return $m[0];
+				}
+				// The widget stands for the API script Bricks enqueues for it, so
+				// it is judged as that tag: its handle id and its callback query
+				// included, so an exemption or rule written on either (as the
+				// Script Blocking screen shows the tag) covers the widget too.
+				$src = 'id="bricks-google-maps-js" src="https://maps.googleapis.com/maps/api/js?callback=bricksMap"';
+				if ( $this->is_whitelisted( $attrs, '' ) || $this->is_whitelisted( $src, '' ) ) {
+					return $m[0];
+				}
+				$category = $this->match_script_to_provider( $src, '', $providers );
+				if ( ! $category ) {
+					$known = Known_Providers::get_all();
+					$category = $known['google-maps']['category'] ?? 'functional';
+				}
+				$blocked = in_array( $category, $blocked_categories, true );
+				$consent = $this->get_service_consent();
+				if ( isset( $consent['google-maps'] ) ) {
+					$blocked = 'yes' !== $consent['google-maps'];
+				}
+				if ( ! $blocked ) {
+					return $m[0];
+				}
+				$attrs = preg_replace( '/\sdata-bricks-map-options\s*=/i', ' data-faz-bricks-map-options=', $attrs, 1 );
+				$widget = '<div' . $attrs . ' data-faz-category="' . esc_attr( $category ) . '" data-faz-service="google-maps">';
+				return Placeholder_Builder::build_social( 'google-maps', Placeholder_Builder::get_service_name( 'google-maps' ), $category ) . self::faz_add_hidden_class( $widget );
+			},
+			$content
+		);
 		return null !== $result ? $result : $content;
 	}
 
