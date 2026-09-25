@@ -18,6 +18,7 @@ use FazCookie\Admin\Modules\Banners\Includes\Banner;
 use FazCookie\Admin\Modules\Settings\Includes\Settings;
 use FazCookie\Admin\Modules\Gcm\Includes\Gcm_Settings;
 use FazCookie\Frontend\Modules\Consent_Logger\Consent_Logger;
+use FazCookie\Admin\Modules\Pageviews\Api\Api as Pageviews_Api;
 use FazCookie\Frontend\Modules\Banner_Rest\Banner_Rest;
 use FazCookie\Includes\Geolocation;
 use FazCookie\Includes\Ab_Test;
@@ -754,8 +755,11 @@ class Frontend {
 			// Pageview and banner interaction tracking (opt-in via Settings).
 			$pv_tracking = isset( $faz_settings['pageview_tracking'] ) && true === $faz_settings['pageview_tracking'];
 			if ( $pv_tracking ) {
-				$pv_bucket    = (string) floor( time() / ( 12 * HOUR_IN_SECONDS ) );
-				$pv_token     = wp_hash( 'faz_pageview_' . $pv_bucket );
+				// Minted by the class that accepts it, like the consent token
+				// above: two copies of the same bucket arithmetic in two files
+				// is what let the consent token's window and the endpoint's
+				// window drift apart in issue #292.
+				$pv_token = Pageviews_Api::current_token();
 
 				wp_localize_script(
 					$script_handle,
@@ -798,12 +802,11 @@ class Frontend {
 			// Add consent logging if enabled.
 			$log_consent_on  = isset( $faz_settings['consent_logs']['status'] ) && true === $faz_settings['consent_logs']['status'];
 			if ( $log_consent_on ) {
-				// Generate a time-bucketed HMAC token to verify requests originate
-				// from pages rendered by this site. The bucket covers 12 hours to
-				// tolerate page caching. The token is NOT a secret (it's in the
-				// HTML source) but prevents casual spoofing from external origins.
-				$bucket    = (string) floor( time() / ( 12 * HOUR_IN_SECONDS ) );
-				$hmac_token = wp_hash( 'faz_consent_' . $bucket );
+				// A time-bucketed HMAC proving the page was rendered by this
+				// site. It is NOT a secret — it ships in the HTML — and the
+				// endpoint pairs it with a same-origin check. Minted by the
+				// logger that accepts it, so the two cannot drift apart.
+				$hmac_token = Consent_Logger::current_token();
 
 				wp_localize_script(
 					$script_handle,
@@ -3972,22 +3975,76 @@ class Frontend {
 	 */
 	private function is_gcm_managed_script( $attrs, $content ) {
 		$ctx = $this->get_provider_match_context( $attrs, $content );
-		$hay = $ctx['haystack'];
+
+		// The three ad domains are matched as HOSTS, against the tag's URL.
+		// stripos() over the whole haystack answered yes for any tag that merely
+		// mentioned one of these names — a URL carrying `?redirect=doubleclick.net`,
+		// a look-alike host such as `doubleclick.net.evil.example`, a word in an
+		// inline comment — and answering yes here means "Consent Mode manages
+		// this tag, let it load before consent". That is the one decision on this
+		// path where a loose match lets a tracker run before the visitor has said
+		// anything, so it gets the strict test.
+		foreach ( preg_split( '/[\s,]+/', (string) $ctx['url'], -1, PREG_SPLIT_NO_EMPTY ) as $faz_candidate ) {
+			$faz_host = (string) \wp_parse_url( $faz_candidate, PHP_URL_HOST );
+			if ( '' === $faz_host ) {
+				continue;
+			}
+			$faz_host = strtolower( $faz_host );
+			foreach ( array( 'googleadservices.com', 'googlesyndication.com', 'doubleclick.net' ) as $faz_domain ) {
+				if ( $this->host_is_or_subdomain_of( $faz_host, $faz_domain ) ) {
+					return true;
+				}
+			}
+			// The PATH, not the whole URL: `gtm.js?id=GTM-X&next=/gtag/js` carries
+			// the string but loads the GTM container, which must stay blocked —
+			// and the container is the one thing this method has always been
+			// careful to exclude.
+			if ( $this->host_is_or_subdomain_of( $faz_host, 'googletagmanager.com' ) ) {
+				$faz_path = (string) \wp_parse_url( $faz_candidate, PHP_URL_PATH );
+				if ( 0 === stripos( $faz_path, '/gtag/js' ) ) {
+					return true;
+				}
+			}
+		}
+
+		// Code fragments, not hosts, so these stay substring tests: an inline
+		// bootstrap has no URL to read, and the gtag.js reference inside a
+		// server-rendered loader is a string in a script body. Narrowing these
+		// to the URL would newly block the inline Advanced Consent Mode
+		// bootstrap (#165) that this method exists to leave running.
 		foreach ( array(
 			'googletagmanager.com/gtag/js',
 			"gtag('config'",
 			'gtag("config"',
 			"gtag('js'",
 			'gtag("js"',
-			'googleadservices.com',
-			'googlesyndication.com',
-			'doubleclick.net',
-		) as $needle ) {
-			if ( false !== stripos( $hay, $needle ) ) {
+		) as $faz_needle ) {
+			if ( false !== stripos( (string) $ctx['content'], $faz_needle ) ) {
 				return true;
 			}
 		}
+
 		return false;
+	}
+
+	/**
+	 * Whether a host is a domain itself or a subdomain of it.
+	 *
+	 * The dot is what does the work. Without it `notdoubleclick.net` and
+	 * `doubleclick.net.evil.example` both pass, which is the failure this
+	 * replaces. Mirrors _fazHostMatches() in frontend/js/script.js.
+	 *
+	 * @param string $host   Lowercased hostname.
+	 * @param string $domain Lowercased registrable domain.
+	 * @return bool
+	 */
+	private function host_is_or_subdomain_of( $host, $domain ) {
+		$host   = (string) $host;
+		$domain = (string) $domain;
+		if ( '' === $host || '' === $domain ) {
+			return false;
+		}
+		return $host === $domain || substr( $host, -( strlen( $domain ) + 1 ) ) === '.' . $domain;
 	}
 
 	/**
