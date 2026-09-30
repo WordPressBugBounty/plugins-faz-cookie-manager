@@ -348,14 +348,8 @@ class Frontend {
 			}
 		}
 
-		// WP 5.7+ exposes wp_inline_script_tag for inline scripts added via
-		// wp_add_inline_script(). Using this filter catches them BEFORE the
-		// output buffer, giving a cleaner block (the browser never sees the
-		// original script in the source). The OB remains active as a catch-all
-		// for scripts injected outside the WP enqueue system. On WP < 5.7
-		// the filter simply does not exist, so add_filter is a safe no-op
-		// and the OB handles everything.
-		add_filter( 'wp_inline_script_tag', array( $this, 'filter_inline_script_tag' ), 10, 3 );
+		// WordPress passes the attribute map and raw inline data (WP 5.7+).
+		add_filter( 'wp_inline_script_attributes', array( $this, 'filter_inline_script_attributes' ), 10, 2 );
 		add_action( 'send_headers', array( $this, 'send_geo_cache_headers' ), 0 );
 		add_action( 'send_headers', array( $this, 'send_vary_header' ) );
 
@@ -901,6 +895,9 @@ class Frontend {
 				$a11y_handle,
 				'fazA11yConfig',
 				array(
+					'bannerTitleTag'     => $this->settings->get( 'banner_control', 'banner_title_tag' ),
+					'preferenceTitleTag' => $this->settings->get( 'banner_control', 'preference_title_tag' ),
+					'categoryTitleTag'   => $this->settings->get( 'banner_control', 'category_title_tag' ),
 					/* translators: {name} is replaced with the cookie category name (appears twice, do not translate {name}) */
 					'checkboxEnabled'  => __( '{name} enabled, disable {name}', 'faz-cookie-manager' ),
 					/* translators: {name} is replaced with the cookie category name (appears twice, do not translate {name}) */
@@ -3910,7 +3907,7 @@ class Frontend {
 			return $full;
 		}
 
-		$matched_category = $this->match_script_to_provider( $attrs, $content, $providers );
+		$matched_category = $this->match_script_to_provider( $attrs, $content, $providers, $blocked_categories );
 		if ( ! $matched_category || ! in_array( $matched_category, $blocked_categories, true ) ) {
 			// Category is allowed — but per-service consent might still block it.
 			$svc_blocked = $this->check_per_service_blocking( $attrs, $content );
@@ -4066,7 +4063,7 @@ class Frontend {
 			return $full;
 		}
 
-		$matched_category = $this->match_script_to_provider( $attrs, '', $providers );
+		$matched_category = $this->match_script_to_provider( $attrs, '', $providers, $blocked_categories );
 		if ( ! $matched_category || ! in_array( $matched_category, $blocked_categories, true ) ) {
 			// Category allowed — but per-service might block.
 			$svc_blocked = $this->check_per_service_blocking( $attrs, '' );
@@ -4161,7 +4158,7 @@ class Frontend {
 		// Kept in its own variable: a content-level hit means the block as a
 		// whole is a tracking fallback, which the rewrite below uses to decide
 		// whether unmatched sibling tags travel with it.
-		$content_matched = $this->match_script_to_provider( '', $content, $providers );
+		$content_matched = $this->match_script_to_provider( '', $content, $providers, $blocked_categories );
 
 		// Pass 2 — URL-fragment patterns against each embedded resource's OWN
 		// tag attributes. The content-only call above carries no src haystack
@@ -4185,7 +4182,7 @@ class Frontend {
 				$whitelisted       = $this->is_whitelisted( $embedded_tag, '' );
 				$embedded_tags[]   = $embedded_tag;
 				$tag_whitelisted[] = $whitelisted;
-				$tag_categories[]  = $whitelisted ? '' : $this->match_script_to_provider( $embedded_tag, '', $providers );
+				$tag_categories[]  = $whitelisted ? '' : $this->match_script_to_provider( $embedded_tag, '', $providers, $blocked_categories );
 				$tag_svcs[]        = $whitelisted ? null : $this->check_per_service_blocking( $embedded_tag, '' );
 			}
 		}
@@ -4335,7 +4332,7 @@ class Frontend {
 			return $full;
 		}
 
-		$matched_category = $this->match_script_to_provider( $attrs, '', $providers );
+		$matched_category = $this->match_script_to_provider( $attrs, '', $providers, $blocked_categories );
 		$svc_blocked      = $this->check_per_service_blocking( $attrs, '' );
 
 		if ( ! $matched_category || ! in_array( $matched_category, $blocked_categories, true ) ) {
@@ -4414,7 +4411,7 @@ class Frontend {
 			return $full;
 		}
 
-		$matched_category = $this->match_script_to_provider( $attrs, '', $providers );
+		$matched_category = $this->match_script_to_provider( $attrs, '', $providers, $blocked_categories );
 		if ( ! $matched_category || ! in_array( $matched_category, $blocked_categories, true ) ) {
 			$svc_blocked = $this->check_per_service_blocking( $attrs, '' );
 			if ( true !== $svc_blocked ) {
@@ -5657,16 +5654,45 @@ class Frontend {
 		if ( empty( $this->providers ) ) {
 			$this->get_cookie_groups();
 		}
-		$map = array();
-		// 1. Existing: url_pattern from cookie DB.
+		$map                = array();
+		$valid_categories   = $this->get_valid_category_slugs();
+		$blocked_categories = null;
+
+		// 1. Cookie-DB patterns can belong to multiple categories. Keep the
+		// first valid non-necessary category as fallback, but never discard a
+		// denied category merely because an allowed one was listed first.
 		foreach ( $this->providers as $pattern => $cats ) {
-			if ( ! empty( $cats ) ) {
-				$map[ $pattern ] = $cats[0];
+			if ( empty( $cats ) ) {
+				continue;
+			}
+			$selected = false;
+			foreach ( $cats as $candidate ) {
+				if ( 'necessary' === $candidate || ! in_array( $candidate, $valid_categories, true ) ) {
+					continue;
+				}
+				if ( false === $selected ) {
+					$selected = $candidate;
+					continue;
+				}
+				// Consent is only needed to choose between valid categories;
+				// single-category patterns retain their existing classification.
+				if ( null === $blocked_categories ) {
+					$blocked_categories = $this->get_blocked_categories();
+				}
+				if ( in_array( $selected, $blocked_categories, true ) ) {
+					break;
+				}
+				if ( in_array( $candidate, $blocked_categories, true ) ) {
+					$selected = $candidate;
+					break;
+				}
+			}
+			if ( false !== $selected ) {
+				$map[ $pattern ] = $selected;
 			}
 		}
 
 		// 2. Known providers database.
-		$valid_categories = $this->get_valid_category_slugs();
 		$known_map        = Known_Providers::get_pattern_map();
 		foreach ( $known_map as $pattern => $category ) {
 			if ( 'necessary' === $category ) {
@@ -5866,12 +5892,15 @@ class Frontend {
 	/**
 	 * Check if a <script> tag (by src or inline content) matches a known provider.
 	 *
-	 * @param string $attrs   The tag's attribute string.
-	 * @param string $content The inline script content.
-	 * @param array  $providers Provider map from get_provider_category_map().
+	 * @param string     $attrs              The tag's attribute string.
+	 * @param string     $content            The inline script content.
+	 * @param array      $providers          Provider map from get_provider_category_map().
+	 * @param array|null $blocked_categories Categories blocked on this request, so a
+	 *                                       blocked match can win over an allowed one.
+	 *                                       Null falls back to get_blocked_categories().
 	 * @return string|false Matched category slug or false.
 	 */
-	private function match_script_to_provider( $attrs, $content, $providers ) {
+	private function match_script_to_provider( $attrs, $content, $providers, $blocked_categories = null ) {
 		$match_context = $this->get_provider_match_context( $attrs, $content );
 		$url                 = $match_context['url'];
 		$inline              = $match_context['content'];
@@ -5894,19 +5923,47 @@ class Frontend {
 		$url_lc    = strtolower( $url );
 		$inline_lc = null; // Lazily lowered — only decoded data: URI payloads need it.
 
+		// Same fail-closed rule as filter_script_loader_tag(): when more than
+		// one pattern matches a tag, a BLOCKED category decides and an allowed
+		// one is only a fallback. Every caller of this method treats a
+		// non-blocked category as "let it through", so returning the first match
+		// let a generic pattern in an allowed category release a tracker that a
+		// specific pattern classifies as blocked — in six call sites, and on the
+		// output-buffer layer that exists to catch what the tag filter misses.
+		// Both layers read the same ordered map, so without this they fail
+		// together rather than backing each other up.
+		//
+		// Cost: a tag whose only matches are in allowed categories now scans the
+		// rest of the map instead of returning early. Tags that match nothing
+		// already scanned it whole, and a tag that matches a blocked pattern
+		// still returns at once, so the extra work is confined to the minority
+		// of tags that match only allowed patterns.
+		// Passed in by every caller, which already holds the list for its own
+		// decision. Read as an argument rather than fetched here so this matcher
+		// keeps depending on nothing but its inputs: reaching for
+		// get_blocked_categories() from inside it pulled the admin category
+		// catalogue into a pure matching routine, and two standalone unit
+		// harnesses that legitimately stub only what their own path touches
+		// fatalled on the missing class. The fallback covers a future caller
+		// that forgets, and never runs today.
+		if ( null === $blocked_categories ) {
+			$blocked_categories = $this->get_blocked_categories();
+		}
+		$fallback_category = false;
+
 		foreach ( $meta as $m ) {
+			$matched = false;
 			// Patterns that look like URL fragments (contain '.' or '/') are designed
 			// to match tracker domains in src/href attributes.  Applying them to the
 			// inline text body causes false positives: config scripts that merely
 			// reference a tracker domain in their data (e.g. Rank Math's rankMath.links
 			// object contains youtu.be, facebook.com, etc.) would be incorrectly blocked.
 			if ( '' !== $url_lc && $this->provider_pattern_matches_lc( $url_lc, $m['lower'] ) ) {
-				return $m['category'];
-			}
-			if ( ! $m['is_url'] ) {
+				$matched = true;
+			} elseif ( ! $m['is_url'] ) {
 				// Code-signature patterns (fbq(, gtag, _ga …) match inline content.
 				if ( false !== stripos( $inline, $m['pattern'] ) ) {
-					return $m['category'];
+					$matched = true;
 				}
 			} elseif ( $is_data_uri_payload ) {
 				// URL-fragment patterns may also match decoded data: script payloads
@@ -5915,11 +5972,21 @@ class Frontend {
 					$inline_lc = strtolower( $inline );
 				}
 				if ( $this->provider_pattern_matches_lc( $inline_lc, $m['lower'] ) ) {
-					return $m['category'];
+					$matched = true;
 				}
 			}
+			if ( ! $matched ) {
+				continue;
+			}
+			if ( in_array( $m['category'], $blocked_categories, true ) ) {
+				return $m['category'];
+			}
+			if ( false === $fallback_category ) {
+				$fallback_category = $m['category'];
+			}
 		}
-		return false;
+
+		return $fallback_category;
 	}
 
 	/**
@@ -7470,111 +7537,168 @@ class Frontend {
 		}
 
 		$tag_src = '' !== (string) $src ? (string) $src : $this->extract_tag_attr( $tag, 'src' );
+		$blocked = $this->get_blocked_categories();
+
+		// Several patterns can match one script, and the order of this map is
+		// an accident of how it is assembled (cookie DB, then the provider
+		// database, then admin rules, then a filter) — not a policy. Stopping
+		// at the FIRST match therefore let the assembly order decide whether a
+		// tracker loads before consent: a generic pattern in a category the
+		// visitor allows won over a specific pattern that classifies the same
+		// script as blocked, and the script ran while the banner promised it
+		// would not.
+		//
+		// Fail closed instead: a matching pattern in a BLOCKED category decides
+		// immediately, an allowed one is only remembered in case nothing
+		// blocked matches. Whitelisting and per-service consent remain the ways
+		// to let a matched script through, both of which are explicit.
+		$matched_category = false;
 		foreach ( $providers as $pattern => $category ) {
 			if ( empty( $pattern ) ) {
 				continue;
 			}
 			// Match against the handle and script src only. Matching the full tag
 			// can false-positive on inline data snippets or unrelated attributes.
-			if ( false !== stripos( $handle, $pattern ) || false !== stripos( $tag_src, $pattern ) ) {
-				$blocked = $this->get_blocked_categories();
-				$should_block = in_array( $category, $blocked, true );
-
-				// Per-service consent override.
-				$svc_blocked = $this->check_per_service_blocking( $tag, '' );
-				if ( false === $svc_blocked ) {
-					$should_block = false; // Service explicitly allowed.
-				} elseif ( true === $svc_blocked ) {
-					$should_block = true;  // Service explicitly blocked.
-				}
-
-				if ( $should_block ) {
-					$tag = $this->block_script_tag_safely( $tag, $category, 'script handle ' . $handle );
-				}
+			if ( false === stripos( $handle, $pattern ) && false === stripos( $tag_src, $pattern ) ) {
+				continue;
+			}
+			if ( in_array( $category, $blocked, true ) ) {
+				$matched_category = $category;
 				break;
 			}
+			if ( false === $matched_category ) {
+				$matched_category = $category;
+			}
 		}
+
+		if ( false === $matched_category ) {
+			return $tag;
+		}
+
+		$should_block = in_array( $matched_category, $blocked, true );
+
+		// Per-service consent override.
+		$svc_blocked = $this->check_per_service_blocking( $tag, '' );
+		if ( false === $svc_blocked ) {
+			$should_block = false; // Service explicitly allowed.
+		} elseif ( true === $svc_blocked ) {
+			$should_block = true;  // Service explicitly blocked.
+		}
+
+		if ( $should_block ) {
+			$tag = $this->block_script_tag_safely( $tag, $matched_category, 'script handle ' . $handle );
+		}
+
 		return $tag;
 	}
 
 	/**
-	 * Filter inline scripts added via wp_add_inline_script() (WP 5.7+).
+	 * Gate inline scripts through the core WordPress attributes filter.
 	 *
-	 * The `wp_inline_script_tag` filter was introduced in WordPress 5.7.
-	 * On older versions the filter does not exist and the output buffer
-	 * catches inline scripts instead. When the filter IS available, it
-	 * provides a cleaner interception point: the browser never sees the
-	 * original script in the page source (vs. OB which replaces it after
-	 * the entire page is buffered).
+	 * Preserve nonce, id and all unrelated attributes; the tag is built by core
+	 * after this callback, so raw inline content need not be parsed as HTML.
 	 *
-	 * The filter signature changed across WP versions:
-	 *   WP 5.7-6.2: ( $tag, $id )           — 2 args
-	 *   WP 6.3+:    ( $tag, $id, $handle )   — 3 args (handle = enqueue handle)
+	 * @param array  $attributes Script attributes supplied by WordPress.
+	 * @param string $data       Raw inline script content.
+	 * @return array
+	 */
+	public function filter_inline_script_attributes( $attributes, $data ) {
+		$type = strtolower( trim( (string) ( $attributes['type'] ?? '' ) ) );
+		// Data blocks and optimiser placeholders are not executable JS.
+		if ( '' !== $type && 'module' !== $type && ! preg_match( '#^(?:(?:text|application)/(?:x-)?(?:java|ecma)script|text/(?:javascript1\.[0-5]|jscript|livescript))$#', $type ) ) {
+			return $attributes;
+		}
+		$id = (string) ( $attributes['id'] ?? '' );
+		$handle = preg_replace( '/-js-(?:before|after|extra|translations)$/', '', $id );
+		$attrs = '';
+		foreach ( $attributes as $name => $value ) {
+			if ( false === $value || null === $value ) {
+				continue;
+			}
+			$attrs .= ' ' . esc_attr( $name ) . '="' . esc_attr( true === $value ? '' : $value ) . '"';
+		}
+		$category = $this->inline_script_block_category( $attrs, $data, $id, (string) $handle );
+		if ( false === $category ) {
+			return $attributes;
+		}
+		if ( '' !== $type && 'text/javascript' !== $type && ! isset( $attributes['data-faz-original-type'] ) ) {
+			$attributes['data-faz-original-type'] = $attributes['type'];
+		}
+		$attributes['type'] = 'text/plain';
+		$attributes['data-faz-category'] = $category;
+		return $attributes;
+	}
+
+	/**
+	 * Compatibility wrapper for callers supplying a complete inline tag.
 	 *
-	 * We register with 3 args and default $handle to '' for WP < 6.3.
-	 *
-	 * @param string $tag    Full <script>…</script> tag with inline content.
-	 * @param string $id     The script ID attribute value.
-	 * @param string $handle The WP enqueue handle (WP 6.3+, '' otherwise).
-	 * @return string Modified tag (type="text/plain" + data-faz-category when blocked).
+	 * @param string $tag    Inline script markup.
+	 * @param string $id     Script element ID.
+	 * @param string $handle Optional enqueue handle.
+	 * @return string
 	 */
 	public function filter_inline_script_tag( $tag, $id, $handle = '' ) {
-		if ( is_admin() ) {
+		if ( ! preg_match( '/<script\b([^>]*)>(.*)<\/script>/si', $tag, $match ) ) {
 			return $tag;
+		}
+		$category = $this->inline_script_block_category( $match[1], $match[2], $id, $handle );
+		return false === $category ? $tag : $this->block_script_tag_safely( $tag, $category, 'inline script handle ' . $handle );
+	}
+
+	/**
+	 * Resolve all matching inline patterns before applying service overrides.
+	 *
+	 * @param string $attrs   Serialized attributes for whitelist/service matching.
+	 * @param string $content Raw JavaScript content.
+	 * @param string $id      Script ID.
+	 * @param string $handle  Enqueue handle inferred from the ID when available.
+	 * @return string|false Category to block, or false when allowed.
+	 */
+	private function inline_script_block_category( $attrs, $content, $id, $handle ) {
+		if ( is_admin() ) {
+			return false;
 		}
 		if ( ! $this->template ) {
-			return $tag;
+			return false;
 		}
 		if ( true === faz_disable_banner() || $this->is_banner_disabled_by_settings() || $this->is_blocking_disabled_for_page() ) {
-			return $tag;
+			return false;
 		}
 		if ( $this->is_strictly_necessary_script( $handle, $id ) ) {
-			return $tag;
+			return false;
 		}
 		// Guard: never block FAZ's own localize/translation/config inline scripts.
 		// wp_localize_script() emits a <script id="faz-cookie-manager-js-extra"> tag
 		// whose content includes category slugs like "analytics" — which would otherwise
 		// be matched by the provider pattern and blocked, preventing window._fazConfig
 		// from being defined and crashing the entire banner.
-		// The handle covers WP 6.3+; the ID-derived check covers WP 5.7-6.2
-		// and the output-buffer fallback's rendered IDs.
+		// Check both the inferred enqueue handle and the rendered script ID.
 		if ( $this->is_own_script_handle( $handle ) || $this->is_own_inline_script_id( $id ) ) {
-			return $tag;
+			return false;
 		}
 		// wp_localize_script / wp_set_script_translations payloads carry only
 		// config data or translation strings — never executable tracker code.
 		// See is_wp_localize_or_translations_inline_id() for the full rationale.
 		if ( $this->is_wp_localize_or_translations_inline_id( $id ) ) {
-			return $tag;
-		}
-		// Extract attributes and inline content separately so the whitelist
-		// only matches against attributes (same policy as the OB path in
-		// process_script_tag, which passes $attrs to is_whitelisted).
-		// Matching against the full $tag would let any inline script that
-		// mentions a whitelist token (e.g. "jquery", "wp-includes/") in its
-		// body bypass blocking — a false-positive risk for third-party
-		// analytics/marketing snippets.
-		$attrs   = '';
-		$content = '';
-		if ( preg_match( '/<script([^>]*)>(.*?)<\/script>/s', $tag, $match ) ) {
-			$attrs   = $match[1];
-			$content = $match[2];
+			return false;
 		}
 
 		// Never block our own inline scripts (match on attributes + handle only).
 		if ( $this->is_whitelisted( $attrs . ' ' . $handle . ' ' . $id, '' ) ) {
-			return $tag;
+			return false;
 		}
 		// Skip if already blocked by another mechanism.
 		if ( false !== strpos( $attrs, 'data-faz-category' ) ) {
-			return $tag;
+			return false;
 		}
 
 		$providers = $this->get_provider_category_map();
 		if ( empty( $providers ) ) {
-			return $tag;
+			return false;
 		}
 
+		$blocked = $this->get_blocked_categories();
+		$matched_category = false;
 		foreach ( $providers as $pattern => $category ) {
 			if ( empty( $pattern ) ) {
 				continue;
@@ -7602,23 +7726,30 @@ class Frontend {
 				continue;
 			}
 
-			$blocked      = $this->get_blocked_categories();
-			$should_block = in_array( $category, $blocked, true );
-
-			// Per-service consent override.
-			$svc_blocked = $this->check_per_service_blocking( $tag, $content );
-			if ( false === $svc_blocked ) {
-				$should_block = false;
-			} elseif ( true === $svc_blocked ) {
-				$should_block = true;
+			if ( false === $matched_category || in_array( $category, $blocked, true ) ) {
+				$matched_category = $category;
 			}
-
-			if ( $should_block ) {
-				$tag = $this->block_script_tag_safely( $tag, $category, 'inline script handle ' . $handle );
+			if ( in_array( $category, $blocked, true ) ) {
+				break;
 			}
-			break;
 		}
-		return $tag;
+		if ( false === $matched_category ) {
+			return false;
+		}
+		$should_block = in_array( $matched_category, $blocked, true );
+		$svc_blocked = $this->check_per_service_blocking( $attrs, $content );
+		if ( false === $svc_blocked ) {
+			$should_block = false;
+		} elseif ( true === $svc_blocked ) {
+			$should_block = true;
+		}
+		// Match the output-buffer exemption for Advanced Consent Mode, but an
+		// explicit service denial still wins over a cookieless bootstrap.
+		if ( true !== $svc_blocked && $this->gcm_settings && $this->gcm_settings->is_advanced_mode()
+			&& $this->is_gcm_managed_script( $attrs, $content ) ) {
+			return false;
+		}
+		return $should_block ? $matched_category : false;
 	}
 
 	/**
@@ -7651,29 +7782,30 @@ class Frontend {
 			return $tag;
 		}
 
+		$blocked = $this->get_blocked_categories();
+		$matched_category = false;
 		foreach ( $providers as $pattern => $category ) {
-			if ( empty( $pattern ) ) {
+			if ( empty( $pattern ) || ( false === stripos( $handle, $pattern ) && false === stripos( $href, $pattern ) ) ) {
 				continue;
 			}
-			if ( false !== stripos( $handle, $pattern ) || false !== stripos( $href, $pattern ) ) {
-				$blocked = $this->get_blocked_categories();
-				$should_block = in_array( $category, $blocked, true );
-
-				// Per-service consent override.
-				$svc_blocked = $this->check_per_service_blocking( $tag, '' );
-				if ( false === $svc_blocked ) {
-					$should_block = false;
-				} elseif ( true === $svc_blocked ) {
-					$should_block = true;
-				}
-
-				if ( $should_block ) {
-					$tag = self::block_link_tag_without_regex( $tag, $category );
-				}
+			if ( false === $matched_category || in_array( $category, $blocked, true ) ) {
+				$matched_category = $category;
+			}
+			if ( in_array( $category, $blocked, true ) ) {
 				break;
 			}
 		}
-		return $tag;
+		if ( false === $matched_category ) {
+			return $tag;
+		}
+		$should_block = in_array( $matched_category, $blocked, true );
+		$svc_blocked = $this->check_per_service_blocking( $tag, '' );
+		if ( false === $svc_blocked ) {
+			$should_block = false;
+		} elseif ( true === $svc_blocked ) {
+			$should_block = true;
+		}
+		return $should_block ? self::block_link_tag_without_regex( $tag, $matched_category ) : $tag;
 	}
 
 	/**
@@ -9166,7 +9298,7 @@ class Frontend {
 				// fallback when nothing in the map matches.
 				$category = false;
 				foreach ( $src_candidates as $src_attrs ) {
-					$category = $this->match_script_to_provider( $src_attrs, '', $providers );
+					$category = $this->match_script_to_provider( $src_attrs, '', $providers, $blocked_categories );
 					if ( $category ) {
 						break;
 					}
@@ -9255,7 +9387,7 @@ class Frontend {
 				if ( $this->is_whitelisted( $attrs, '' ) || $this->is_whitelisted( $src, '' ) ) {
 					return $m[0];
 				}
-				$category = $this->match_script_to_provider( $src, '', $providers );
+				$category = $this->match_script_to_provider( $src, '', $providers, $blocked_categories );
 				if ( ! $category ) {
 					$known = Known_Providers::get_all();
 					$category = $known['google-maps']['category'] ?? 'functional';

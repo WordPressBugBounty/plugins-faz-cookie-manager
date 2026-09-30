@@ -30,6 +30,15 @@ if ( ! _fazStore ) {
 } else {
 
 _fazStore._backupNodes = [];
+
+// One queue across consent updates: a second click must not overtake a pending
+// download or execute an inline payload twice. Originals stay inert until their
+// turn so a consent withdrawal can still leave them blocked and recoverable.
+var _fazScriptRestoreQueue = [];
+var _fazScriptRestorePending = new WeakSet();
+var _fazScriptRestoreBusy = false;
+
+
 _fazStore._resetConsentID = false;
 _fazStore._bannerState = false;
 _fazStore._preferenceOriginTag = false;
@@ -44,7 +53,7 @@ ref._fazConsentStore = new Map();
 // Build marker — bump when shipping behavioural changes to this file. Lets
 // `fazcookie._diag().build` reveal at a glance whether a cache (CDN / optimizer)
 // is serving a stale bundle after a plugin update. #auto-show-hardening
-const _FAZ_BUILD = '1.27.0+geo-bootstrap';
+const _FAZ_BUILD = '1.33.0+shared-consent-restore';
 
 /**
  * One-call frontend self-diagnosis for support: paste
@@ -5268,6 +5277,7 @@ function _fazMutationObserver(mutations) {
     }
 
     for (const node of nodesToProcess) {
+            if (!node.isConnected) continue;
             // The synchronous iframe gate may already have parked src before
             // insertion. It still needs a placeholder and a restorable backup.
             const nodeSrc = node && typeof node.getAttribute === "function"
@@ -5323,6 +5333,11 @@ function _fazMutationObserver(mutations) {
                 if (node.nodeName.toLowerCase() === "iframe")
                     _fazAddPlaceholder(node, uniqueID);
                 else {
+                    var originalType = node.getAttribute('type');
+                    if (originalType && originalType !== 'text/plain' && originalType !== 'javascript/blocked'
+                        && !node.hasAttribute('data-faz-original-type')) {
+                        node.setAttribute('data-faz-original-type', originalType);
+                    }
                     node.type = "javascript/blocked";
                     const scriptEventListener = function (event) {
                         event.preventDefault();
@@ -5338,10 +5353,18 @@ function _fazMutationObserver(mutations) {
                         Node.DOCUMENT_POSITION_CONTAINED_BY
                         ? "head"
                         : "body";
+                // Keep a position anchor for scripts so their restored dependency
+                // order can be shared with server-blocked tags and templates.
+                var anchor = null;
+                if (node.nodeName.toLowerCase() === 'script' && node.parentNode) {
+                    anchor = document.createComment('faz-script');
+                    node.parentNode.insertBefore(anchor, node);
+                }
                 node.remove();
                 _fazStore._backupNodes.push({
                     position: position,
-                    node: node.cloneNode(),
+                    node: node,
+                    anchor: anchor,
                     uniqueID,
                 });
             } catch (_unused) { /* node backup failed, skip */ }
@@ -5370,7 +5393,7 @@ function _fazUnblock() {
     )
         return;
     _fazStore._backupNodes = _fazStore._backupNodes.filter(
-        ({ position, node, uniqueID }) => {
+        ({ position, node, uniqueID, anchor }) => {
             try {
                 var nodeCategory = node && typeof node.getAttribute === "function"
                     ? (node.getAttribute("data-fazcookie") || node.getAttribute("data-faz-category") || "")
@@ -5386,9 +5409,16 @@ function _fazUnblock() {
                     : "";
                 if (_fazShouldBlockResource(nodeCategory, nodeTarget, nodeService)) return true;
                 if (node.nodeName.toLowerCase() === "script") {
-                    const scriptNode = _fazBuildRestoredScript(node);
-                    if (!scriptNode) return false;
-                    document[position].appendChild(scriptNode);
+                    if (anchor && !anchor.isConnected) return false;
+                    // Connect the original inert node first. The common restore
+                    // pass will queue it in DOM order and recheck consent at its turn.
+                    node.type = 'text/plain';
+                    node.setAttribute('data-faz-restore', '1');
+                    if (anchor && anchor.isConnected) {
+                        anchor.parentNode.replaceChild(node, anchor);
+                    } else {
+                        document[position].appendChild(node);
+                    }
                 } else {
                     const frame = document.getElementById(uniqueID);
                     if (!frame) return false;
@@ -5503,11 +5533,15 @@ function _fazBuildRestoredScript(script, extraSkipAttributes) {
         'type',
         'src',
         'data-faz-category',
-        'data-faz-service',
         'data-faz-original-type',
+        'data-faz-restore',
     ]);
 
+    // Keep the explicit service identity for the live observer's consent check.
     clone.type = origType || 'text/javascript';
+    // Dynamically created scripts default to async even without an attribute.
+    // Preserve the author's ordering unless async was explicitly requested.
+    clone.async = script.hasAttribute('async');
 
     for (var i = 0; i < script.attributes.length; i++) {
         var attr = script.attributes[i];
@@ -5643,6 +5677,80 @@ function _fazRestoreInlineScript(script, extraRemoveAttributes) {
     }
 }
 
+function _fazQueueScriptRestore(script) {
+    if (_fazScriptRestorePending.has(script) || script.getAttribute('data-faz-executed') === '1') return;
+    _fazScriptRestorePending.add(script);
+    _fazScriptRestoreQueue.push(script);
+}
+
+function _fazDrainScriptRestoreQueue() {
+    if (_fazScriptRestoreBusy) return;
+    while (_fazScriptRestoreQueue.length) {
+        var script = _fazScriptRestoreQueue.shift();
+        var category = script.getAttribute('data-faz-category')
+            || (script.getAttribute('data-fazcookie') || '').replace('fazcookie-', '')
+            || script.getAttribute('data-faz-waitfor') || '';
+        var src = script.getAttribute('src') || '';
+        var waitFor = script.getAttribute('data-faz-waitfor');
+        if (!script.isConnected || script.getAttribute('data-faz-executed') === '1'
+            || (waitFor && _fazIsCategoryToBeBlocked(waitFor))
+            || (!_fazIsUserWhitelisted(src, script) && !script.classList.contains('faz-skip')
+                && _fazShouldBlockResource(category, src || script.textContent || '', script.getAttribute('data-faz-service') || ''))) {
+            _fazScriptRestorePending.delete(script);
+            continue;
+        }
+        var clone = _fazBuildRestoredScript(script, ['data-fazcookie', 'data-faz-waitfor', 'data-faz-loaded', 'data-faz-restore']);
+        if (!clone) {
+            _fazUnblockInPlace(script, ['data-fazcookie', 'data-faz-waitfor', 'data-faz-loaded', 'data-faz-restore']);
+            _fazScriptRestorePending.delete(script);
+            continue;
+        }
+        clone.setAttribute('data-faz-executed', '1');
+        // Inline classic scripts execute during insertion. External classics
+        // and modules must finish before the next ordered script is inserted.
+        var type = clone.type.trim().toLowerCase();
+        var classic = /^(?:text|application)\/(?:x-)?(?:java|ecma)script$/.test(type)
+            || /^text\/(?:javascript1\.[0-5]|jscript|livescript)$/.test(type);
+        // Data blocks and nomodule fallbacks do not dispatch load in a modern
+        // browser. They must not hold the rest of the queue indefinitely.
+        var executable = type === 'module' || (classic && !(clone.noModule && 'noModule' in clone));
+        var wait = executable && !script.hasAttribute('async') && (!!clone.getAttribute('src') || type === 'module');
+        if (wait) {
+            _fazScriptRestoreBusy = true;
+            // Capture this iteration's nodes; error releases the queue just as
+            // a parser continues after a failed download. Never retry the tag.
+            (function (original, restored) {
+                var done = false;
+                var finish = function () {
+                    if (done) return;
+                    done = true;
+                    restored.removeEventListener('load', finish);
+                    restored.removeEventListener('error', finish);
+                    _fazScriptRestorePending.delete(original);
+                    _fazScriptRestoreBusy = false;
+                    _fazDrainScriptRestoreQueue();
+                };
+                restored.addEventListener('load', finish);
+                restored.addEventListener('error', finish);
+                try {
+                    original.parentNode.replaceChild(restored, original);
+                } catch (_restoreError) {
+                    finish();
+                }
+            })(script, clone);
+            return;
+        }
+        // Guard against reentrant consent events dispatched by inline scripts.
+        _fazScriptRestoreBusy = true;
+        try {
+            script.parentNode.replaceChild(clone, script);
+        } finally {
+            _fazScriptRestorePending.delete(script);
+            _fazScriptRestoreBusy = false;
+        }
+    }
+}
+
 /**
  * Re-enable resources that were blocked server-side via PHP output buffering.
  *
@@ -5653,31 +5761,6 @@ function _fazRestoreInlineScript(script, extraRemoveAttributes) {
  * - Stylesheets: data-faz-href + data-faz-category     → restore href
  */
 function _fazUnblockServerSide() {
-    // 1. Scripts (data-faz-category from server-side, data-fazcookie from client-side).
-    document.querySelectorAll('script[type="text/plain"][data-faz-category], script[type="javascript/blocked"][data-fazcookie]')
-        .forEach(function (script) {
-            var category = script.getAttribute("data-faz-category")
-                || (script.getAttribute("data-fazcookie") || "").replace("fazcookie-", "");
-            var scriptSrc = script.getAttribute('src') || script.src || '';
-            var scriptTarget = scriptSrc || script.textContent || '';
-            if (_fazShouldBlockResource(category, scriptTarget, script.getAttribute("data-faz-service") || "")) return;
-            if (!scriptSrc) {
-                _fazRestoreInlineScript(script);
-                return;
-            }
-            if (/^data:/i.test(scriptSrc)) {
-                var decodedInline = _fazDecodeDataUriPayload(scriptSrc);
-                if (!decodedInline) return;
-                script.removeAttribute('src');
-                script.textContent = decodedInline;
-                _fazRestoreInlineScript(script, ['src', 'data-fazcookie']);
-                return;
-            }
-            var clone = _fazBuildRestoredScript(script);
-            if (!clone) return;
-            if (script.parentNode) script.parentNode.replaceChild(clone, script);
-        });
-
     // 2. Placeholders with <template> content (iframes, oEmbeds).
     // The Placeholder_Builder wraps blocked content in a <template> inside
     // a .faz-placeholder div. Restore by replacing the placeholder with the
@@ -5717,20 +5800,29 @@ function _fazUnblockServerSide() {
                 }
                 iframe.classList.add('faz-skip');
             });
-            // Restore blocked scripts inside the template content.
-            fragment.querySelectorAll('script[type="text/plain"][data-faz-category]').forEach(function (script) {
-                if (!(script.getAttribute('src') || script.src)) {
-                    _fazRestoreInlineScript(script);
-                    return;
+            // Connect the inert fragment before queuing scripts: waiting on a
+            // download in a detached fragment would never receive a load event.
+            var templateScripts = Array.from(fragment.querySelectorAll('script[type="text/plain"][data-faz-category]'));
+            templateScripts.forEach(function (script) {
+                if (phService && !script.getAttribute('data-faz-service')) {
+                    script.setAttribute('data-faz-service', phService);
                 }
-                var clone = _fazBuildRestoredScript(script);
-                if (!clone) return;
-                script.parentNode.replaceChild(clone, script);
             });
-            // Replace placeholder with restored content.
             placeholder.parentNode.insertBefore(fragment, placeholder);
             placeholder.remove();
         });
+
+    // Materialize every eligible source before collecting scripts. querySelectorAll
+    // cannot see inside template.content; draining earlier lets following inline
+    // code overtake a library in a preceding placeholder.
+    document.querySelectorAll('script[type="text/plain"][data-faz-category], script[type="javascript/blocked"][data-fazcookie], script[data-faz-restore], script[data-faz-waitfor]:not([data-faz-loaded])')
+        .forEach(_fazQueueScriptRestore);
+    _fazScriptRestoreQueue.sort(function (a, b) {
+        var order = a.compareDocumentPosition(b);
+        if (order & Node.DOCUMENT_POSITION_DISCONNECTED) return 0;
+        return order & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : order & Node.DOCUMENT_POSITION_PRECEDING ? 1 : 0;
+    });
+    _fazDrainScriptRestoreQueue();
 
     // 2b. Standalone iframes with data-faz-src (not inside a placeholder).
     document.querySelectorAll('iframe[data-faz-src][data-faz-category]')
@@ -5849,25 +5941,6 @@ function _fazUnblockServerSide() {
 
     // 4b. Constructable Stylesheets parked at build time (adoptedStyleSheets).
     _fazRestoreConstructableSheets();
-
-    // 5. Deferred scripts with data-faz-waitfor (script dependency chains).
-    // Usage: <script data-faz-waitfor="analytics" src="..."> loads only after
-    // the "analytics" category is accepted. Useful for scripts that depend on
-    // a consent-blocked tracker (e.g. a GTM plugin that needs GTM loaded first).
-    document.querySelectorAll('script[data-faz-waitfor]')
-        .forEach(function (script) {
-            var waitCat = script.getAttribute("data-faz-waitfor");
-            if (_fazIsCategoryToBeBlocked(waitCat)) return;
-            if (script.getAttribute("data-faz-loaded")) return;
-            script.setAttribute("data-faz-loaded", "1");
-            if (!(script.getAttribute('src') || script.src)) {
-                _fazRestoreInlineScript(script, ['data-faz-waitfor', 'data-faz-loaded']);
-                return;
-            }
-            var clone = _fazBuildRestoredScript(script, ['data-faz-waitfor', 'data-faz-loaded']);
-            if (!clone) return;
-            script.parentNode.replaceChild(clone, script);
-        });
 
     // 6. Social embeds (Facebook, Instagram, Twitter/X).
     // Hidden elements with data-faz-category preceded by .faz-social-placeholder.
@@ -6139,8 +6212,10 @@ function _fazShouldBlockResource(category, target, serviceId) {
     // only covers the pre-consent / category-default state.
     if (_fazStore._gcmAdvanced && _fazIsGcmManaged(target)) return false;
 
-    if (category) return _fazIsCategoryToBeBlocked(category);
-    return _fazShouldBlockProvider(target);
+    // The server can attach only one category to a tag. That category is
+    // not an exemption from other denied categories matching the same resource.
+    if (_fazIsUserWhitelisted(target)) return false;
+    return (category && _fazIsCategoryToBeBlocked(category)) || _fazShouldBlockProvider(target);
 }
 
 function _fazShouldBlockProvider(formattedRE) {
