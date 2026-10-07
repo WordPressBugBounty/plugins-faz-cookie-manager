@@ -162,9 +162,8 @@ class AMP_Consent {
 	 * @return bool
 	 */
 	private function is_cache_compatibility_enabled() {
-		$settings = $this->get_faz_settings();
-		$geo_enabled = class_exists( Geo_Runtime::class ) && Geo_Runtime::is_enabled();
-		return ! $geo_enabled && ! empty( $settings['banner_control']['cache_compatibility'] );
+		// Shared predicate — see FazCookie\Includes\Cache_Compatibility.
+		return \FazCookie\Includes\Cache_Compatibility::is_active( $this->get_faz_settings() );
 	}
 
 	/**
@@ -849,7 +848,14 @@ class AMP_Consent {
 					return false;
 				}
 			}
-			$banner->set_settings( Geo_Runtime::apply_ui_requirements( $ruleset, $banner->get_settings() ) );
+			// Normal-page footer probes only prove a script.js trigger, not
+			// an AMP tap action. Keep the native post-consent control.
+			$banner->set_settings(
+				Geo_Runtime::apply_ui_requirements(
+					$ruleset,
+					$banner->get_settings()
+				)
+			);
 		}
 
 		// Guard 2 — per-banner ruleSet (matches Frontend::is_geo_blocked()).

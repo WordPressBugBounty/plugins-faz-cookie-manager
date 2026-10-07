@@ -119,6 +119,16 @@ class Frontend {
 	const ENFORCEABLE_WILDCARD_MIN_LENGTH = 6;
 
 	/**
+	 * _fazConfig keys moved out of the inline config into the content-hashed
+	 * static file (window._fazStaticConfig). Each one is the same for every
+	 * visitor of a page type, so inlining it re-sent it with every HTML
+	 * response and kept it out of the browser cache. `_serviceCatalogue` is
+	 * the bulk of the config once per-service consent is on (~43 KB for ~330
+	 * services against ~12 KB for everything else). #310
+	 */
+	const STATIC_CONFIG_KEYS = array( '_providersToBlock', '_cookieCategoryMap', '_serviceCatalogue' );
+
+	/**
 	 * Per-request cache for blocked categories and provider map.
 	 *
 	 * @var array|null
@@ -379,6 +389,32 @@ class Frontend {
 	}
 
 	/**
+	 * Split the store data into the static payload (STATIC_CONFIG_KEYS, the
+	 * same for every visitor of a page type, written to the content-hashed
+	 * config-*.js file) and the inline remainder (per-visitor and per-request
+	 * keys, printed into the page). Keys absent from the store are skipped;
+	 * nothing else is transformed. The caller uses 'inline' only once the
+	 * static file has actually been provided, otherwise the full store stays
+	 * inline. #310
+	 *
+	 * @param array $store_data Full _fazConfig store.
+	 * @return array{static: array, inline: array}
+	 */
+	public static function split_static_config( array $store_data ) {
+		$static_config = array();
+		foreach ( self::STATIC_CONFIG_KEYS as $static_key ) {
+			if ( isset( $store_data[ $static_key ] ) ) {
+				$static_config[ $static_key ] = $store_data[ $static_key ];
+				unset( $store_data[ $static_key ] );
+			}
+		}
+		return array(
+			'static' => $static_config,
+			'inline' => $store_data,
+		);
+	}
+
+	/**
 	 * Enqeue front end scripts
 	 *
 	 * @return void
@@ -445,9 +481,10 @@ class Frontend {
 			$alt_asset     = ! empty( $faz_settings['banner_control']['alternative_asset_path'] );
 			$script_handle = $alt_asset ? 'faz-fw' : $this->plugin_name;
 
-			// Offload the static bulk of _fazConfig (~60 KB of provider block
-			// patterns + cookie-category map, identical for every visitor of a
-			// given page type) into a content-hashed, browser-cacheable .js
+			// Offload the static bulk of _fazConfig (provider block patterns,
+			// cookie-category map and, with per-service consent, the ~43 KB
+			// service catalogue — all identical for every visitor of a given
+			// page type) into a content-hashed, browser-cacheable .js
 			// file instead of re-inlining it into every HTML response. The
 			// file defines window._fazStaticConfig; a "before" inline snippet
 			// merges it back into _fazConfig ahead of script.js execution, so
@@ -457,13 +494,9 @@ class Frontend {
 			$store_data  = $this->get_store_data();
 			$static_deps = array();
 			if ( ! $alt_asset && apply_filters( 'faz_external_static_assets', true ) ) {
-				$static_config = array();
-				foreach ( array( '_providersToBlock', '_cookieCategoryMap' ) as $static_key ) {
-					if ( isset( $store_data[ $static_key ] ) ) {
-						$static_config[ $static_key ] = $store_data[ $static_key ];
-					}
-				}
-				$static_json = ! empty( $static_config ) ? wp_json_encode( $static_config ) : false;
+				$split         = self::split_static_config( $store_data );
+				$static_config = $split['static'];
+				$static_json   = ! empty( $static_config ) ? wp_json_encode( $static_config ) : false;
 				if ( false !== $static_json && '' !== $static_json ) {
 					$static_url = $this->get_static_asset_url(
 						'config-' . md5( $static_json ) . '.js',
@@ -473,9 +506,7 @@ class Frontend {
 						$static_handle = $this->plugin_name . '-static-config';
 						wp_enqueue_script( $static_handle, $static_url, array(), null, false );
 						$static_deps[] = $static_handle;
-						foreach ( array_keys( $static_config ) as $static_key ) {
-							unset( $store_data[ $static_key ] );
-						}
+						$store_data    = $split['inline'];
 					}
 				}
 			}
@@ -945,6 +976,16 @@ class Frontend {
 	 * containing ad-blocker keywords. Every FAZ frontend bundle must therefore
 	 * use the same delivery path, not just the main and accessibility bundles.
 	 *
+	 * Known limit: an inline bundle is exposed to page rewriters that parse
+	 * the document as HTML4 (DOMDocument::loadHTML(), e.g. WPSpeed's image
+	 * optimiser). libxml ends a <script> at the first `</` followed by a
+	 * letter, so a `</` inside the bundle's string literals truncates the
+	 * script. The banner template escapes `</` as `<\/` for this reason
+	 * (escape_template_end_tags()), but that is not done here on purpose:
+	 * rewriting `</` in JavaScript source would corrupt regex literals and
+	 * other code where `<\/` is not equivalent. A site that combines this
+	 * option with such a rewriter should leave this option off.
+	 *
 	 * @param string $handle        Script handle.
 	 * @param string $relative_path Path relative to frontend/.
 	 * @param array  $dependencies  Script dependencies.
@@ -1191,12 +1232,11 @@ class Frontend {
 	 * @return bool
 	 */
 	private function is_cache_compatibility_enabled() {
-		$settings = $this->get_faz_settings();
-		// A shared full-page cache cannot safely serve jurisdiction-specific law,
-		// defaults and mandatory controls. Runtime compliance therefore wins over
-		// this optimisation; the filter can still disable geo runtime entirely.
-		$geo_enabled = class_exists( Geo_Runtime::class ) && Geo_Runtime::is_enabled();
-		return ! $geo_enabled && ! empty( $settings['banner_control']['cache_compatibility'] );
+		// One predicate, shared with Amp_Consent, Banner_Rest,
+		// Translation_Compat and faz_current_language(). See
+		// FazCookie\Includes\Cache_Compatibility for why the three states
+		// matter and what the five copies used to disagree about.
+		return \FazCookie\Includes\Cache_Compatibility::is_active( $this->get_faz_settings() );
 	}
 
 	/**
@@ -1337,7 +1377,11 @@ class Frontend {
 
 		if ( null !== $runtime_ruleset ) {
 			$this->banner->set_settings(
-				Geo_Runtime::apply_ui_requirements( $runtime_ruleset, $this->banner->get_settings() )
+				Geo_Runtime::apply_ui_requirements(
+					$runtime_ruleset,
+					$this->banner->get_settings(),
+					\FazCookie\Includes\Withdrawal_Path::satisfies_revisit_requirement( $this->get_faz_settings() )
+				)
 			);
 		}
 
@@ -1677,61 +1721,14 @@ class Frontend {
 	 * @return bool True when at least one country source is available.
 	 */
 	private function has_country_signal_source() {
-		$has_source = false;
-
-		// The trust filter alone, NOT the header being present on this request.
-		// Requiring the header made the answer depend on who is asking: a cache
-		// warmer or any request that reaches the origin without passing through
-		// Cloudflare carries no CF-IPCountry, would have been told "no source",
-		// and its un-vetoed response would then be served from cache to a real
-		// visitor whose country the header DID identify — handing them the
-		// fallback ruleset and banner. That is precisely the leak the veto
-		// exists to stop, and the docblock above already says this predicate is
-		// about a source being CONFIGURED rather than resolved; the CF branch
-		// was the one place that did not honour it.
-		if ( apply_filters( 'faz_trust_cf_ipcountry_header', false ) ) {
-			$has_source = true;
-		}
-		// mod_geoip had the SAME defect, three lines below the fix — and the
-		// comment above claimed CF was "the one place", which is how it survived
-		// a review. GEOIP_COUNTRY_CODE is set by Apache from REMOTE_ADDR, so a
-		// cache warmer hitting from localhost carries none: the presence test
-		// answered "no source", the response was cached without the veto, and a
-		// real visitor was then served a page rendered for country ''. On an
-		// install whose only source is mod_geoip that is the whole audience.
-		//
-		// Configuration, not resolution: the module being loaded is the signal.
-		// apache_get_modules() is unavailable under PHP-FPM, so fall back to the
-		// header — on a warmer request that leaves the veto OFF exactly as
-		// before, never weaker, and the filter is the explicit override.
-		if ( ! $has_source && $this->mod_geoip_configured() ) {
-			$has_source = true;
-		}
-		if ( ! $has_source && function_exists( 'geoip_country_code_by_name' ) ) {
-			$has_source = true;
-		}
-		// get_database_path() already returns '' unless a GeoLite2 MMDB exists,
-		// is readable AND passes its format check, so presence of a path is the
-		// same question as "can this install do a local lookup".
-		if ( ! $has_source && class_exists( '\FazCookie\Includes\Geolocation' )
-			&& method_exists( '\FazCookie\Includes\Geolocation', 'get_database_path' ) ) {
-			try {
-				$has_source = ( '' !== (string) \FazCookie\Includes\Geolocation::get_database_path() );
-			} catch ( \Throwable $e ) {
-				$has_source = false;
-			}
-		}
-
-		/**
-		 * Override the country-source detection.
-		 *
-		 * A publisher whose edge injects a country by another means can force
-		 * this true; one who knows their stack can never resolve a country can
-		 * force it false and keep their page cache.
-		 *
-		 * @param bool $has_source Whether a country source was detected.
-		 */
-		return (bool) apply_filters( 'faz_has_country_signal_source', $has_source );
+		// One predicate, in Geolocation. The body that used to live here was
+		// duplicated by a DIFFERENT test in the admin (a saved licence key was
+		// treated as proof a database existed), so a site with no database at
+		// all was told its geo source was configured while this method — the
+		// one the resolver's behaviour actually follows — said otherwise.
+		// Keeping the wrapper preserves the private call sites and the
+		// `faz_has_country_signal_source` filter contract.
+		return \FazCookie\Includes\Geolocation::has_country_source();
 	}
 
 	/**
@@ -1801,13 +1798,7 @@ class Frontend {
 	 * @return bool
 	 */
 	private function mod_geoip_configured() {
-		if ( function_exists( 'apache_get_modules' ) ) {
-			$modules = apache_get_modules();
-			if ( is_array( $modules ) && in_array( 'mod_geoip', $modules, true ) ) {
-				return true;
-			}
-		}
-		return ! empty( $_SERVER['GEOIP_COUNTRY_CODE'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- presence test only.
+		return \FazCookie\Includes\Geolocation::mod_geoip_configured();
 	}
 
 	/**
@@ -1933,11 +1924,11 @@ class Frontend {
 			if ( $controller->has_country_dependent_banners() ) {
 				return array( 'requested' => true, 'active' => false, 'reason' => 'country_banners' );
 			}
-			$strict_banner = $controller->get_active_banner_for_law( 'gdpr', '' );
+			$has_strict_banner = $controller->has_active_banner_for_law( 'gdpr', '' );
 		} catch ( \Throwable $e ) {
 			return array( 'requested' => true, 'active' => false, 'reason' => 'missing_gdpr_banner' );
 		}
-		if ( false === $strict_banner ) {
+		if ( ! $has_strict_banner ) {
 			return array( 'requested' => true, 'active' => false, 'reason' => 'missing_gdpr_banner' );
 		}
 		if ( apply_filters( 'faz_country_dependent_banner_output', false, $settings ) ) {
@@ -2219,8 +2210,28 @@ class Frontend {
 		// that must appear inline so the renderer finds it synchronously.
 		// phpcs:ignore WordPress.WP.EnqueuedResources.NonEnqueuedScript -- inert HTML template (type=text/template is non-executable); see comment above.
 		echo '<script id="fazBannerTemplate" type="text/template">';
-		echo wp_kses( $html, faz_allowed_html() );
+		echo self::escape_template_end_tags( wp_kses( $html, faz_allowed_html() ) ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- already through wp_kses(); only `</` is rewritten.
 		echo '</script>';
+	}
+
+	/**
+	 * Write every `</` in the banner template as `<\/`.
+	 *
+	 * The template travels inside a <script type="text/template">. HTML5 ends
+	 * that element only at `</script`, but an HTML4 parser — libxml, i.e. PHP's
+	 * DOMDocument::loadHTML() — ends a script at any `</` followed by a letter
+	 * and then throws the stray end tags away. Optimisation plugins that
+	 * rewrite the whole page through DOMDocument (WPSpeed's image optimiser,
+	 * on by default) therefore delivered the template with every closing tag
+	 * removed: the browser nested the whole banner inside the title and the
+	 * consent bar rendered 0 px tall, with no buttons. `<\/` is plain text to
+	 * both parsers; _fazReadBannerTemplate() in script.js turns it back.
+	 *
+	 * @param string $html Sanitised template markup.
+	 * @return string
+	 */
+	public static function escape_template_end_tags( $html ) {
+		return str_replace( '</', '<\/', (string) $html );
 	}
 
 	/**
@@ -6759,10 +6770,24 @@ class Frontend {
 	 */
 	public static function prepare_banner_styles( $raw_css ) {
 		$raw_css   = is_string( $raw_css ) ? $raw_css : '';
+		$layout    = self::get_mobile_layout();
 		// Keep an explicit pipeline revision in addition to FAZ_VERSION so a
 		// development deploy cannot reuse CSS assembled before utility rules were
 		// added. Release builds also invalidate through the version as usual.
-		$cache_key = 'faz_boosted_css_v2_' . FAZ_VERSION . '_' . md5( $raw_css );
+		//
+		// The mobile layout is part of the key because it changes the assembled
+		// CSS without changing $raw_css: keyed on the template alone, toggling
+		// the setting would keep serving the previously cached stylesheet for a
+		// day and the setting would look broken. It is a site-wide value, not a
+		// per-visitor one, so it stays safe under Cache Compatibility Mode.
+		// v4: the compact layout gained a full-width row for the Do-Not-Sell
+		// control. That rule is appended after $raw_css is hashed, so without
+		// this bump an install that had already cached v3 within this same
+		// plugin version would keep serving the stylesheet in which the control
+		// collapses — the revision is here for exactly this case.
+		// v5: the compact labels wrap instead of clipping, the buttons follow
+		// DOM order and the classic chevron keeps its padding. Same reason.
+		$cache_key = 'faz_boosted_css_v5_' . FAZ_VERSION . '_' . $layout . '_' . md5( $raw_css );
 		$cached    = get_transient( $cache_key );
 		if ( false !== $cached ) {
 			return $cached;
@@ -6826,10 +6851,166 @@ class Frontend {
 			. '.faz-cookie-settings-btn:focus-visible{'
 			. 'outline:2px solid var(--faz-accept-button-background-color,#1863dc);outline-offset:2px;'
 			. '}';
-		$css = $css_reset . $css . $css_fixes . $css_settings_btn;
+		$css = $css_reset . $css . $css_fixes . $css_settings_btn . self::compact_mobile_css( $layout );
 
 		set_transient( $cache_key, $css, DAY_IN_SECONDS );
 		return $css;
+	}
+
+	/**
+	 * Current phone layout for the consent notice.
+	 *
+	 * Static because prepare_banner_styles() is reached both from the frontend
+	 * render and from the banner REST endpoint, neither of which shares an
+	 * instance.
+	 *
+	 * @since 1.34.0
+	 * @return string Either 'comfortable' or 'compact'; never anything else.
+	 */
+	private static function get_mobile_layout() {
+		$settings = get_option( 'faz_settings', array() );
+		$value    = '';
+		if ( is_array( $settings ) && isset( $settings['banner_control']['mobile_layout'] ) ) {
+			$value = $settings['banner_control']['mobile_layout'];
+		}
+		$value = is_string( $value ) ? strtolower( trim( $value ) ) : '';
+
+		// Re-check here rather than trusting the stored value. The sanitiser
+		// already whitelists it on save, but this string decides which CSS is
+		// emitted, and a row written before the sanitiser existed - or by hand -
+		// must not reach the stylesheet.
+		return 'compact' === $value ? 'compact' : 'comfortable';
+	}
+
+	/**
+	 * Compact phone layout for the notice buttons.
+	 *
+	 * Below 440px the shipped templates give each notice button its own
+	 * full-width row, which on a 390x844 screen makes the notice 372px tall -
+	 * about 44% of the viewport, and past half of it on a 375x667 phone. Laying
+	 * the buttons out on a shared row brings the same notice to 244px (29%).
+	 *
+	 * Five constraints shape the rules below, and none of them is cosmetic:
+	 *
+	 * 1. `flex: 1 1 0` makes the accept and reject buttons exactly as wide as
+	 *    each other because the same layout pass sizes them, not because two
+	 *    widths were written to match. EDPB Guidelines 03/2022 require the
+	 *    accept and reject options to carry equal prominence, so equality has to
+	 *    survive translation into any language - which hardcoded widths do not.
+	 * 2. Labels wrap instead of being cut. Three buttons on a 361-440px row get
+	 *    about 100px each, and translated labels do not fit that on one line
+	 *    ("Az összes elfogadása", "Alles accepteren"). With `nowrap` the accept
+	 *    label was clipped while the shorter reject label was not - two boxes of
+	 *    equal size that no longer looked equal. Wrapping keeps every word
+	 *    visible, and `align-items: stretch` on the row gives every button the
+	 *    height of the tallest one, so a two-line accept never stands taller
+	 *    than a one-line reject.
+	 * 3. `min-height: 44px` keeps the tap target at the size a finger needs.
+	 *    Shrinking the buttons to fit is exactly the wrong trade.
+	 * 4. Visual order is DOM order. Every template writes the buttons as
+	 *    [customise][reject][accept], and the template's own phone rules
+	 *    reorder them with `order`, which moves the boxes but not the Tab
+	 *    sequence: on a single row that made keyboard focus run right to left
+	 *    (WCAG 2.4.3). Stacked one per row the mismatch is only odd; side by side
+	 *    it is backwards. Rewriting the DOM would change every other layout, so
+	 *    compact resets `order` instead and lets the markup decide. Accept and
+	 *    reject stay adjacent either way, which is what keeps them reading as
+	 *    one pair of equal options.
+	 * 5. Under 360px three buttons no longer fit side by side. Accept and reject
+	 *    stay paired on their own row and "customise" - the one control that
+	 *    takes no part in the equal-prominence comparison - takes a row of its
+	 *    own. Since it comes first in the markup, that row sits above the pair.
+	 *
+	 * Emitted AFTER boost_css_specificity(), so the selectors are written with
+	 * their `#faz-consent` prefix already in place and need no `!important`:
+	 * `#faz-consent .faz-notice-btn-wrapper .faz-btn` is specificity 1-2-0, equal
+	 * to the template's boosted `.faz-notice-btn-wrapper .faz-btn-*` phone rules
+	 * and above its 1-1-0 ones, and wins the ties on document order. The RTL and
+	 * classic rules below carry the extra class those template rules carry.
+	 *
+	 * @since 1.34.0
+	 * @param string $layout Resolved layout, already whitelisted.
+	 * @return string CSS, or an empty string for the default layout.
+	 */
+	private static function compact_mobile_css( $layout ) {
+		if ( 'compact' !== $layout ) {
+			return '';
+		}
+
+		return '@media (max-width:440px){'
+			// `stretch`, not the templates' `center`: every button in a row takes
+			// the height of the tallest, so a label that wraps to two lines makes
+			// its partner two lines tall as well instead of standing out.
+			. '#faz-consent .faz-notice-btn-wrapper{'
+			. 'flex-direction:row;flex-wrap:wrap;align-items:stretch;gap:8px;margin-top:12px;'
+			. '}'
+			// `order:0` hands the sequence back to the markup (constraint 4). It
+			// also overrides the `.faz-btn-accept{margin-top:16px}` the box and
+			// banner templates give the button they used to sort first.
+			//
+			// inline-flex centres a wrapped label vertically in a stretched box
+			// for both variants the shortcode can emit: a <button> centres its
+			// content natively, a link-type <a> does not.
+			//
+			// `overflow-wrap:break-word` only breaks inside a word that cannot fit
+			// the box on its own line (a long compound), never ordinary text.
+			. '#faz-consent .faz-notice-btn-wrapper .faz-btn{'
+			. 'order:0;flex:1 1 0;width:auto;min-width:0;margin:0;'
+			. 'display:inline-flex;align-items:center;justify-content:center;'
+			. 'min-height:44px;font-size:13px;line-height:1.25;padding:8px 6px;'
+			. 'white-space:normal;overflow-wrap:break-word;word-break:normal;hyphens:auto;'
+			. '}'
+			// The classic template's RTL phone rule gives reject alone an 8px
+			// end margin (1-3-0, so the reset above does not reach it). The row
+			// already has its gap; drop it so the spacing stays symmetric.
+			. '#faz-consent .faz-rtl .faz-notice-btn-wrapper .faz-btn-reject{margin-right:0;}'
+			// The classic template - also used for Full-width + Pushdown - draws
+			// the customise chevron as an absolutely positioned ::after 12px
+			// from the end of the button and relies on the 28px end padding it
+			// sets on desktop to keep the label clear of it. With the padding
+			// above the chevron sat on the label ("Personalizz▾"), so the end
+			// padding is restored for that template only, and the chevron is
+			// centred vertically because the stretched button is no longer the
+			// 40px it was positioned for. Customise is not one of the compared
+			// options, so the extra padding cannot unbalance accept and reject.
+			. '#faz-consent.faz-classic-top .faz-notice-btn-wrapper .faz-btn-customize,'
+			. '#faz-consent.faz-classic-bottom .faz-notice-btn-wrapper .faz-btn-customize{padding-right:28px;}'
+			. '#faz-consent.faz-classic-top .faz-notice-btn-wrapper .faz-btn-customize::after,'
+			. '#faz-consent.faz-classic-bottom .faz-notice-btn-wrapper .faz-btn-customize::after{top:calc(50% - 3px);}'
+			// The Do-Not-Sell control is a flex child of this same wrapper, last
+			// in the markup. On a single row it would have to share the first
+			// line with the accept/reject pair, and at 360px their 40% bases
+			// leave it almost nothing to grow into: it collapses to a few pixels
+			// while its label spills across Accept.
+			//
+			// It is not one of the compared options — EDPB 03/2022 equal
+			// prominence governs accept against reject — so it takes a full-width
+			// row of its own, last, where it cannot compete with the pair and
+			// cannot be squeezed. This is reached in normal operation, not only
+			// by hand: Geo_Runtime turns donotSell on for a US visitor even when
+			// applicableLaw is 'gdpr', and class-template.php then keeps the
+			// button precisely because its status is true.
+			//
+			// Matched by data attribute because the two variants share nothing
+			// else: the shortcode emits either `.faz-btn.faz-btn-do-not-sell` or a
+			// bare `<a>` with no class at all. `display:block` keeps the
+			// template's left-aligned link look instead of the centred flex box
+			// the compared buttons use. The label - "Do Not Sell or Share My
+			// Personal Information" - is statutory wording that cannot be
+			// shortened, so it wraps like the others.
+			. '#faz-consent .faz-notice-btn-wrapper [data-faz-tag="donotsell-button"]{'
+			. 'flex:1 1 100%;width:100%;display:block;white-space:normal;'
+			. '}'
+			. '}'
+			. '@media (max-width:360px){'
+			// 40% rather than calc(50% - 4px): the exact value lands on the
+			// width budget to the pixel, and one sub-pixel of rounding pushes
+			// the second button onto its own row. A basis under half leaves
+			// flex-grow to fill the row and cannot round into a wrap.
+			. '#faz-consent .faz-notice-btn-wrapper .faz-btn-accept,'
+			. '#faz-consent .faz-notice-btn-wrapper .faz-btn-reject{flex:1 1 40%;}'
+			. '#faz-consent .faz-notice-btn-wrapper .faz-btn-customize{flex:1 1 100%;}'
+			. '}';
 	}
 
 	/**

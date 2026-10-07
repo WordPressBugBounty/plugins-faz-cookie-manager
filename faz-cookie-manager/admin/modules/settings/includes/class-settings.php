@@ -131,6 +131,12 @@ class Settings extends Store {
 				'banner_title_tag'       => 'h2',
 				'preference_title_tag'   => 'h2',
 				'category_title_tag'     => 'h3',
+				// Phone layout. 'comfortable' is the shipped behaviour: below
+				// 440px the notice buttons stack into one full-width row each.
+				// 'compact' lays them out on a shared row so the banner stops
+				// claiming ~44% of a 390px viewport. Default is the existing
+				// behaviour, so no installed site changes appearance on update.
+				'mobile_layout'          => 'comfortable',
 				'subdomain_sharing'      => false,
 				'hide_from_bots'         => true,
 				'gtm_datalayer'          => false,
@@ -138,6 +144,14 @@ class Settings extends Store {
 				'per_service_consent'    => false,
 				'per_cookie_consent'     => false,
 				'cache_compatibility'    => false,
+				// How a visitor withdraws consent: FAZ's floating revisit widget
+				// ('widget', the default) or a persistent link the administrator
+				// placed in the site template ('footer_link'). The second only
+				// satisfies a rule set's standing-withdrawal requirement once the
+				// plugin has fetched its own pages and found the marker — see
+				// FazCookie\Includes\Withdrawal_Path. Default keeps every
+				// existing install exactly as it is.
+				'withdrawal_path'        => 'widget',
 				// Anti-adblock banner resilience. When enabled, a single
 				// deferred client-side check re-asserts the consent banner's
 				// visibility if an ad-block cosmetic filter list (e.g. EasyList
@@ -351,6 +365,14 @@ class Settings extends Store {
 			'banner_title_tag',
 			'preference_title_tag',
 			'category_title_tag',
+			// Same reason, for two more scalars whose default is a string.
+			// Without an entry here an array-valued payload would recurse against
+			// the string default and store an empty array, which then reaches a
+			// reader expecting a string — configured_path() was casting an array.
+			// The whitelists in sanitize_option() handle every shape and settle on
+			// 'comfortable' for the layout and 'widget' for the withdrawal path.
+			'mobile_layout',
+			'withdrawal_path',
 			'sites',
 			'custom_rules',
 			'target_regions',
@@ -505,6 +527,17 @@ class Settings extends Store {
 				$value   = is_string( $value ) ? strtolower( trim( $value ) ) : '';
 				$value   = in_array( $value, $allowed, true ) ? $value : ( 'category_title_tag' === $option ? 'h3' : 'h2' );
 				break;
+			case 'mobile_layout':
+				// Whitelist, never a pass-through. The value never reaches
+				// markup — it selects which stylesheet compact_mobile_css()
+				// returns and forms part of the banner-template cache key — so
+				// the risk is not injection but an unrecognised string becoming
+				// a third layout that nothing defines. Collapsing anything
+				// unexpected to 'comfortable' keeps the stored value inside the
+				// two layouts that exist.
+				$value = is_string( $value ) ? strtolower( trim( $value ) ) : '';
+				$value = in_array( $value, array( 'comfortable', 'compact' ), true ) ? $value : 'comfortable';
+				break;
 			case 'status':
 			case 'subdomain_sharing':
 			case 'uet_consent_mode':
@@ -550,6 +583,16 @@ class Settings extends Store {
 				// banner-apply logic only ever reads one of these four values.
 				$allowed = array( '', 'gdpr', 'ccpa', 'both', 'popia' );
 				$value   = in_array( $value, $allowed, true ) ? $value : '';
+				break;
+			case 'withdrawal_path':
+				// Whitelist, never a pass-through. This value decides whether the
+				// runtime stops forcing the revisit widget on, so an unrecognised
+				// string must fall back to the route that is always present
+				// rather than to "some other route exists". Fail-closed: a
+				// visitor keeps a way to withdraw.
+				$value   = is_string( $value ) ? strtolower( trim( $value ) ) : '';
+				$allowed = array( 'widget', 'footer_link' );
+				$value   = in_array( $value, $allowed, true ) ? $value : 'widget';
 				break;
 			case 'scan_frequency':
 				$allowed = array( 'daily', 'weekly', 'monthly' );
