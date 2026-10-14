@@ -11,7 +11,11 @@ if (window._fazConfig && window._fazStaticConfig) {
         if (!(key in window._fazConfig)) window._fazConfig[key] = window._fazStaticConfig[key];
     });
 }
-const _fazStore = window._fazConfig;
+// A failed static dependency must never release the bootstrap without its
+// provider rules. Keep resources parked and let a reload retry the asset.
+const _fazStaticConfigMissing = window._fazConfig && window._fazConfig._staticConfigRequired && !window._fazStaticConfig;
+const _fazStore = _fazStaticConfigMissing ? null : window._fazConfig;
+if (_fazStore && window._fazBootstrap) window._fazBootstrap.start();
 
 // Opt-out success message (US state laws / CCPA): after the visitor confirms an
 // opt-out, the popup shows a confirmation message and auto-closes after a short
@@ -24,7 +28,14 @@ if ( ! _fazStore ) {
     // JS-defer plugin scoped the localize block inside a DOMContentLoaded
     // callback instead of emitting it at global scope), abort gracefully so
     // the rest of the page continues to work.
-    console.warn( '[FAZ Cookie Manager] _fazConfig is not defined — banner disabled. If you use a JS optimisation plugin (WP Rocket, LiteSpeed, etc.), exclude _fazConfig from deferral.' );
+    // Precision matters here: the bootstrap's own DOMContentLoaded fallback is
+    // what runs next, and it releases SAME-ORIGIN work while keeping everything
+    // cross-origin parked for the rest of the page view. Saying "resources
+    // remain blocked" without that distinction described a state the code does
+    // not produce, and the banner is gone for this page view either way.
+    console.warn( _fazStaticConfigMissing
+        ? '[FAZ Cookie Manager] The static configuration file failed to load, so the provider rules this runtime needs are missing and the consent banner is disabled for this page view. Third-party resources stay parked and same-origin requests are released; reload to retry. Check the Network tab for frontend/js/config-*.js under wp-content/uploads.'
+        : '[FAZ Cookie Manager] _fazConfig is not defined — banner disabled. If you use a JS optimisation plugin (WP Rocket, LiteSpeed, etc.), exclude _fazConfig from deferral.' );
     // Expose a no-op stub so any external callers (GTM, etc.) do not crash.
     window.fazcookie = window.fazcookie || {};
 } else {
@@ -58,7 +69,14 @@ ref._fazConsentStore = new Map();
 // that couples this file to new server output (like the `<\/` escape in the
 // banner template, which an older script.js does not undo) only reaches
 // visitors safely once FAZ_VERSION is bumped at release.
-const _FAZ_BUILD = '1.33.0+html4-escape+provider-memo';
+// The suffix after the version is deliberate and is NOT a version bump: the
+// `?ver=` cache buster follows FAZ_VERSION, which this string cannot change. It
+// exists so a support session can see at a glance that a cache is serving the
+// pre-deferral bundle. A stale bundle is survivable now — it simply never calls
+// _fazBootstrap.start()/finish(), the bootstrap's DOMContentLoaded fallback
+// takes over, and the fallback no longer uninstalls anything, so the stale
+// runtime's own gates stay in place instead of being wiped.
+const _FAZ_BUILD = '1.34.1+deferred-bootstrap';
 
 /**
  * One-call frontend self-diagnosis for support: paste
@@ -2690,13 +2708,19 @@ function _fazWatchWithdrawalControl() {
         });
     };
     _fazWithdrawalObserver = new MutationObserver(refresh);
-    // documentElement, not body: a theme or cache plugin injects its late
-    // <style> into <head>, which a body-rooted observer never sees.
+    // Theme CSS can hide a control through any attribute selector (ARIA,
+    // data-state, id, or a closed <details>), so do not restrict attributes.
+    // Observe the head too, where themes and cache plugins add late styles.
     _fazWithdrawalObserver.observe(document.documentElement, {
-        subtree: true, childList: true, attributes: true,
-        attributeFilter: ['hidden', 'inert', 'disabled', 'class', 'style', 'media', 'data-faz-open-preferences']
+        subtree: true, childList: true, attributes: true
     });
     window.addEventListener('resize', refresh);
+    // The mutation's first frame can still see a usable control partway
+    // through a fade. Recheck when CSS motion finishes or is cancelled;
+    // those computed-style changes do not create another DOM mutation.
+    ['transitionend', 'transitioncancel', 'animationend', 'animationcancel'].forEach(function (eventName) {
+        document.addEventListener(eventName, refresh, true);
+    });
     // A stylesheet that finishes loading AFTER the first check can hide the
     // footer control without mutating the DOM and without a resize, and the
     // first check runs from _fazRemoveBanner() at init — usually before that
@@ -4280,6 +4304,9 @@ function _fazAttachShortCodeStyles() {
  */
 function _fazImgShouldBlock(el, url) {
     if (!_fazStore._block || typeof url !== "string" || url === "") return false;
+    // Judged as the engine resolves it: `https:\\host/p` has no `//` as
+    // written and read as a relative path below, so it was never blocked.
+    url = _fazNormalizeResourceUrl(url);
     // Root-relative ("/path") is same-origin and bails; protocol-relative
     // ("//host/path") is CROSS-origin and must still be matched — only the host
     // check below can clear it. data:/blob: are inert and bail.
@@ -4411,45 +4438,237 @@ function _fazSrcsetBlockedCategory(el, srcset) {
  * attributes the standard restore pass re-enables on consent. Writes the park
  * attributes via the native setAttribute so it does not re-enter this gate.
  */
+// Every absolute or protocol-relative URL a markup string names. The sibling
+// of _fazCssUrls for the other place a URL hides inside a value: an iframe's
+// srcdoc, which the engine parses into a document of its own that no gate here
+// can reach once it exists.
+function _fazMarkupUrls(markup) {
+    var text = String(markup == null ? "" : markup);
+    // The document the engine builds from this markup decodes character
+    // references, and a script inside it reads `\/` as `/`; a search for a
+    // literal `//` saw neither `https:&#x2F;&#x2F;` nor `https:\/\/`. A
+    // <textarea> decodes the references the way the parser does (RCDATA:
+    // tags stay text), twice for a doubly-encoded one.
+    try {
+        var area = document.createElement("textarea");
+        for (var pass = 0; pass < 2; pass++) {
+            area.innerHTML = text;
+            if (area.value === text) break;
+            text = area.value;
+        }
+    } catch (e) { /* search the raw text */ }
+    // Every spelling that names a host to the WHATWG parser, not just a
+    // literal `//`: for a special scheme a backslash IS a slash, and any run
+    // of slashes after `https:` is ignored — so `https:host`, `https:/host`,
+    // `\\host`, `/\\host` and `\\/host` all fetch from that host. The server
+    // already judges all of them inside a srcdoc (M2 and the backslash block
+    // of test-unwatched-resource-routes-php.php) and this side read none of
+    // them, which is the layer disagreement the pair keeps falling into.
+    var MARKUP_URL = /(?:https?:[\\\/]*|[\\\/]{2})[^\s"'<>)\\\/][^\s"'<>)]*/gi;
+    var found = [];
+    var push = function (list) {
+        for (var i = 0; i < list.length; i++) {
+            if (found.indexOf(list[i]) === -1) found.push(list[i]);
+        }
+    };
+    // The raw text first. Collapsing `\\/` to `/` BEFORE the match would turn
+    // `\\/host` — protocol-relative to the parser — into a first-party path and
+    // lose the host, so the escaped form is read as a second, separate pass
+    // rather than in place: the same union _fazCssUrls does for the decoded
+    // spelling of a sheet.
+    push(text.match(MARKUP_URL) || []);
+    var unescaped = text.replace(/\\\//g, "/");
+    if (unescaped !== text) push(unescaped.match(MARKUP_URL) || []);
+    return found;
+}
+function _fazMarkupBlockedCategory(el, markup) {
+    var urls = _fazMarkupUrls(markup);
+    for (var i = 0; i < urls.length; i++) {
+        if (_fazImgShouldBlock(el, urls[i])) return _fazImgCategory(urls[i]);
+    }
+    return "";
+}
 function _fazGateResourceSetAttribute(proto, opts) {
     if (!proto || typeof proto.setAttribute !== "function") return;
     var native = proto.setAttribute;
+    // The one judgement both entry points share: a lower-cased LOCAL name and
+    // a value, parked through the native setAttribute so nothing re-enters.
+    // Returns true when the write was parked and must not reach the engine.
+    function judge(el, n, value) {
+        // `xlink:href` is the same URL by its legacy spelling, and it is
+        // what every SVG library still writes. One gate, both names.
+        if ((n === opts.urlAttr || (opts.urlAltAttr && n === opts.urlAltAttr)) && _fazImgShouldBlock(el, value)) {
+            native.call(el, opts.parkAttr, String(value));
+            native.call(el, "data-faz-category", _fazImgCategory(String(value)));
+            if (opts.hideOnPark && el.classList) el.classList.add("faz-hidden");
+            // Same runtime per-service reveal as the src-property gate: a
+            // lazy-loader that parks the embed via setAttribute('src') is
+            // equally invisible to the block-time observer. #134/#146.
+            if (opts.hideOnPark) _fazRevealService(_fazResolveServiceId(String(value), (el.getAttribute && el.getAttribute("data-faz-service")) || ""));
+            return true;
+        }
+        if (opts.markupAttr && n === opts.markupAttr) {
+            var markupCat = _fazMarkupBlockedCategory(el, value);
+            if (markupCat) {
+                native.call(el, opts.markupParkAttr, String(value));
+                native.call(el, "data-faz-category", markupCat);
+                // A parked srcdoc frame is an empty frame in the layout
+                // exactly like a parked-src one; hide it the same way.
+                if (opts.hideOnPark && el.classList) el.classList.add("faz-hidden");
+                return true;
+            }
+        }
+        if (n === "srcset" && opts.srcset) {
+            var cat = _fazSrcsetBlockedCategory(el, value);
+            if (cat) {
+                native.call(el, "data-faz-srcset", String(value));
+                // srcset keeps its OWN category so it never collides with a
+                // src/href park's data-faz-category on the same element.
+                native.call(el, "data-faz-srcset-category", cat);
+                return true;
+            }
+        }
+        return false;
+    }
     Object.defineProperty(proto, "setAttribute", {
         configurable: true,
         writable: true,
         enumerable: true,
         value: function (name, value) {
             try {
-                var n = String(name == null ? "" : name).toLowerCase();
-                if (n === opts.urlAttr && _fazImgShouldBlock(this, value)) {
-                    native.call(this, opts.parkAttr, String(value));
-                    native.call(this, "data-faz-category", _fazImgCategory(String(value)));
-                    if (opts.hideOnPark && this.classList) this.classList.add("faz-hidden");
-                    // Same runtime per-service reveal as the src-property gate: a
-                    // lazy-loader that parks the embed via setAttribute('src') is
-                    // equally invisible to the block-time observer. #134/#146.
-                    if (opts.hideOnPark) _fazRevealService(_fazResolveServiceId(String(value), (this.getAttribute && this.getAttribute("data-faz-service")) || ""));
-                    return;
-                }
-                if (n === "srcset" && opts.srcset) {
-                    var cat = _fazSrcsetBlockedCategory(this, value);
-                    if (cat) {
-                        native.call(this, "data-faz-srcset", String(value));
-                        // srcset keeps its OWN category so it never collides with a
-                        // src/href park's data-faz-category on the same element.
-                        native.call(this, "data-faz-srcset-category", cat);
-                        return;
-                    }
-                }
+                if (judge(this, String(name == null ? "" : name).toLowerCase(), value)) return;
             } catch (e) { /* fall through to native on any error */ }
             return native.call(this, name, value);
         }
     });
+    // setAttributeNS is the only way to write a namespaced attribute, so an
+    // element whose URL lives in one (SVG's xlink:href) is reachable through it
+    // with the gate above never consulted. With a NULL namespace it writes the
+    // very same attribute setAttribute does, on an HTML element too — a
+    // `<link rel=stylesheet>` given its href through setAttributeNS(null,
+    // 'href', url) fetched with nothing in front of it, because this gate used
+    // to be installed for the SVG interfaces only.
+    if (typeof proto.setAttributeNS !== "function") return;
+    var nativeNS = proto.setAttributeNS;
+    Object.defineProperty(proto, "setAttributeNS", {
+        configurable: true,
+        writable: true,
+        enumerable: true,
+        value: function (ns, name, value) {
+            try {
+                // The namespace and the LOCAL name are the attribute; the
+                // prefix is the caller's choice. Comparing the qualified name
+                // let `setAttributeNS(XLINK, 'p:href', url)` through.
+                var qname = String(name == null ? "" : name);
+                var local = qname.slice(qname.indexOf(":") + 1).toLowerCase();
+                var nsStr = ns == null ? "" : String(ns);
+                if (opts.ns) {
+                    if (local === opts.urlAttr && (nsStr === "" || nsStr === "http://www.w3.org/1999/xlink") && _fazImgShouldBlock(this, value)) {
+                        native.call(this, opts.parkAttr, String(value));
+                        native.call(this, "data-faz-category", _fazImgCategory(String(value)));
+                        return;
+                    }
+                } else if (nsStr === "" && judge(this, local, value)) {
+                    return;
+                }
+            } catch (e) { /* fall through to native on any error */ }
+            return nativeNS.call(this, ns, name, value);
+        }
+    });
 }
 _fazGateResourceSetAttribute(window.HTMLImageElement && HTMLImageElement.prototype, { urlAttr: "src", parkAttr: "data-faz-src", hideOnPark: false, srcset: true });
-_fazGateResourceSetAttribute(window.HTMLIFrameElement && HTMLIFrameElement.prototype, { urlAttr: "src", parkAttr: "data-faz-src", hideOnPark: true, srcset: false });
+_fazGateResourceSetAttribute(window.HTMLIFrameElement && HTMLIFrameElement.prototype, { urlAttr: "src", parkAttr: "data-faz-src", hideOnPark: true, srcset: false, markupAttr: "srcdoc", markupParkAttr: "data-faz-srcdoc" });
 _fazGateResourceSetAttribute(window.HTMLLinkElement && HTMLLinkElement.prototype, { urlAttr: "href", parkAttr: "data-faz-href", hideOnPark: false, srcset: false });
 _fazGateResourceSetAttribute(window.HTMLSourceElement && HTMLSourceElement.prototype, { urlAttr: "src", parkAttr: "data-faz-src", hideOnPark: false, srcset: true });
+// The SVG namespace fetches through its own elements and its own attribute
+// spelling: <image> is an <img> by another name, <use href="https://x/s.svg#i">
+// fetches an external document, and an SVG <script href> EXECUTES. None of them
+// was gated anywhere — not here, not in the bootstrap's element map (keyed on
+// nodeName, which is uppercase only for HTML), not in the server-side pass.
+// The legacy `background` presentation attribute fetches an image and is
+// honoured on the body and on every table part. It belongs to no single
+// interface, so the gate goes on each one that can carry it.
+["HTMLBodyElement", "HTMLTableElement", "HTMLTableRowElement", "HTMLTableCellElement", "HTMLTableSectionElement"].forEach(function (name) {
+    _fazGateResourceSetAttribute(window[name] && window[name].prototype, {
+        urlAttr: "background", parkAttr: "data-faz-background", hideOnPark: false, srcset: false
+    });
+});
+// <feImage href> fetches exactly as <image href> does; jsdom has no interface
+// for it, so its gate is a no-op there and the sweep below is what the tests
+// exercise. Known limit, shared with the bootstrap and listed in its header:
+// `image.href.baseVal = url` writes through SVGAnimatedString and reaches the
+// engine with neither of these two APIs called. It is not interceptable
+// without wrapping the `href` GETTER to hand out a proxy object, which this
+// file does not do; libraries write SVG URLs through setAttribute and
+// setAttributeNS, which are gated here.
+["SVGImageElement", "SVGUseElement", "SVGScriptElement", "SVGFEImageElement"].forEach(function (name) {
+    _fazGateResourceSetAttribute(window[name] && window[name].prototype, {
+        urlAttr: "href", urlAltAttr: "xlink:href", parkAttr: "data-faz-href",
+        hideOnPark: false, srcset: false, ns: true
+    });
+});
+
+/**
+ * The IDL route for a MARKUP attribute: `iframe.srcdoc = html`. The
+ * setAttribute gate above judges srcdoc, but a property assignment never calls
+ * setAttribute, and the deferred bootstrap replays a held `srcdoc` as exactly
+ * that assignment on this prototype at handoff — so without this gate a frame
+ * assigned after it was appended, or found by id in server markup, was applied
+ * live under a refusing policy. Same judgement as the attribute route: the
+ * markup is a document, parked whole when it names a blocked provider.
+ */
+function _fazGateSrcdocSetter(proto) {
+    if (!proto) return;
+    var desc = Object.getOwnPropertyDescriptor(proto, "srcdoc");
+    if (!desc || typeof desc.set !== "function" || typeof desc.get !== "function" || desc.configurable === false) return;
+    var nativeSet = desc.set, nativeGet = desc.get;
+    Object.defineProperty(proto, "srcdoc", {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: function () { return nativeGet.call(this); },
+        set: function (val) {
+            try {
+                var cat = _fazMarkupBlockedCategory(this, val);
+                if (cat) {
+                    this.setAttribute("data-faz-srcdoc", String(val));
+                    this.setAttribute("data-faz-category", cat);
+                    if (this.classList) this.classList.add("faz-hidden");
+                    return; // park the document; the engine never parses it
+                }
+            } catch (e) { /* fall through to the native setter on any error */ }
+            nativeSet.call(this, val);
+        }
+    });
+}
+_fazGateSrcdocSetter(window.HTMLIFrameElement && HTMLIFrameElement.prototype);
+
+/**
+ * The IDL route for the legacy `background` attribute: `document.body.background
+ * = url`. Only <body> reflects it as a property; the setAttribute gate above
+ * covers the attribute route on every element that honours it.
+ */
+function _fazGateBackgroundSetter(proto) {
+    if (!proto) return;
+    var desc = Object.getOwnPropertyDescriptor(proto, "background");
+    if (!desc || typeof desc.set !== "function" || typeof desc.get !== "function" || desc.configurable === false) return;
+    var nativeSet = desc.set, nativeGet = desc.get;
+    Object.defineProperty(proto, "background", {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: function () { return nativeGet.call(this); },
+        set: function (val) {
+            try {
+                if (_fazImgShouldBlock(this, val)) {
+                    this.setAttribute("data-faz-background", String(val));
+                    this.setAttribute("data-faz-category", _fazImgCategory(String(val)));
+                    return;
+                }
+            } catch (e) { /* fall through to the native setter on any error */ }
+            nativeSet.call(this, val);
+        }
+    });
+}
+_fazGateBackgroundSetter(window.HTMLBodyElement && HTMLBodyElement.prototype);
 
 // srcset PROPERTY setter (img.srcset = …) — the sibling of the .src/.href property
 // gates. Without it, a runtime `.srcset` assignment writes the attribute directly
@@ -4497,12 +4716,49 @@ function _fazParkResourceElementIfBlocked(el) {
                 el.removeAttribute("src");
                 if (tag === "iframe" && el.classList) el.classList.add("faz-hidden");
             }
+            var doc = el.getAttribute("srcdoc");
+            if (doc && !el.getAttribute("data-faz-srcdoc")) {
+                // srcdoc is a document, not a URL: judged whole, because what
+                // it names is fetched by a parser this side cannot intercept.
+                var docCat = _fazMarkupBlockedCategory(el, doc);
+                if (docCat) {
+                    el.setAttribute("data-faz-srcdoc", doc);
+                    el.setAttribute("data-faz-category", docCat);
+                    el.removeAttribute("srcdoc");
+                    if (el.classList) el.classList.add("faz-hidden");
+                }
+            }
             var ss = el.getAttribute("srcset");
             if (ss && !el.getAttribute("data-faz-srcset")) {
                 var c = _fazSrcsetBlockedCategory(el, ss);
                 if (c) { el.setAttribute("data-faz-srcset", ss); el.setAttribute("data-faz-srcset-category", c); el.removeAttribute("srcset"); }
             }
-        } else if (tag === "link") {
+        } else if (tag === "image" || tag === "use" || tag === "feimage" || (tag === "script" && el.namespaceURI === "http://www.w3.org/2000/svg")) {
+            // Parser-built SVG, which is the common case: an inline <svg> in the
+            // page's own HTML, or markup a script wrote. Both spellings are read
+            // and both are removed, so nothing is left for the engine to resolve.
+            // Read through the namespace as well: a legacy href written under
+            // another prefix (`p:href` on the xlink namespace) is the same
+            // attribute and is not spelled `xlink:href` in the DOM.
+            var svgHref = el.getAttribute("href") || el.getAttribute("xlink:href")
+                || (typeof el.getAttributeNS === "function" ? el.getAttributeNS("http://www.w3.org/1999/xlink", "href") : null);
+            if (svgHref && !el.getAttribute("data-faz-href") && _fazImgShouldBlock(el, svgHref)) {
+                el.setAttribute("data-faz-href", svgHref);
+                el.setAttribute("data-faz-category", _fazImgCategory(svgHref));
+                el.removeAttribute("href");
+                try { el.removeAttributeNS("http://www.w3.org/1999/xlink", "href"); } catch (e) { /* not namespaced */ }
+                el.removeAttribute("xlink:href");
+            }
+        }
+        // Any element at all, so it is checked outside the tag branches: the
+        // attribute is what fetches, not the tag.
+        var bg = el.getAttribute("background");
+        if (bg && !el.getAttribute("data-faz-background") && _fazImgShouldBlock(el, bg)) {
+            el.setAttribute("data-faz-background", bg);
+            el.setAttribute("data-faz-category", _fazImgCategory(bg));
+            el.removeAttribute("background");
+        }
+        if (tag === "link") {
             var href = el.getAttribute("href");
             var rel = (el.getAttribute("rel") || "").toLowerCase();
             // Same rel set the server-side pass gates (process_link_tag in
@@ -4558,26 +4814,116 @@ function _fazAggressiveCssUrlBlockingEnabled() {
     return !!(_fazStore && _fazStore._aggressiveCssUrlBlocking);
 }
 
-function _fazCssUrls(css) {
+// A CSS escape, as the CSS tokenizer consumes it: `\XX` (one to six hex
+// digits, one optional whitespace swallowed after them) or `\c` for any other
+// character. `u\72l(` is `url(` to the tokenizer, `\75 rl(` is too, and
+// `tracker\.test` is `tracker.test` — none of which a regex over the raw text
+// could see, so each of them fetched.
+function _fazCssDecodeEscapes(css) {
+    if (!css || typeof css !== "string" || css.indexOf("\\") === -1) return css;
+    // CRLF is ONE whitespace to the tokenizer after a hex escape; eating the
+    // CR alone left `u\nrl(`, which no extraction regex reads as url(.
+    return css.replace(/\\([0-9a-f]{1,6})(?:\r\n|[ \t\n\r\f])?|\\([\s\S])/gi, function (_m, hex, ch) {
+        if (hex) {
+            var cp = parseInt(hex, 16);
+            if (!cp || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return "\ufffd";
+            try { return String.fromCodePoint(cp); } catch (_e) { return "\ufffd"; }
+        }
+        return ch;
+    });
+}
+
+// Every URL a stylesheet names, read the way the CSS tokenizer reads it:
+// url() in its three forms, `@import` followed by a string with or without
+// whitespace, the string form of image-set(), and all of them again on a copy
+// with CSS escapes decoded, because an escape can hide the function name or
+// a character of the host from the raw text.
+// The bare branch of the url() pattern stops at the first whitespace, which is
+// right for the RAW text: an unquoted url() token cannot hold one. On the
+// DECODED copy it is wrong — an escape that decoded to a space put one inside
+// the token, so `url(https://tracker.test/a\ b.png)` matched neither pass and
+// no URL was read out of the sheet at all. On the decoded text the whitespace
+// is already part of the URL the engine resolved, so the body runs to the
+// closing paren instead.
+// A CSS string ends at an UNESCAPED quote: `url("https://host/a\".png")` is one
+// string whose value holds a quote, and the engine fetches it. Reading the body
+// as `[^"]*` stopped at the escaped quote, failed the closing paren, and let the
+// bare branch swallow the whole thing INCLUDING the quotes — a token that
+// resolves against the page and lands on the site's own origin, so the third
+// party was never named and never blocked. The two alternatives below are
+// disjoint on their first character, so this cannot backtrack badly.
+var _FAZ_CSS_URL_BARE = /url\(\s*(?:"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)'|([^\)\s]+))\s*\)/gi;
+var _FAZ_CSS_URL_DECODED = /url\(\s*(?:"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)'|([^\)]+?))\s*\)/gi;
+// A url( left OPEN: the tokenizer reads to the end of the text as the URL, and
+// the engine fetches it. That is the shape a sheet has while a held fragment
+// has not landed yet, and the shape a truncated sheet keeps for good — so it
+// is not exotic. bootstrap.js has held it all along (CSS_URL_OPEN) and this
+// extractor did not, which made the two layers disagree on the same text: the
+// pre-runtime blocker parked the sheet and the runtime that arrived afterwards
+// read it as clean. Anchored at the end, so only a genuinely unclosed token
+// matches.
+var _FAZ_CSS_URL_OPEN = /url\(\s*(?:"((?:[^"\\]|\\[\s\S])*)|'((?:[^'\\]|\\[\s\S])*)|([^\)\s]*))\s*$/i;
+// image-set() and src() name a file with a bare string and no url() around it.
+// src() was the other form bootstrap.js read and this one did not.
+//
+// The body allows ONE level of nesting, which is the depth bootstrap.js's
+// CSS_STRING_FN has always had. A flat `[^()]*` stopped at the first nested
+// token, so `image-set(url(a.png) 1x, "https://tracker.test/b.png" 2x)` never
+// reached the string after the url() — the server parked that sheet and the
+// runtime called it clean, which is the layer disagreement this pair keeps
+// falling back into. Deeper nesting than one level is not valid in either
+// function's grammar.
+var _FAZ_CSS_STRING_FN = /(?:-webkit-)?(?:image-set|src)\(((?:[^()]|\([^()]*\))*)\)/gi;
+function _fazCssUrlsRaw(css, decoded) {
     var urls = [];
     if (!css || typeof css !== "string") return urls;
-    css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^\)\s]+))\s*\)/gi, function (_m, dq, sq, bare) {
+    css.replace(decoded ? _FAZ_CSS_URL_DECODED : _FAZ_CSS_URL_BARE, function (_m, dq, sq, bare) {
         urls.push(dq || sq || bare || "");
         return _m;
     });
-    css.replace(/@import\s+(["'])([^"']+)\1/gi, function (_m, _q, url) {
+    // Same reason as the url() string above: the body must cross an escaped
+    // quote, or `@import"https://host/a\".css"` names nothing.
+    css.replace(/@import\s*(["'])((?:(?!\1)[^\\]|\\[\s\S])+)\1/gi, function (_m, _q, url) {
         urls.push(url || "");
         return _m;
     });
+    css.replace(_FAZ_CSS_STRING_FN, function (_m, inner) {
+        String(inner).replace(/"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)'/g, function (_s, dq, sq) {
+            urls.push(dq || sq || "");
+            return _s;
+        });
+        return _m;
+    });
+    var open = _FAZ_CSS_URL_OPEN.exec(css);
+    if (open && (open[1] || open[2] || open[3])) urls.push(open[1] || open[2] || open[3]);
+    return urls;
+}
+function _fazCssUrls(css) {
+    var urls = _fazCssUrlsRaw(css);
+    var decoded = _fazCssDecodeEscapes(css);
+    if (decoded !== css) {
+        var more = _fazCssUrlsRaw(decoded, true);
+        for (var i = 0; i < more.length; i++) {
+            if (urls.indexOf(more[i]) === -1) urls.push(more[i]);
+        }
+    }
     return urls;
 }
 
+// Judged on host and path, exactly as policy.url judges a URL for the
+// bootstrap: a substring match over the whole URL called
+// `cdn.site.test/p.png?u=tracker.test` a tracker, the bootstrap did not, the
+// two layers' neutralised forms diverged, _fazPrimeStyleCssMarkers() could
+// not adopt the server's original, and the first append lost it. Escapes are
+// decoded first so `tracker\.test` is the host it is to the tokenizer.
 function _fazCssUrlShouldBlock(url) {
     if (!url || typeof url !== "string") return false;
-    url = url.trim();
+    url = _fazCssDecodeEscapes(url).trim();
     if (!url || url.charAt(0) === "#" || /^data:/i.test(url) || /^blob:/i.test(url)) return false;
     if (_fazIsUserWhitelisted(url)) return false;
-    return _fazShouldBlockProvider(url);
+    var endpoint = _fazExtractEndpoint(url);
+    if (!endpoint) return false;
+    return _fazShouldBlockProvider(endpoint);
 }
 
 function _fazCssShouldBlock(css) {
@@ -4591,21 +4937,34 @@ function _fazCssShouldBlock(css) {
 function _fazCssBlockedCategory(css) {
     var urls = _fazCssUrls(css);
     for (var i = 0; i < urls.length; i++) {
-        if (_fazCssUrlShouldBlock(urls[i])) return _fazImgCategory(urls[i]);
+        if (_fazCssUrlShouldBlock(urls[i])) return _fazImgCategory(_fazExtractEndpoint(_fazCssDecodeEscapes(urls[i])) || urls[i]);
     }
     return "functional";
 }
 
+// Neutralise in place what a regex over the raw text can reach: url(), an
+// @import string, an image-set() string. What it cannot reach — a URL or a
+// function name spelled through CSS escapes — is still found by _fazCssUrls
+// on the decoded copy, and a sheet that still fetches after the in-place pass
+// is blocked WHOLE: empty live text, the original in the marker, restored on
+// consent. Partial is not an option there; partial is how it fetched.
 function _fazNeutralizeCssUrls(css) {
     if (!css || typeof css !== "string") return css;
-    css = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^\)\s]+))\s*\)/gi, function (match, dq, sq, bare) {
+    var out = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^\)\s]+))\s*\)/gi, function (match, dq, sq, bare) {
         var url = dq || sq || bare || "";
         return _fazCssUrlShouldBlock(url) ? 'url("' + _FAZ_INERT_CSS_URL + '")' : match;
     });
-    css = css.replace(/(@import\s+)(["'])([^"']+)\2/gi, function (match, prefix, _quote, url) {
+    out = out.replace(/(@import\s*)(["'])([^"']+)\2/gi, function (match, prefix, _quote, url) {
         return _fazCssUrlShouldBlock(url) ? prefix + 'url("' + _FAZ_INERT_CSS_URL + '")' : match;
     });
-    return css;
+    out = out.replace(/((?:-webkit-)?image-set\()([^()]*)(\))/gi, function (match, open, inner, close) {
+        var replaced = String(inner).replace(/"([^"]*)"|'([^']*)'/g, function (str, dq, sq) {
+            return _fazCssUrlShouldBlock(dq || sq || "") ? '"' + _FAZ_INERT_CSS_URL + '"' : str;
+        });
+        return open + replaced + close;
+    });
+    if (_fazCssShouldBlock(out)) return "";
+    return out;
 }
 
 function _fazBase64EncodeUtf8(str) {
@@ -4665,6 +5024,29 @@ function _fazPrimeStyleCssMarkers(style) {
     if (!encoded) return;
     var original = _fazBase64DecodeUtf8(encoded);
     if (!original) return;
+    // A sheet parked WHOLE — by the bootstrap, by the markup sink, or by the
+    // server — has an empty live text and therefore no child at all, which
+    // no element can carry in markup. Give it the empty Text node that holds
+    // the original, or the first append() would read no original, drop the
+    // marker, and lose the sheet.
+    if (style.childNodes.length === 0 && _fazNeutralizeCssUrls(original) === "" && _fazNativeNodeAppendChild) {
+        var holder = (style.ownerDocument || document).createTextNode("");
+        _fazNativeNodeAppendChild.call(style, holder);
+        _fazSetStyleNodeOriginalCss(holder, original);
+        return;
+    }
+    // The OTHER shape a park whole takes, and the one the pre-runtime blocker
+    // actually writes: emptySheet() (bootstrap.js) leaves exactly ONE empty
+    // Text node, for this very reason. Only the no-children case was covered,
+    // so a sheet parked by the bootstrap reached the equality below — which
+    // compares the neutralised original against an empty string and can never
+    // hold — was never adopted, and the first append dropped its marker.
+    if (style.childNodes.length === 1 && _fazIsStyleTextNode(style.childNodes[0])
+        && !_fazHasStyleNodeOriginalCss(style.childNodes[0])
+        && (style.childNodes[0].nodeValue || "") === "") {
+        _fazSetStyleNodeOriginalCss(style.childNodes[0], original);
+        return;
+    }
     if (style.childNodes.length === 1 && _fazIsStyleTextNode(style.childNodes[0]) && !_fazHasStyleNodeOriginalCss(style.childNodes[0])) {
         // Only adopt the parked original when the live node still holds its
         // neutralized form (server-rendered <style data-faz-css> with the inert
@@ -4743,7 +5125,7 @@ function _fazFindAccessorDescriptor(proto, prop) {
     return null;
 }
 
-function _fazGateStyleTextSetter(proto, prop) {
+function _fazGateStyleTextSetter(proto, prop, onlyStyle) {
     if (!proto) return;
     var desc = _fazFindAccessorDescriptor(proto, prop);
     if (!desc || typeof desc.set !== "function" || typeof desc.get !== "function" || desc.configurable === false) return;
@@ -4753,6 +5135,10 @@ function _fazGateStyleTextSetter(proto, prop) {
         enumerable: desc.enumerable,
         get: function () { return nativeGet.call(this); },
         set: function (val) {
+            // Installed on a shared interface (innerText lives on HTMLElement)
+            // the gate applies to a <style> alone; any other element's text
+            // is not CSS and must not be rewritten.
+            if (onlyStyle && (this.nodeName || "").toLowerCase() !== "style") return nativeSet.call(this, val);
             var s = String(val == null ? "" : val);
             // Fail open on any error in the CSS-block logic: assign the original
             // CSS rather than dropping it (a thrown error must never blank the
@@ -4760,7 +5146,16 @@ function _fazGateStyleTextSetter(proto, prop) {
             try {
                 if (_fazStore._block && s && _fazCssShouldBlock(s)) {
                     nativeSet.call(this, _fazNeutralizeCssUrls(s));
-                    if (_fazIsStyleTextNode(this.firstChild)) _fazSetStyleNodeOriginalCss(this.firstChild, s);
+                    // A sheet blocked whole has an EMPTY live text, and an empty
+                    // textContent write leaves no text node to carry the
+                    // original; give it one, or the marker could not be written
+                    // and the original would be lost.
+                    var holder = this.firstChild;
+                    if (!_fazIsStyleTextNode(holder) && _fazNativeNodeAppendChild) {
+                        holder = (this.ownerDocument || document).createTextNode("");
+                        _fazNativeNodeAppendChild.call(this, holder);
+                    }
+                    if (_fazIsStyleTextNode(holder)) _fazSetStyleNodeOriginalCss(holder, s);
                 } else {
                     nativeSet.call(this, s);
                 }
@@ -4814,10 +5209,38 @@ function _fazGateStyleTextNodeMethod(proto, methodName) {
                 } catch (e) { /* leave this argument untouched on any error */ }
             }
             var result = native.apply(this, args);
+            try { _fazCollapseSplitStyleCss(this); } catch (_collapseErr) { /* native mutation already succeeded */ }
             try { _fazSyncStyleCssAttribute(this); } catch (_syncErr) { /* native mutation already succeeded */ }
             return result;
         }
     });
+}
+
+// The per-argument gate above judges each string or node on its own, and a
+// URL can be split across two of them: `s.append('.p{background-image:u',
+// 'rl(https://tracker/c.png)}')`, or two consecutive appendChild() calls.
+// Neither piece names a URL, so nothing was neutralised — while the marker
+// was still written from the combined original, which read as "parked" with
+// the live text fetching. The RESULTING text is what the engine parses, so
+// that is what is judged here, after the write: if the live text still
+// fetches, the children collapse into one text node holding the neutralised
+// combined CSS, with the combined original kept for the restore pass.
+var _fazNativeNodeRemoveChild = window.Node && Node.prototype.removeChild;
+var _fazNativeNodeAppendChild = window.Node && Node.prototype.appendChild;
+function _fazCollapseSplitStyleCss(style) {
+    if (!_fazStore._block || !style || !style.childNodes || !_fazNativeNodeRemoveChild || !_fazNativeNodeAppendChild) return;
+    var live = "";
+    for (var i = 0; i < style.childNodes.length; i++) {
+        var node = style.childNodes[i];
+        live += _fazIsStyleTextNode(node) ? (node.nodeValue || "") : (node.textContent || "");
+    }
+    if (!live || !_fazCssShouldBlock(live)) return;
+    var original = _fazStyleOriginalCss(style);
+    var doc = style.ownerDocument || document;
+    var replacement = doc.createTextNode(_fazNeutralizeCssUrls(original));
+    _fazSetStyleNodeOriginalCss(replacement, original);
+    while (style.firstChild) _fazNativeNodeRemoveChild.call(style, style.firstChild);
+    _fazNativeNodeAppendChild.call(style, replacement);
 }
 
 _fazGateStyleTextSetter(window.HTMLStyleElement && HTMLStyleElement.prototype, "textContent");
@@ -4935,6 +5358,9 @@ function _fazGateStyleCharacterDataSetter(proto, prop) {
         get: function () { return nativeGet.call(this); },
         set: function (val) {
             if (_fazInStyleCharDataWrite) { nativeSet.call(this, val); return; }
+            // On Node.prototype (textContent) this runs for every node; only
+            // a Text or CDATA child of a <style> is CSS.
+            if (!_fazIsStyleTextNode(this)) { nativeSet.call(this, val); return; }
             var style = _fazStyleParentForCharacterData(this);
             if (!style) {
                 nativeSet.call(this, val);
@@ -5011,20 +5437,69 @@ function _fazGateStyleCharacterDataReplaceWith(proto) {
 // resource is not fetched before consent. (Live restore of an individually-inserted
 // rule is not tracked — the inert rule is re-evaluated on the next navigation once
 // consented; the pre-consent leak is what matters here.)
-function _fazGateStyleSheetInsertRule() {
-    var proto = window.CSSStyleSheet && CSSStyleSheet.prototype;
+function _fazGateInsertRuleOn(proto) {
     if (!proto || typeof proto.insertRule !== "function") return;
     var native = proto.insertRule;
     Object.defineProperty(proto, "insertRule", {
         configurable: true, writable: true, enumerable: true,
         value: function (rule, index) {
+            // The decision is taken first and KEPT, because past a refusal the
+            // original must never be what reaches the sheet. It used to be: the
+            // neutralised form was inserted inside a try whose catch fell
+            // through to `native.call(this, rule, index)`, and insertRule()
+            // throws on the empty string — which is exactly what
+            // _fazNeutralizeCssUrls answers for a rule whose URL it cannot
+            // rewrite one token at a time. The refusal then inserted the
+            // refused rule, and the engine fetched it.
+            var blocked = false, s = "";
             try {
-                var s = String(rule == null ? "" : rule);
-                if (_fazStore._block && s && _fazCssShouldBlock(s)) {
-                    return native.call(this, _fazNeutralizeCssUrls(s), index);
-                }
-            } catch (e) { /* fall through to native */ }
-            return native.call(this, rule, index);
+                s = String(rule == null ? "" : rule);
+                blocked = !!(_fazStore._block && s && _fazCssShouldBlock(s));
+            } catch (e) { blocked = false; }
+            if (!blocked) return native.call(this, rule, index);
+            // Something has to land: a caller that reads the returned index
+            // gets one that does not exist otherwise, and every later index
+            // shifts under it. An @media query that can never match is valid
+            // CSS, holds the slot, and fetches nothing.
+            var inert = "@media not all{}";
+            var neutral = "";
+            try { neutral = _fazNeutralizeCssUrls(s) || ""; } catch (e) { neutral = ""; }
+            try { return native.call(this, neutral || inert, index); } catch (e) { /* the inert form below */ }
+            // If this throws too, the index itself is bad and the caller is
+            // owed that error — never the rule.
+            return native.call(this, inert, index);
+        }
+    });
+}
+function _fazGateStyleSheetInsertRule() {
+    _fazGateInsertRuleOn(window.CSSStyleSheet && CSSStyleSheet.prototype);
+    // A grouping rule (@media, @supports, @layer…) has its own insertRule,
+    // which never reaches the sheet's.
+    _fazGateInsertRuleOn(window.CSSGroupingRule && CSSGroupingRule.prototype);
+    // The legacy addRule(selector, block, index) is insertRule by another
+    // signature; the block is what carries the url().
+    var proto = window.CSSStyleSheet && CSSStyleSheet.prototype;
+    if (!proto || typeof proto.addRule !== "function") return;
+    var nativeAdd = proto.addRule;
+    Object.defineProperty(proto, "addRule", {
+        configurable: true, writable: true, enumerable: true,
+        value: function (selector, block, index) {
+            // Same rule as insertRule above: once refused, the original block
+            // is not what gets written, whatever goes wrong afterwards.
+            var blocked = false, b = "";
+            try {
+                b = String(block == null ? "" : block);
+                blocked = !!(_fazStore._block && b && _fazCssShouldBlock(selector + "{" + b + "}"));
+            } catch (e) { blocked = false; }
+            if (!blocked) return nativeAdd.call(this, selector, block, index);
+            var inner = "";
+            try {
+                var neutral = _fazNeutralizeCssUrls(selector + "{" + b + "}");
+                // Whole-sheet fallback came back empty: insert an empty block.
+                inner = neutral ? neutral.slice(String(selector).length + 1, -1) : "";
+            } catch (e) { inner = ""; }
+            try { return nativeAdd.call(this, selector, inner, index); } catch (e) { /* the empty block below */ }
+            return nativeAdd.call(this, selector, "", index);
         }
     });
 }
@@ -5040,7 +5515,127 @@ if (_fazAggressiveCssUrlBlockingEnabled()) {
     _fazGateStyleCharacterDataMethod(window.CharacterData && CharacterData.prototype, "deleteData");
     _fazGateStyleCharacterDataMethod(window.CharacterData && CharacterData.prototype, "replaceData");
     _fazGateStyleCharacterDataReplaceWith(window.CharacterData && CharacterData.prototype);
+    // Three more routes into a <style>'s text that the bootstrap holds during
+    // the download window and replays here: textContent written on the Text
+    // CHILD (Node.prototype, not the element's gated accessor), innerText on
+    // the element (HTMLElement.prototype, so a <style> alone is gated), and a
+    // Range edit, which can complete a tracker host out of two harmless
+    // halves and is judged on the owner's resulting text.
+    _fazGateStyleCharacterDataSetter(window.Node && Node.prototype, "textContent");
+    _fazGateStyleTextSetter(window.HTMLElement && HTMLElement.prototype, "innerText", true);
+    _fazGateRangeEditOnStyle(window.Range && Range.prototype, "deleteContents");
+    _fazGateRangeEditOnStyle(window.Range && Range.prototype, "extractContents");
     _fazGateStyleSheetInsertRule();
+}
+
+// The <style> a Range edit lands in, if any: the common ancestor itself or an
+// ancestor of it.
+function _fazStyleOwnerOf(node) {
+    for (var n = node; n; n = n.parentNode) {
+        if (n.nodeType === 1 && (n.nodeName || "").toLowerCase() === "style") return n;
+    }
+    return null;
+}
+// A Range edit on a <style> is judged BEFORE it lands. Blink reparses an
+// inline sheet synchronously on the text mutation, and an @import request
+// leaves during that parse: a gate that let the native edit run and
+// neutralised the text afterwards emitted the request first, measured in
+// tests/browser-intent/range-edit-import.spec.ts. So the resulting text is
+// computed from the live text and the range's own offsets (the owner's text
+// minus the range's text, the way the bootstrap's rangeRemoved does it),
+// judged, and written through _fazApplyStyleCharacterData, which writes the
+// neutralised form and parks the original; the native edit never touches a
+// live sheet. extractContents still hands back the removed content, cloned
+// from the range before the edit; deleteContents returns nothing, as it does.
+//
+// The parked original survives an edit that does not touch the parked URLs:
+// the live text is the original with its blocked url()s replaced, so the two
+// share a prefix and a suffix around those spans, and a deletion that lies
+// entirely in the shared prefix or suffix is applied to the original at the
+// same place. An edit that reaches into a replaced span has no derivable
+// original, and the resulting live text becomes the source, as it must: the
+// old original would restore CSS the page removed.
+function _fazStyleLiveText(style) {
+    var live = "";
+    for (var i = 0; i < style.childNodes.length; i++) {
+        var node = style.childNodes[i];
+        live += _fazIsStyleTextNode(node) ? (node.nodeValue || "") : (node.textContent || "");
+    }
+    return live;
+}
+function _fazRangeStartInStyle(style, range) {
+    var acc = 0;
+    for (var i = 0; i < style.childNodes.length; i++) {
+        var node = style.childNodes[i];
+        if (range.startContainer === style) {
+            if (i === range.startOffset) return acc;
+        } else if (node === range.startContainer || (node.contains && node.contains(range.startContainer))) {
+            return acc + (node === range.startContainer ? range.startOffset : 0);
+        }
+        acc += _fazIsStyleTextNode(node) ? (node.nodeValue || "").length : (node.textContent || "").length;
+    }
+    return acc;
+}
+function _fazDeriveEditedOriginal(original, live, at, removed) {
+    if (original === live) return original.slice(0, at) + original.slice(at + removed);
+    var prefix = 0;
+    while (prefix < original.length && prefix < live.length && original.charAt(prefix) === live.charAt(prefix)) prefix++;
+    if (at + removed <= prefix) return original.slice(0, at) + original.slice(at + removed);
+    var suffix = 0;
+    while (suffix < original.length - prefix && suffix < live.length - prefix
+        && original.charAt(original.length - 1 - suffix) === live.charAt(live.length - 1 - suffix)) suffix++;
+    if (at >= live.length - suffix) {
+        var from = original.length - (live.length - at);
+        return original.slice(0, from) + original.slice(from + removed);
+    }
+    return null;
+}
+function _fazGateRangeEditOnStyle(proto, methodName) {
+    if (!proto || typeof proto[methodName] !== "function") return;
+    var native = proto[methodName];
+    // Captured now: the page can reassign Range.prototype.toString, and the
+    // removed length must come from the engine, not from whoever shadowed it.
+    var nativeToString = typeof proto.toString === "function" ? proto.toString : null;
+    Object.defineProperty(proto, methodName, {
+        configurable: true, writable: true, enumerable: true,
+        value: function () {
+            var owner = null;
+            try { owner = _fazStyleOwnerOf(this.commonAncestorContainer); } catch (e) { owner = null; }
+            if (!owner || !_fazStore._block || !_fazNativeNodeRemoveChild || !_fazNativeNodeAppendChild) return native.apply(this, arguments);
+            try {
+                _fazPrimeStyleCssMarkers(owner);
+                var returned = methodName === "extractContents" ? this.cloneContents() : undefined;
+                var live = _fazStyleLiveText(owner);
+                var at = _fazRangeStartInStyle(owner, this);
+                var removed = String(nativeToString ? nativeToString.call(this) : "").length;
+                var result = live.slice(0, at) + live.slice(at + removed);
+                var original = _fazStyleOriginalCss(owner);
+                var derived = _fazDeriveEditedOriginal(original, live, at, removed);
+                var source = derived === null ? result : derived;
+                // One text node carries the result; the range is collapsed so a
+                // live boundary cannot point past the text it used to cover.
+                var holder = owner.childNodes.length === 1 && _fazIsStyleTextNode(owner.firstChild) ? owner.firstChild : null;
+                if (!holder) {
+                    while (owner.firstChild) _fazNativeNodeRemoveChild.call(owner, owner.firstChild);
+                    holder = (owner.ownerDocument || document).createTextNode("");
+                    _fazNativeNodeAppendChild.call(owner, holder);
+                }
+                _fazApplyStyleCharacterData(owner, holder, source, function (node, value) {
+                    _fazInStyleCharDataWrite = true;
+                    try { node.nodeValue = value; } finally { _fazInStyleCharDataWrite = false; }
+                });
+                try { this.setStart(holder, Math.min(at, holder.nodeValue.length)); this.collapse(true); } catch (e) { /* a boundary the engine already moved */ }
+                return returned;
+            } catch (e) {
+                // A decision nobody made is a refusal: the native edit would land
+                // on a live sheet and an @import it completes leaves during the
+                // parse, so the edit is dropped rather than applied unjudged.
+                try { console.warn("[FAZ Cookie Manager] Range edit on a stylesheet could not be judged; the edit was refused", e); } catch (e2) { /* no console */ }
+                try { if (methodName === "extractContents") return (this.startContainer && this.startContainer.ownerDocument || document).createDocumentFragment(); } catch (e3) { /* fall through */ }
+                return undefined;
+            }
+        }
+    });
 }
 
 function _fazEscapeHtmlAttr(value) {
@@ -5057,6 +5652,9 @@ function _fazPrepareStyleTagHtml(full, attrs, css) {
     if (rewritten === css) return full;
     var encoded = _fazBase64EncodeUtf8(css);
     if (!encoded) return full;
+    // A whole-sheet park leaves `rewritten` empty, and markup cannot carry an
+    // empty Text node: the element arrives with no child, and
+    // _fazPrimeStyleCssMarkers() creates the holder on first touch.
     return '<style' + (attrs || '') +
         ' data-faz-css="' + _fazEscapeHtmlAttr(encoded) + '"' +
         ' data-faz-category="' + _fazEscapeHtmlAttr(_fazCssBlockedCategory(css)) + '">' +
@@ -5103,9 +5701,44 @@ function _fazGateInsertAdjacentHtml(proto) {
     });
 }
 
+// setHTMLUnsafe/setHTML carry the same markup string as innerHTML, and a shadow
+// root has its OWN innerHTML descriptor on its own interface — so the two gates
+// above covered neither, and `root.innerHTML = '<style>@import url(blocked)>'`
+// or `el.setHTMLUnsafe(...)` reached the CSS engine with nothing in front of it.
+// Measured in tests/browser-intent/written-style-and-shadow.spec.ts: with the
+// bootstrap holding setHTMLUnsafe during its download window and handing the
+// markup over at the handoff, the stylesheet then landed here ungated and
+// fetched its background-image with consent REFUSED.
+function _fazGateHtmlStringMethod(proto, name) {
+    if (!proto || typeof proto[name] !== "function") return;
+    var native = proto[name];
+    Object.defineProperty(proto, name, {
+        configurable: true,
+        writable: true,
+        enumerable: true,
+        value: function () {
+            // Every argument is passed on: setHTML takes an options object
+            // second, and dropping it would change what the sanitiser does.
+            var args = Array.prototype.slice.call(arguments);
+            var html = String(args[0] == null ? "" : args[0]);
+            try { args[0] = _fazPrepareStyleHtmlString(html); } catch (e) { /* fail open */ }
+            return native.apply(this, args);
+        }
+    });
+}
+
 if (_fazAggressiveCssUrlBlockingEnabled()) {
     _fazGateHtmlStyleStringSetter(window.Element && Element.prototype, "innerHTML");
+    // outerHTML carries the same markup string and replaces the element with
+    // it; the bootstrap holds it during the download window and replays it
+    // here, where it reached the CSS engine with nothing in front of it.
+    _fazGateHtmlStyleStringSetter(window.Element && Element.prototype, "outerHTML");
     _fazGateInsertAdjacentHtml(window.Element && Element.prototype);
+    _fazGateHtmlStyleStringSetter(window.ShadowRoot && ShadowRoot.prototype, "innerHTML");
+    ["setHTMLUnsafe", "setHTML"].forEach(function (name) {
+        _fazGateHtmlStringMethod(window.Element && Element.prototype, name);
+        _fazGateHtmlStringMethod(window.ShadowRoot && ShadowRoot.prototype, name);
+    });
 }
 
 // Constructable Stylesheets (adoptedStyleSheets): CSS-in-JS and modern themes
@@ -5176,7 +5809,9 @@ function _fazRestoreConstructableSheets() {
 
 const _fazCreateElementBackup = document.createElement;
 document.createElement = (...args) => {
-    const createdElement = _fazCreateElementBackup.call(document, ...args);
+    return _fazGuardScriptElement(_fazCreateElementBackup.call(document, ...args));
+};
+function _fazGuardScriptElement(createdElement) {
     if (createdElement.nodeName.toLowerCase() !== "script") return createdElement;
     const originalSetAttribute = createdElement.setAttribute.bind(createdElement);
 
@@ -5288,7 +5923,7 @@ document.createElement = (...args) => {
         }
     };
     return createdElement;
-};
+}
 
 function _fazMutationObserver(mutations) {
     // Collect every <script>/<iframe> introduced by this batch of mutations.
@@ -5349,11 +5984,18 @@ function _fazMutationObserver(mutations) {
             var tag = (n.nodeName || '').toLowerCase();
             if (tag === 'script' || tag === 'iframe') {
                 if (_fazInsideNoscript(n)) continue;
+                // A srcdoc has no src for the loop below to judge; park it here.
+                if (tag === 'iframe' && n.hasAttribute && n.hasAttribute('srcdoc')) _fazParkResourceElementIfBlocked(n);
                 nodesToProcess.push(n);
             } else {
                 // img/link/source that entered via parsed markup never hit the
                 // property setter or setAttribute, so park them here (best-effort).
-                if (tag === 'img' || tag === 'link' || tag === 'source') {
+                // The SVG namespace and the legacy `background` attribute fetch
+                // the same way and were missing from this set, so markup built
+                // after the handoff (`div.innerHTML = '<svg><image href=…>'`)
+                // fetched while the <img> next to it was parked.
+                if (tag === 'img' || tag === 'link' || tag === 'source' || tag === 'image' || tag === 'use' || tag === 'feimage'
+                    || (n.hasAttribute && n.hasAttribute('background'))) {
                     if (!_fazInsideNoscript(n)) _fazParkResourceElementIfBlocked(n);
                 }
                 if (typeof n.querySelectorAll === 'function') {
@@ -5364,7 +6006,7 @@ function _fazMutationObserver(mutations) {
                         if (_fazInsideNoscript(nested[ni])) continue;
                         nodesToProcess.push(nested[ni]);
                     }
-                    var nestedRes = n.querySelectorAll('img[src], img[srcset], link[href], source[src], source[srcset]');
+                    var nestedRes = n.querySelectorAll('img[src], img[srcset], link[href], source[src], source[srcset], image, use, feImage, [background], iframe[srcdoc]');
                     for (var ri = 0; ri < nestedRes.length; ri++) {
                         if (_fazInsideNoscript(nestedRes[ri])) continue;
                         _fazParkResourceElementIfBlocked(nestedRes[ri]);
@@ -5984,8 +6626,22 @@ function _fazUnblockServerSide() {
             delete link.dataset.fazLightboxPlaceholder;
         });
 
-    // 3. Images (tracking pixels inside noscript tags that JS can see).
-    document.querySelectorAll('img[data-faz-src][data-faz-category], source[data-faz-src][data-faz-category]')
+    // 3. Images (tracking pixels inside noscript tags that JS can see), plus
+    // every other element that fetches through a plain `src`.
+    //
+    // video, audio, embed, track and input[type=image] are here because the
+    // deferred bootstrap parks them: its element list is the one the runtime's
+    // own observer uses, so whatever it can park must be restorable from the
+    // same keys, or a resource held during the download window would stay dead
+    // for the rest of the page view even after the visitor consents. Restoring
+    // needs no per-tag branch — `el.src` is the right IDL attribute on all of
+    // them, and the gate below re-parks anything still blocked.
+    document.querySelectorAll(
+        'img[data-faz-src][data-faz-category], source[data-faz-src][data-faz-category],'
+        + ' video[data-faz-src][data-faz-category], audio[data-faz-src][data-faz-category],'
+        + ' embed[data-faz-src][data-faz-category], track[data-faz-src][data-faz-category],'
+        + ' input[data-faz-src][data-faz-category]'
+    )
         .forEach(function (el) {
             var cat = el.getAttribute("data-faz-category");
             var imgSrc = el.getAttribute("data-faz-src");
@@ -5994,6 +6650,53 @@ function _fazUnblockServerSide() {
             el.src = imgSrc;
             if (!el.getAttribute("src")) return; // gate re-parked it — stay parked, recoverable
             el.removeAttribute("data-faz-src");
+        });
+
+    // 3a-bis. The SVG namespace. Restored as the SVG2 `href` whatever spelling
+    // it arrived in: both park into one attribute precisely so there is one
+    // restore branch, and `href` is honoured by every engine in the support
+    // matrix. Using el.src here would write an expando and leave the element
+    // parked forever, which is how a delayed resource becomes a dead one.
+    document.querySelectorAll('image[data-faz-href][data-faz-category], use[data-faz-href][data-faz-category], feImage[data-faz-href][data-faz-category], script[data-faz-href][data-faz-category]')
+        .forEach(function (el) {
+            var cat = el.getAttribute("data-faz-category");
+            var href = el.getAttribute("data-faz-href");
+            if (_fazShouldBlockResource(cat, href, el.getAttribute("data-faz-service") || "")) return;
+            if (!_fazIsAllowedScheme(href)) return;
+            el.setAttribute("href", href);
+            if (!el.getAttribute("href")) return; // the gate re-parked it — stay parked, recoverable
+            el.removeAttribute("data-faz-href");
+        });
+
+    // 3a-quater. An iframe's srcdoc, parked whole.
+    //
+    // Order note: a frame the server parked with BOTH src and srcdoc has its
+    // src restored first (2b above) and its srcdoc here. Chromium replaces
+    // the pending navigation when srcdoc is set before the src fetch starts,
+    // so no double load was observed; other engines are not guaranteed to,
+    // and consent has already been given by this point, so the worst case is
+    // one extra request to a provider the visitor just allowed.
+    document.querySelectorAll('iframe[data-faz-srcdoc][data-faz-category]')
+        .forEach(function (el) {
+            var cat = el.getAttribute("data-faz-category");
+            var doc = el.getAttribute("data-faz-srcdoc");
+            if (_fazShouldBlockResource(cat, doc, el.getAttribute("data-faz-service") || "")) return;
+            el.setAttribute("srcdoc", doc);
+            if (!el.getAttribute("srcdoc")) return; // the gate re-parked it
+            el.removeAttribute("data-faz-srcdoc");
+            el.classList.remove("faz-hidden");
+        });
+
+    // 3a-ter. The legacy `background` attribute, on whatever element carried it.
+    document.querySelectorAll('[data-faz-background][data-faz-category]')
+        .forEach(function (el) {
+            var cat = el.getAttribute("data-faz-category");
+            var bg = el.getAttribute("data-faz-background");
+            if (_fazShouldBlockResource(cat, bg, el.getAttribute("data-faz-service") || "")) return;
+            if (!_fazIsAllowedScheme(bg)) return;
+            el.setAttribute("background", bg);
+            if (!el.getAttribute("background")) return; // the gate re-parked it
+            el.removeAttribute("data-faz-background");
         });
 
     // 3b. srcset parked by the srcset gates (setAttribute / property setter / parser).
@@ -6007,6 +6710,42 @@ function _fazUnblockServerSide() {
             el.setAttribute("srcset", srcset);
             el.removeAttribute("data-faz-srcset");
             el.removeAttribute("data-faz-srcset-category");
+        });
+
+    // 3c. <object data> and the poster frame of a media element. Both are
+    // parked under their own keys (data-faz-data, data-faz-poster) because
+    // neither is a `src`, and neither had a restore pass at all: the bootstrap
+    // could park them and nothing could ever hand them back.
+    document.querySelectorAll('object[data-faz-data][data-faz-category]')
+        .forEach(function (el) {
+            var cat = el.getAttribute("data-faz-category");
+            var parked = el.getAttribute("data-faz-data");
+            if (_fazShouldBlockResource(cat, parked, el.getAttribute("data-faz-service") || "")) return;
+            // The one restore on this page that is an HTML sink rather than a
+            // resource fetch: <object data> can load a document, and a
+            // data:text/html payload there would run in this origin. So the
+            // value is resolved through the URL parser and admitted only as
+            // http(s) — stricter than _fazIsAllowedScheme, which lets a
+            // relative URL through, and free of cost here because the only
+            // thing that parks this key is the bootstrap and it parks nothing
+            // that is not absolute and cross-origin.
+            var resolved;
+            try { resolved = new URL(parked, document.baseURI); } catch (e) { return; }
+            if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return;
+            el.setAttribute("data", resolved.href);
+            if (!el.getAttribute("data")) return; // gate re-parked it — stay parked, recoverable
+            el.removeAttribute("data-faz-data");
+        });
+
+    document.querySelectorAll('[data-faz-poster][data-faz-category]')
+        .forEach(function (el) {
+            var cat = el.getAttribute("data-faz-category");
+            var parked = el.getAttribute("data-faz-poster");
+            if (_fazShouldBlockResource(cat, parked, el.getAttribute("data-faz-service") || "")) return;
+            if (!_fazIsAllowedScheme(parked)) return;
+            el.setAttribute("poster", parked);
+            if (!el.getAttribute("poster")) return; // gate re-parked it — stay parked, recoverable
+            el.removeAttribute("data-faz-poster");
         });
 
     // 4. Stylesheets.
@@ -6127,6 +6866,38 @@ function _fazAddProviderToList(node, cleanedHostname) {
         provider.categories.push(categoryName);
 }
 
+// Sweep what is already in the document before arming the observer.
+//
+// A MutationObserver has no retroactive view, and this runtime now arrives
+// deferred — so every resource element the parser produced before this line ran
+// is invisible to the observer that follows. While the bootstrap was
+// downloading its own observer parked what it could see, but the bootstrap has
+// no provider rules: it can only judge an origin. Anything it waved through, and
+// anything that landed before it installed, would otherwise stay live and
+// unparked for the whole page view, with no placeholder, no per-service reveal
+// and no re-evaluation on a consent change. That is a permanent exposure, not a
+// delayed one, which is why it is worth one querySelectorAll at startup.
+//
+// _fazParkResourceElementIfBlocked is idempotent — it skips an element that
+// already carries the parking attribute — so a node the bootstrap parked is left
+// exactly as it is.
+try {
+    document
+        .querySelectorAll('img[src],img[srcset],source[src],source[srcset],iframe[src],iframe[srcdoc],link[href],link[imagesrcset],image,use,feImage,[background]')
+        .forEach(_fazParkResourceElementIfBlocked);
+    // Scripts are deliberately NOT swept. A parser-inserted <script src> has
+    // already been fetched and executed by the time this deferred bundle runs,
+    // so stamping its type changes nothing it could still prevent — while
+    // marking it as blocked-by-us puts it into the restore machinery's path for
+    // no reason. Measured: it broke restoring an allowed analytics script after
+    // a preference save. Scripts keep the coverage they have: the server-side
+    // blocker for parsed markup, and createElement + the src setter +
+    // setAttribute + the handoff list for anything created at runtime.
+} catch (_sweepError) {
+    // A sweep that throws must not stop the observer from being installed.
+    if (window.console && console.warn) console.warn('[FAZ Cookie Manager] Startup resource sweep failed', _sweepError);
+}
+
 const _nodeListObserver = new MutationObserver(_fazMutationObserver);
 _nodeListObserver.observe(document.documentElement, {
     childList: true,
@@ -6193,14 +6964,42 @@ function _fazDecodeDataUriPayload(uri) {
     }
 }
 
+// A URL as the engine resolves it, for matching only — the same rules the
+// server applies in Frontend::normalize_resource_url(): for a special scheme
+// every `\` is a `/` (WHATWG), a scheme takes exactly two slashes whatever
+// was written, and the host is what follows the authority's LAST `@`. Without
+// this `https://site.test@tracker.test/p`, `https:\\tracker.test/p` and
+// `\\tracker.test/p` were not recognised on restore or by the sweep while
+// every engine fetched tracker.test; and dropping the userinfo is what lets
+// the boundary check work on host and path alone, so an `@` in a path or a
+// query (`/local.png?u=me@tracker.test`) is not a boundary and does not
+// over-park, and `site.test\@tracker.test` is the first-party host it is.
+function _fazNormalizeResourceUrl(url) {
+    var s = String(url == null ? "" : url);
+    // Tab, LF and CR are stripped anywhere by the URL parser before anything
+    // is read; `https://tra\tcker.test/` is tracker.test to the engine.
+    if (/[\t\n\r]/.test(s)) s = s.replace(/[\t\n\r]/g, "");
+    if (!/^\s*(?:https?:|[\\\/]{2})/i.test(s)) return s;
+    s = s.replace(/\\/g, "/");
+    s = s.replace(/^(\s*https?:)\/*/i, "$1//");
+    s = s.replace(/^(\s*(?:[a-z][a-z0-9+.\-]*:)?\/\/)([^\/?#\s]*)@/i, "$1");
+    // The host is percent-decoded by the parser too: `tracker%2Etest` is
+    // tracker.test. Authority only; the path keeps its bytes.
+    return s.replace(/^(\s*(?:[a-z][a-z0-9+.\-]*:)?\/\/)([^\/?#\s]*)/i, function (m, scheme, authority) {
+        if (authority.indexOf("%") === -1) return m;
+        try { return scheme + decodeURIComponent(authority); } catch (e) { return m; }
+    });
+}
 function _fazGetProviderMatchTarget(target) {
     if (!target || typeof target !== "string") return "";
     if (/^data:/i.test(target)) return _fazDecodeDataUriPayload(target);
-    return target;
+    return _fazNormalizeResourceUrl(target);
 }
 
 function _fazHasProviderBoundary(target, index, length) {
-    if (index > 0 && !/[\/\.\:\s"'`=;,(<{\[]/.test(target.charAt(index - 1))) return false;
+    // `\` is a slash to every special-scheme URL parser; `@` is deliberately
+    // NOT here, see _fazNormalizeResourceUrl.
+    if (index > 0 && !/[\/\.\:\s"'`=;,(<{\[\\]/.test(target.charAt(index - 1))) return false;
     // A pattern ending on a separator already carries its own right-hand
     // boundary — `js.hs-scripts.com/` cannot be the prefix of a longer domain
     // label once the slash has closed it. Requiring a further separator after
@@ -6209,7 +7008,7 @@ function _fazHasProviderBoundary(target, index, length) {
     // Frontend::has_provider_boundary().
     if (/[\/\.\:\?\#=&]/.test(target.charAt(index + length - 1))) return true;
     var afterPos = index + length;
-    if (afterPos < target.length && !/[\/\.\:\?\#\s"'=;,&)<}\]]/.test(target.charAt(afterPos))) return false;
+    if (afterPos < target.length && !/[\/\.\:\?\#\s"'=;,&)<}\]\\]/.test(target.charAt(afterPos))) return false;
     return true;
 }
 
@@ -6649,6 +7448,39 @@ function _fazShouldChangeType(element, src, typeOverride) {
 }
 
 /**
+ * Extract a clean hostname+path from a URL string for provider matching.
+ * Handles the https, http, wss and ws URL schemes.
+ * Returns empty string on failure (non-blocking).
+ *
+ * At module scope because the bootstrap handoff matches URLs with the very
+ * same rule as the network interceptors below. Matching the raw string there
+ * instead meant a first-party request whose query carried a blocked domain —
+ * /wp-json/x?return=https://www.facebook.com/ — was refused before consent and
+ * allowed after it.
+ */
+// Module scope, deliberately: the bootstrap handoff policy and the runtime's own
+// interceptors have to match URLs by the same rule, and the policy object is
+// built at the very end of the `if (_fazStore)` block. It calls
+// _fazCleanHostName, which is declared inside that block — a block-level
+// function declaration, so the binding exists from block entry and this is safe
+// for every caller that runs after the block has been entered. There is no
+// caller outside it, and adding one would need the helper moved out too.
+function _fazExtractEndpoint(url) {
+    if (!url || typeof url !== "string") return "";
+    try {
+        url = _fazNormalizeResourceUrl(url);
+        var full = url.startsWith("//") ? window.location.protocol + url : url;
+        // Normalise WebSocket schemes to https so URL() can parse them.
+        full = full.replace(/^wss?:\/\//i, 'https://');
+        if (!/^https?:\/\//i.test(full)) return "";
+        var u = new URL(full);
+        return _fazCleanHostName(u.hostname + u.pathname);
+    } catch (e) {
+        return "";
+    }
+}
+
+/**
  * Network-level consent enforcement.
  *
  * Wraps navigator.sendBeacon, fetch, XMLHttpRequest.open, and WebSocket to block
@@ -6657,24 +7489,6 @@ function _fazShouldChangeType(element, src, typeOverride) {
  * the consent plugin can be prevented from phoning home.
  */
 (function _fazNetworkInterceptors() {
-    /**
-     * Extract a clean hostname+path from a URL string for provider matching.
-     * Handles the https, http, wss and ws URL schemes.
-     * Returns empty string on failure (non-blocking).
-     */
-    function _fazExtractEndpoint(url) {
-        if (!url || typeof url !== "string") return "";
-        try {
-            var full = url.startsWith("//") ? window.location.protocol + url : url;
-            // Normalise WebSocket schemes to https so URL() can parse them.
-            full = full.replace(/^wss?:\/\//i, 'https://');
-            if (!/^https?:\/\//i.test(full)) return "";
-            var u = new URL(full);
-            return _fazCleanHostName(u.hostname + u.pathname);
-        } catch (e) {
-            return "";
-        }
-    }
 
     // --- sendBeacon ---
     if (navigator.sendBeacon) {
@@ -9011,5 +9825,40 @@ document.addEventListener('click', function (event) {
         } catch (_pe) { /* placeholder injection is best-effort */ }
     }
 }, true /* capture phase — beats the page-builder listener */);
+
+// Drain the bootstrap only after every permanent interceptor is installed.
+if (window._fazBootstrap) window._fazBootstrap.finish({
+    script: _fazGuardScriptElement,
+    node: function (node) {
+        if (node.nodeName === 'SCRIPT' && _fazShouldChangeType(node)) {
+            // Same stamp rememberOriginalType() writes, and for the same two
+            // reasons: data-faz-original-type is only written when there is
+            // nothing saved yet — writing it unconditionally overwrote the real
+            // original with "javascript/blocked" on a second pass — and
+            // data-faz-blocked-by-us is what the src/type setters and the
+            // mutation observer read to tell our block from a third party's.
+            // Without it a script blocked here was never unblocked again.
+            var type = node.getAttribute('type');
+            if (type && type !== 'javascript/blocked' && !node.getAttribute('data-faz-original-type')) {
+                node.setAttribute('data-faz-original-type', type);
+            }
+            node.setAttribute('data-faz-blocked-by-us', '1');
+            node.setAttribute('type', 'javascript/blocked');
+        } else {
+            _fazParkResourceElementIfBlocked(node);
+        }
+    },
+    url: function (url) {
+        var endpoint = _fazExtractEndpoint(String(url));
+        if (!endpoint) return false;
+        return !_fazIsUserWhitelisted(String(url)) && _fazShouldBlockProvider(endpoint);
+    },
+    // The bootstrap parks a cross-origin URL before this runtime exists and
+    // therefore cannot name its category, while every restore selector requires
+    // one. This is the answer to that: the same resolution the parser backstop
+    // uses, so an element parked during the download is restored on exactly the
+    // consent that would have released it had it arrived a moment later.
+    category: function (url) { return _fazImgCategory(String(url)); }
+});
 
 } // end: if ( _fazStore ) — null-safety guard for deferred _fazConfig

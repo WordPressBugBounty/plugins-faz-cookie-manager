@@ -56,6 +56,43 @@ class Frontend {
 	const SMASH_BALLOON_SETTINGS_SLUG = 'sbi-settings';
 
 	/**
+	 * The attribute walk every tag pattern in this class uses, written the way
+	 * the HTML tokenizer reads a start tag.
+	 *
+	 * A value is quoted only when a quote is the first character after `=`,
+	 * and an unquoted value runs to the next whitespace or `>` whatever it
+	 * contains. A stray quote or `=` where a name should start is accepted as
+	 * the tokenizer accepts it (with a parse error), one character at a time,
+	 * so a tag the engine will render is never one this class refuses to see.
+	 * A `/` is consumed unless it is the last thing before `>`, which each
+	 * pattern then captures or skips on its own, so self-closing shapes keep
+	 * their existing capture semantics.
+	 *
+	 * `[^>]*` was the walk before this, on every pass, and a `>` inside a
+	 * QUOTED value ended it early and hid every attribute after it: an
+	 * `<img title="a>b" src="https://tracker/p.png">` was never parked, and
+	 * for server-rendered markup the engine starts the fetch before any
+	 * client layer can act. Every quantifier here is possessive and the
+	 * alternatives cannot start with the same character, so there is nothing
+	 * to backtrack into and a megabyte of unterminated value fails in one
+	 * pass instead of tripping the PCRE limit — which `[^>]*` did, and a PCRE
+	 * failure skips that pass for the whole page.
+	 *
+	 * Used with the `#` delimiter: it contains `/`.
+	 */
+	const ATTR_TOKEN = '/\G[\s\/"\'=>]*+([^\s"\'>\/=]++)(?:\s*+=\s*+("[^"]*+"|\'[^\']*+\'|[^\s>"\'][^\s>]*+))?/';
+
+	/**
+	 * One attribute token, anchored at the offset it is asked from: whatever
+	 * cannot start a name (whitespace, a slash, a stray quote, `=`, `>`) is
+	 * skipped, then a name, then optionally `=` and a value shaped as in
+	 * ATTR_WALK. tokenize_tag_attrs() walks a string with it one token at a
+	 * time; `\G` at the start makes the pattern anchored, so a failed match
+	 * does not scan forward.
+	 */
+	const ATTR_WALK = '(?:\s++|/(?!\s*+>)|[^\s"\'>/=]++(?:\s*+=\s*+(?:"[^"]*+"|\'[^\']*+\'|[^\s>"\'][^\s>]*+))?|[^\s>/])*+';
+
+	/**
 	 * The ID of this plugin.
 	 *
 	 * @since    3.0.0
@@ -72,6 +109,21 @@ class Frontend {
 	 * @var      string    $version    The current version of this plugin.
 	 */
 	private $version;
+
+	/** External consent scripts that must execute in order without blocking parsing. */
+	private $deferred_script_handles = array();
+
+	/** Inline bootstrap source, '' when unavailable. Null until first read. */
+	private $bootstrap_js = null;
+
+	/**
+	 * Whether the inline bootstrap is being attached to a head handle on this
+	 * request. Nothing in the chain may be deferred unless it is: see
+	 * enqueue_deferred_script().
+	 *
+	 * @var bool
+	 */
+	private $bootstrap_emitted = false;
 
 	/**
 	 * Banner object
@@ -183,6 +235,20 @@ class Frontend {
 	 * @var bool
 	 */
 	private $faz_law_fallback_suppress = false;
+
+	/**
+	 * Per-request memo for is_bot_variant_render() (null = not yet computed).
+	 *
+	 * @var bool|null
+	 */
+	private $bot_variant_render = null;
+
+	/**
+	 * Whether the page-cache veto for a User-Agent-variant render is in force.
+	 *
+	 * @var bool
+	 */
+	private $bot_variance_cache_vetoed = false;
 	/**
 	 * Per-request memo for is_geo_bootstrap_cache_active() (null = not yet
 	 * computed). The readiness check touches banner/ruleset storage, so every
@@ -253,6 +319,9 @@ class Frontend {
 		add_filter( 'rest_pre_echo_response', array( $this, 'filter_server_cookies_before_rest_echo' ), PHP_INT_MAX, 3 );
 		add_filter( 'wp_redirect', array( $this, 'filter_server_cookies_before_redirect' ), PHP_INT_MAX, 2 );
 		add_filter( 'script_loader_tag', array( $this, 'filter_script_loader_tag' ), 10, 3 );
+		add_filter( 'script_loader_tag', array( $this, 'defer_runtime_script_tag' ), 25, 2 );
+		// After every enqueue hook has run, before anything is printed.
+		add_action( 'wp_print_scripts', array( $this, 'warn_on_undeferred_handles' ), PHP_INT_MAX );
 		add_filter( 'style_loader_tag', array( $this, 'filter_style_loader_tag' ), 10, 4 );
 
 		// Auto-exclusion from cache/optimization plugins' defer + delay +
@@ -273,6 +342,16 @@ class Frontend {
 			// `text/plain`.
 			add_filter( 'script_loader_tag', array( $this, 'tag_own_scripts_nooptimize' ), 20, 2 );
 
+			// On a handle this plugin defers itself, `data-no-defer="1"` and the
+			// LiteSpeed defer-exclusion below read like a contradiction and are
+			// not one: they say "do not APPLY YOUR deferral to this", which is
+			// exactly what protects the ordering this plugin chose. An optimizer
+			// that re-deferred or delayed these handles would either duplicate
+			// the attribute or, with "delay until interaction", hold the consent
+			// runtime until the first click — by which point the scripts a click
+			// releases have already fired. The one thing none of these hints must
+			// do is remove a defer that is already there, and none of them does.
+			//
 			// LiteSpeed Cache pattern-based exclude lists
 			// (belt-and-suspenders in case the tag attribute ever gets
 			// stripped by a future LS release).
@@ -427,27 +506,27 @@ class Frontend {
 		if ( apply_filters( 'faz_is_amp_request', false ) ) {
 			return;
 		}
+		// This gate must stay ABOVE the bot gate below. Both only return, so
+		// the order was once immaterial; it stopped being so when the bot gate
+		// gained a side effect. On a page where the banner is off by settings
+		// or excluded by path, the render does not vary by User-Agent at all,
+		// so vetoing the page cache there would spend the cache for nothing —
+		// the same over-reach case 8b guards against for hide_from_bots: false.
+		// send_geo_cache_headers() orders these two the same way.
+		if ( $this->is_banner_disabled_by_settings() ) {
+			return;
+		}
 		// Skip banner for search engine bots (configurable via Settings).
 		//
-		// MUST be suppressed under Cache Compatibility Mode: the page is then
-		// full-page cached and the render has to be visitor-invariant. A bot
-		// request (incl. the cache-warming crawler) would otherwise generate a
-		// banner-less copy that LiteSpeed/WP Rocket caches and serves to every
-		// human visitor — leaving the banner permanently hidden and trackers
-		// unblocked (the server-rendered container stays, but script.min.js /
-		// _fazConfig that reveal it and block scripts are never enqueued).
-		// Reported on gooloo.de after enabling Cache Compatibility Mode. (#158)
-		// The jurisdiction bootstrap full-page-caches a strict shell too, so the
-		// same invariance requirement applies there.
-		if ( ! $this->is_cache_compatibility_enabled() && ! $this->is_geo_bootstrap_cache_active() ) {
-			$bot_settings = $this->get_faz_settings();
-			if ( ! isset( $bot_settings['banner_control']['hide_from_bots'] ) || ! empty( $bot_settings['banner_control']['hide_from_bots'] ) ) {
-				if ( faz_is_bot() ) {
-					return;
-				}
-			}
-		}
-		if ( $this->is_banner_disabled_by_settings() ) {
+		// bot_suppression_applies() answers both halves of that question: the
+		// setting, and whether this response can be kept out of the shared page
+		// cache. A banner-less copy that a cache is free to store is handed to
+		// every later human visitor — banner permanently hidden, trackers
+		// unblocked, nothing on the page to reveal it. Cache Compatibility Mode
+		// and the cached jurisdiction shell need an invariant render and so
+		// never suppress (#158, gooloo.de); every other full-page cache gets a
+		// no-store veto instead (kalabron.com, LiteSpeed).
+		if ( $this->bot_suppression_applies() ) {
 			return;
 		}
 
@@ -481,15 +560,54 @@ class Frontend {
 			$alt_asset     = ! empty( $faz_settings['banner_control']['alternative_asset_path'] );
 			$script_handle = $alt_asset ? 'faz-fw' : $this->plugin_name;
 
+			/**
+			 * Opt-in: load the main banner bundle in the footer instead of the
+			 * head. External bundles use defer in either position; the inline
+			 * bootstrap protects dynamic resources until they execute. Default
+			 * false keeps the bootstrap in the head, before page scripts run.
+			 * Server-side blocking is unaffected.
+			 *
+			 * Ignored when Google Consent Mode or the IAB TCF CMP is active.
+			 * Both declare this handle as a dependency and must themselves load
+			 * in <head> — GCM has to emit `consent default` and the TCF stub has
+			 * to define `__tcfapi` before any ad script runs, and moving them
+			 * later is a compliance regression, not a tuning choice.
+			 * WP_Scripts::set_group then pulls a dependency back into the head
+			 * group, so honouring the filter while either is enabled produced no
+			 * footer move at all: the option read as supported and silently did
+			 * nothing on exactly the installs most likely to want it. Now the
+			 * constraint is explicit, and `faz_main_script_effective_in_footer`
+			 * reports what was actually applied.
+			 *
+			 * Resolved HERE, before the first deferred enqueue, because whether
+			 * the bootstrap reaches the head is what decides if deferring any
+			 * handle in this chain is safe — including the configuration file,
+			 * which is enqueued before the main handle exists.
+			 *
+			 * @since 1.26.0
+			 * @param bool $in_footer Default false (head).
+			 */
+			$in_footer = (bool) apply_filters( 'faz_main_script_in_footer', false );
+			if ( $in_footer && ! $alt_asset ) {
+				$gcm_active = is_object( $this->gcm_settings ) && true === $this->gcm_settings->is_gcm_enabled();
+				$tcf_active = (bool) $this->settings->get( 'iab', 'enabled' )
+					&& absint( $this->settings->get( 'iab', 'cmp_id' ) ) >= 2;
+				if ( $gcm_active || $tcf_active ) {
+					$in_footer = false;
+				}
+			}
+			// Alternative-asset mode inlines every bundle and attaches no
+			// bootstrap, so nothing in that mode is deferred either way.
+			$this->bootstrap_emitted = ! $alt_asset && ! $in_footer && '' !== $this->deferred_bootstrap_js();
+
 			// Offload the static bulk of _fazConfig (provider block patterns,
 			// cookie-category map and, with per-service consent, the ~43 KB
 			// service catalogue — all identical for every visitor of a given
 			// page type) into a content-hashed, browser-cacheable .js
 			// file instead of re-inlining it into every HTML response. The
-			// file defines window._fazStaticConfig; a "before" inline snippet
-			// merges it back into _fazConfig ahead of script.js execution, so
-			// the frontend bundle needs no changes. Server-side blocking is
-			// unaffected either way; if the static file cannot be provided the
+			// file defines window._fazStaticConfig; script.js merges it back
+			// into _fazConfig at the start of its deferred execution. Server-side
+			// blocking is unaffected either way; if the static file cannot be provided the
 			// full config stays inline exactly as before.
 			$store_data  = $this->get_store_data();
 			$static_deps = array();
@@ -504,9 +622,10 @@ class Frontend {
 					);
 					if ( '' !== $static_url ) {
 						$static_handle = $this->plugin_name . '-static-config';
-						wp_enqueue_script( $static_handle, $static_url, array(), null, false );
+						$this->enqueue_deferred_script( $static_handle, $static_url, array(), null, false );
 						$static_deps[] = $static_handle;
 						$store_data    = $split['inline'];
+						$store_data['_staticConfigRequired'] = true;
 					}
 				}
 			}
@@ -514,39 +633,6 @@ class Frontend {
 			if ( $alt_asset ) {
 				$this->enqueue_inline_bundle( $script_handle, 'js/script' . $suffix . '.js', array(), false );
 			} else {
-				/**
-				 * Opt-in: load the main banner bundle in the footer instead of
-				 * render-blocking in <head>. Default false — loading in <head>
-				 * shows the banner (and arms the client-side interceptors)
-				 * before page scripts run. Sites that accept a later banner
-				 * paint in exchange for faster first render can return true;
-				 * server-side blocking is unaffected by the position.
-				 *
-				 * Ignored when Google Consent Mode or the IAB TCF CMP is active.
-				 * Both of those declare this handle as a dependency and must
-				 * themselves load in <head> — GCM has to emit `consent default`
-				 * and the TCF stub has to define `__tcfapi` before any ad script
-				 * runs, and moving them later is a compliance regression, not a
-				 * tuning choice. WP_Scripts::set_group then pulls a dependency
-				 * back into the head group, so honouring the filter here while
-				 * either is enabled produced no footer move at all: the option
-				 * read as supported and silently did nothing on exactly the
-				 * installs most likely to want it. Now the constraint is
-				 * explicit, and `faz_main_script_effective_in_footer` reports
-				 * what was actually applied.
-				 *
-				 * @since 1.26.0
-				 * @param bool $in_footer Default false (head).
-				 */
-				$in_footer = (bool) apply_filters( 'faz_main_script_in_footer', false );
-				if ( $in_footer ) {
-					$gcm_active = is_object( $this->gcm_settings ) && true === $this->gcm_settings->is_gcm_enabled();
-					$tcf_active = (bool) $this->settings->get( 'iab', 'enabled' )
-						&& absint( $this->settings->get( 'iab', 'cmp_id' ) ) >= 2;
-					if ( $gcm_active || $tcf_active ) {
-						$in_footer = false;
-					}
-				}
 				/**
 				 * The position actually used, after the GCM/TCF constraint above.
 				 *
@@ -557,20 +643,23 @@ class Frontend {
 				 * @param bool $in_footer Effective position (true = footer).
 				 */
 				do_action( 'faz_main_script_effective_in_footer', $in_footer );
-				wp_enqueue_script( $script_handle, faz_frontend_url() . 'js/script' . $suffix . '.js', $static_deps, $this->version, $in_footer );
+				$this->enqueue_deferred_script( $script_handle, faz_frontend_url() . 'js/script' . $suffix . '.js', $static_deps, $this->version, $in_footer );
 			}
 
 			wp_localize_script( $script_handle, '_fazConfig', $store_data );
 
-			if ( ! empty( $static_deps ) ) {
-				// Runs in the "before" bucket: after the _fazConfig data blob,
-				// after the static-config file's own tag (it is a dependency),
-				// and before script.js executes.
-				wp_add_inline_script(
-					$script_handle,
-					'if(window._fazStaticConfig&&typeof _fazConfig!=="undefined"){for(var _fazK in window._fazStaticConfig){if(!(_fazK in _fazConfig)){_fazConfig[_fazK]=window._fazStaticConfig[_fazK];}}}',
-					'before'
-				);
+			if ( ! $alt_asset ) {
+				// The full config is merged by script.js after its deferred static
+				// dependency executes. Inline "before" code runs while parsing and
+				// must never depend on a deferred external file being available.
+				$bootstrap_js = $this->deferred_bootstrap_js();
+				$attached     = '' !== $bootstrap_js
+					&& false !== wp_add_inline_script( $script_handle, $bootstrap_js, 'before' );
+				// The verdict above was a prediction; this is what happened.
+				// wp_add_inline_script() returns false on an empty payload or an
+				// unregistered handle, and a silent false is how a deferred
+				// runtime ends up with nothing holding its window.
+				$this->note_bootstrap_emission( $attached, ! $in_footer );
 			}
 
 			// Pre-initialise window.dataLayer so third-party trackers that emit
@@ -675,11 +764,31 @@ class Frontend {
 				wp_add_inline_script( $script_handle, 'var _fazGcm = ' . $gcm_json . ';', 'before' );
 				$gcm_suffix = $this->get_script_suffix( 'js/gcm' );
 				$gcm_handle = $script_handle . '-gcm';
-				if ( $alt_asset ) {
-					$this->enqueue_inline_bundle( $gcm_handle, 'js/gcm' . $gcm_suffix . '.js', array( $script_handle ), false );
-				} else {
-					wp_enqueue_script( $gcm_handle, faz_frontend_url() . 'js/gcm' . $gcm_suffix . '.js', array( $script_handle ), $this->version, false );
-				}
+				// Basic mode also needs its baseline before page-level Google
+				// snippets. This small bridge is self-contained and must stay
+				// synchronous while the config/main/TCF downloads are deferred.
+				//
+				// "Self-contained" is the load-bearing claim, so it is spelled
+				// out: gcm.js reads `window._fazConfig` (localized, printed in
+				// the data bucket ahead of every inline below it), the inline
+				// `var _fazGcm` above, and the `fazcookie-consent` cookie. It
+				// touches nothing script.js creates — no `window.fazcookie`, no
+				// merged static configuration — and its consent wiring is a
+				// `fazcookie_consent_update` listener, which is ordering-free by
+				// construction. Add a dependency on anything script.js defines
+				// and this bundle has to move back behind the deferred runtime,
+				// which puts the `consent default` baseline after the page's own
+				// Google snippets: a compliance regression, not a tuning choice.
+				//
+				// The dependency on $script_handle is dropped in non-alt mode for
+				// a second, separate reason: enqueue_inline_bundle() attaches its
+				// code in the default 'after' position, and
+				// WP_Scripts::filter_eligible_strategies() clears the strategy of
+				// any handle with an 'after' inline AND of everything it depends
+				// on. Re-adding array( $script_handle ) here would therefore
+				// un-defer the entire chain silently. warn_on_undeferred_handles()
+				// reports it under WP_DEBUG if it ever happens again.
+				$this->enqueue_inline_bundle( $gcm_handle, 'js/gcm' . $gcm_suffix . '.js', $alt_asset ? array( $script_handle ) : array(), false );
 			}
 
 			// IAB TCF v2.3 CMP stub (when IAB is enabled AND a valid CMP ID is set).
@@ -700,7 +809,7 @@ class Frontend {
 				if ( $alt_asset ) {
 					$this->enqueue_inline_bundle( $tcf_handle, 'js/tcf-cmp' . $tcf_suffix . '.js', array( $script_handle ), false );
 				} else {
-					wp_enqueue_script( $tcf_handle, faz_frontend_url() . 'js/tcf-cmp' . $tcf_suffix . '.js', array( $script_handle ), $this->version, false );
+					$this->enqueue_deferred_script( $tcf_handle, faz_frontend_url() . 'js/tcf-cmp' . $tcf_suffix . '.js', array( $script_handle ), $this->version, false );
 				}
 
 				// PublisherCC: use admin setting, fall back to site locale.
@@ -908,7 +1017,17 @@ class Frontend {
 						"})" .
 					"}).catch(function(){});" .
 				"});";
-				wp_add_inline_script( $script_handle, $inline_js );
+				// 'before', not the default 'after', and both halves of that
+				// matter. An 'after' inline makes WordPress drop the defer
+				// strategy for this handle and for the configuration file it
+				// depends on, which would revert the whole non-blocking chain
+				// without a word. And it is safe here because this snippet
+				// depends on nothing script.js defines: it registers a
+				// `fazcookie_consent_update` listener and reads `_fazConsentLog`,
+				// which wp_localize_script() prints in the data bucket above it.
+				// The listener only ever fires long after the runtime has
+				// executed, so running at parse time costs nothing.
+				wp_add_inline_script( $script_handle, $inline_js, 'before' );
 			}
 
 			// Enqueue the native a11y module that runs after fazcookie_banner_loaded.
@@ -919,7 +1038,7 @@ class Frontend {
 			if ( $alt_asset ) {
 				$this->enqueue_inline_bundle( $a11y_handle, 'js/a11y' . $a11y_suffix . '.js', array( $script_handle ), true );
 			} else {
-				wp_enqueue_script( $a11y_handle, faz_frontend_url() . 'js/a11y' . $a11y_suffix . '.js', array( $script_handle ), $this->version, true );
+				$this->enqueue_deferred_script( $a11y_handle, faz_frontend_url() . 'js/a11y' . $a11y_suffix . '.js', array( $script_handle ), $this->version, true );
 			}
 			// Pass translatable checkbox label templates — {name} is replaced in JS.
 			wp_localize_script(
@@ -943,7 +1062,7 @@ class Frontend {
 			if ( $alt_asset ) {
 				$this->enqueue_inline_bundle( $handle, 'js/wca' . $wca_suffix . '.js', array( $script_handle ), false );
 			} else {
-				wp_register_script( $handle, faz_frontend_url() . 'js/wca' . $wca_suffix . '.js', array( $script_handle ), $this->version, false );
+				$this->enqueue_deferred_script( $handle, faz_frontend_url() . 'js/wca' . $wca_suffix . '.js', array( $script_handle ), $this->version, false );
 			}
 			if ( true === $this->is_gsk_enabled() ) {
 				wp_add_inline_script( $handle, 'var _fazGsk = true;', 'before' );
@@ -958,7 +1077,7 @@ class Frontend {
 			if ( $alt_asset ) {
 				$this->enqueue_inline_bundle( $ms_handle, 'js/microsoft-consent' . $ms_suffix . '.js', array( $script_handle ), false );
 			} else {
-				wp_enqueue_script( $ms_handle, faz_frontend_url() . 'js/microsoft-consent' . $ms_suffix . '.js', array( $script_handle ), $this->version, false );
+				$this->enqueue_deferred_script( $ms_handle, faz_frontend_url() . 'js/microsoft-consent' . $ms_suffix . '.js', array( $script_handle ), $this->version, false );
 			}
 			if ( $ms_uet ) {
 				wp_add_inline_script( $ms_handle, 'window._fazMicrosoftUET = true;', 'before' );
@@ -967,6 +1086,172 @@ class Frontend {
 				wp_add_inline_script( $ms_handle, 'window._fazMicrosoftClarity = true;', 'before' );
 			}
 		}
+	}
+
+	/**
+	 * Keep the dependency chain ordered and non-blocking on WP 5.0+ too.
+	 *
+	 * What a visitor experiences, since "non-blocking" is not free. A `defer`
+	 * script is fetched during parsing and executed before DOMContentLoaded, so
+	 * the banner's first paint moves from "as soon as the head script runs" to
+	 * "once the document has parsed" — later, but still before the load event
+	 * and still on the same page view, never after a navigation. It does not
+	 * move the layout: the notice container is `position: fixed`, so it is
+	 * outside the flow wherever it appears, and the anti-FOUC rule in
+	 * insert_styles() keeps it invisible until the runtime has positioned it
+	 * rather than painting it unstyled first. Embeds the server blocked keep
+	 * their placeholder throughout, because that markup and the banner
+	 * stylesheet are both in the HTML and neither is deferred. What a visitor
+	 * can see during the window is a third-party resource some script is trying
+	 * to insert dynamically: it is held, so the space is empty until the handoff.
+	 * That is the trade this release makes, and it is the same trade the hold
+	 * has always made — the alternative is letting the request out first.
+	 *
+	 * Deferring is only safe while the inline bootstrap is holding dynamic
+	 * resources for the download window; without it the runtime arrives after
+	 * the page's own scripts with nothing in between. So the gate is not "can
+	 * the bootstrap be read" — it is "was the bootstrap actually attached, in
+	 * the head, for this request". Those were two different conditions
+	 * evaluated in two places: the emission is separately guarded by the
+	 * alternative-asset branch and by wp_add_inline_script() succeeding, and a
+	 * handle whose chain runs in the footer gets no head-time protection at
+	 * all. One flag, set by the one call site that emits it, now answers for
+	 * both. Falling back to a synchronous request is slower and never
+	 * unprotected.
+	 */
+	private function enqueue_deferred_script( $handle, $src, $dependencies, $version, $in_footer ) {
+		wp_enqueue_script( $handle, $src, $dependencies, $version, $in_footer );
+		if ( ! $this->bootstrap_emitted ) {
+			return;
+		}
+		$this->deferred_script_handles[ $handle ] = true;
+		wp_script_add_data( $handle, 'strategy', 'defer' );
+	}
+
+	/**
+	 * Report a deferred handle that an 'after' inline has quietly un-deferred.
+	 *
+	 * WP_Scripts::filter_eligible_strategies() returns an empty strategy set for
+	 * any handle carrying an inline script in the default 'after' position, and
+	 * it recurses into dependents — so one
+	 * `wp_add_inline_script( $handle, $code )` without an explicit 'before'
+	 * anywhere in this chain forces the whole chain back to blocking. Nothing
+	 * errors, nothing logs, and the only visible effect is that the request is
+	 * render-blocking again. That is the single easiest way to revert this
+	 * release by accident, from inside the plugin or from a site's own hook, so
+	 * it gets named out loud under WP_DEBUG instead of being left to a profiler.
+	 *
+	 * Diagnostic only: it changes nothing, because an 'after' inline is a
+	 * legitimate thing for a site to add and losing defer is the safe direction.
+	 *
+	 * @return void
+	 */
+	public function warn_on_undeferred_handles() {
+		if ( ! defined( 'WP_DEBUG' ) || ! WP_DEBUG || empty( $this->deferred_script_handles ) ) {
+			return;
+		}
+		$scripts = wp_scripts();
+		foreach ( array_keys( $this->deferred_script_handles ) as $handle ) {
+			if ( ! isset( $scripts->registered[ $handle ] ) ) {
+				continue;
+			}
+			$extra = $scripts->registered[ $handle ]->extra;
+			if ( empty( $extra['after'] ) ) {
+				continue;
+			}
+			error_log( // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				'FAZ Cookie Manager: the script handle "' . $handle . '" carries an inline script in the "after" position, '
+				. 'which makes WordPress drop the defer strategy for it and for everything that depends on it. '
+				. 'Pass "before" as the third argument to wp_add_inline_script() to keep the consent runtime non-blocking.'
+			);
+		}
+	}
+
+	/**
+	 * Record that the inline bootstrap was attached to a head handle.
+	 *
+	 * Called from the one place that attaches it. A WP_DEBUG breadcrumb when it
+	 * could not be attached, because the silent version of this failure is
+	 * exactly the regression the docblock above describes: a deferred runtime
+	 * with nothing holding the window, visible only as a performance change.
+	 *
+	 * @param bool $attached Whether wp_add_inline_script() accepted the code.
+	 * @param bool $in_head  Whether the carrying handle prints in the head.
+	 * @return void
+	 */
+	private function note_bootstrap_emission( $attached, $in_head ) {
+		$this->bootstrap_emitted = (bool) $attached && (bool) $in_head;
+		if ( $this->bootstrap_emitted || ! defined( 'WP_DEBUG' ) || ! WP_DEBUG ) {
+			return;
+		}
+		error_log( // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			'FAZ Cookie Manager: the inline consent bootstrap was not emitted in <head> ('
+			. ( $attached ? 'the carrying script prints in the footer' : 'frontend/js/bootstrap.js is missing or unreadable' )
+			. '), so the consent runtime and the generated configuration stay synchronous for this request.'
+		);
+	}
+
+	/**
+	 * Inline bootstrap source, or '' when it cannot be read.
+	 *
+	 * file_get_contents() returns false on a missing or unreadable file, and
+	 * WP_Scripts::add_inline_script() opens with `if ( ! $data ) return false;`
+	 * — so passing that straight through emitted no bootstrap, raised no
+	 * notice, and left the deferred runtime arriving with nothing holding
+	 * dynamic resources in the meantime. Read it once, through one accessor,
+	 * so the decision to defer and the protection that makes deferring safe
+	 * can never disagree.
+	 *
+	 * @return string JavaScript source, or '' when unavailable.
+	 */
+	private function deferred_bootstrap_js() {
+		if ( null === $this->bootstrap_js ) {
+			$path = plugin_dir_path( __FILE__ ) . 'js/bootstrap' . $this->get_script_suffix( 'js/bootstrap' ) . '.js';
+			$code = is_readable( $path ) ? file_get_contents( $path ) : false; // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- local plugin asset, not a remote request.
+			$this->bootstrap_js = ( is_string( $code ) && '' !== trim( $code ) ) ? $code : '';
+		}
+		return $this->bootstrap_js;
+	}
+
+	/**
+	 * WP added native strategies in 6.3; older supported versions still need
+	 * the attribute. Touch only the external tag, never inline bootstraps.
+	 */
+	public function defer_runtime_script_tag( $tag, $handle ) {
+		global $wp_version;
+		// Modern core can deliberately remove defer when a third-party
+		// synchronous script depends on this handle, or when a handle printing
+		// in the head has a blocking dependent. Respect that decision rather
+		// than re-applying the attribute behind its back: core knows the
+		// dependency graph and this filter does not, and losing defer is the
+		// safe direction — a synchronous runtime is slower, never unprotected.
+		//
+		// The reverse assumption is the one that has to hold, and it is enforced
+		// where the strategy is requested, not here: `strategy => defer` is only
+		// ever set when the inline bootstrap is actually being attached to a
+		// head handle on this request (see enqueue_deferred_script()). So on
+		// 6.3+ either core defers and the bootstrap is holding the window, or
+		// core does not defer and there is no window to hold.
+		if ( isset( $wp_version ) && version_compare( $wp_version, '6.3', '>=' ) ) {
+			return $tag;
+		}
+		if ( is_admin() || empty( $this->deferred_script_handles[ $handle ] ) ) {
+			return $tag;
+		}
+		$new_tag = preg_replace_callback( '#<script(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>#i', function ( $match ) {
+			$attributes = $match[1];
+			if ( ! preg_match( '/(?:^|\s)src\s*=/i', $attributes ) || preg_match( '/\btype\s*=\s*[\'"]text\/plain/i', $attributes ) ) {
+				return $match[0];
+			}
+			// An async rewrite would lose the config -> runtime -> bridge order.
+			$attributes = preg_replace( '/\s+(?:async|defer)(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?(?=\s|$)/i', '', $attributes );
+			return '<script defer' . $attributes . '>';
+		}, $tag );
+		// PCRE failure returns null, and this composite tag carries the whole
+		// inline bootstrap plus the runtime's <script src>. Returning null from
+		// a tag filter drops all of it from the page — the consent banner with
+		// it. Same guard tag_own_scripts_nooptimize() already uses.
+		return is_string( $new_tag ) ? $new_tag : $tag;
 	}
 
 	/**
@@ -1830,6 +2115,137 @@ class Frontend {
 	}
 
 	/**
+	 * Whether `hide_from_bots` is effectively enabled for this request.
+	 *
+	 * A missing key counts as enabled: that is the historical behaviour and it
+	 * matches Settings::get_defaults(), where `hide_from_bots` is true.
+	 *
+	 * @return bool
+	 */
+	private function hide_from_bots_enabled() {
+		$settings = $this->get_faz_settings();
+		return ! isset( $settings['banner_control']['hide_from_bots'] )
+			|| ! empty( $settings['banner_control']['hide_from_bots'] );
+	}
+
+	/**
+	 * Whether this response's banner render varies by User-Agent.
+	 *
+	 * True only when `hide_from_bots` actually changes the output for the
+	 * caller at hand — the setting is on and the request is a known crawler.
+	 * Cache Compatibility Mode and the cached jurisdiction shell both require a
+	 * visitor-invariant render, so under either one the answer is always false
+	 * and the crawler sees exactly what a human sees.
+	 *
+	 * faz_is_bot() is tested first on purpose: it is a substring scan over one
+	 * request header, while the two cache predicates below read settings and
+	 * banner storage. This runs on `send_headers` for every front-end request,
+	 * and for all but a few per cent of them the cheap test ends it.
+	 *
+	 * @return bool
+	 */
+	private function is_bot_variant_render() {
+		if ( null !== $this->bot_variant_render ) {
+			return $this->bot_variant_render;
+		}
+		// `function_exists` + leading `\`: this predicate is reachable from
+		// `flying_press_is_cacheable`, which can fire on bootstraps where
+		// includes/class-utils.php has not been loaded, and an unqualified call
+		// would resolve inside FazCookie\Frontend first. Same guard the AMP
+		// consent class uses.
+		$variant = function_exists( 'faz_is_bot' ) && \faz_is_bot()
+			/**
+			 * Whether a crawler-only render may be kept out of shared caches.
+			 *
+			 * The two things `hide_from_bots` wants — a banner-less copy for
+			 * crawlers, and a page the cache can keep — cannot both be had: a
+			 * cache that does not vary by User-Agent will hand the crawler's
+			 * copy to the next human. Returning false here resolves that in
+			 * favour of the cache, and FAZ then stops hiding the banner from
+			 * crawlers at all rather than risk hiding it from visitors.
+			 *
+			 * @since 1.34.1
+			 * @param bool $veto Default true (hide from bots, bypass the cache).
+			 */
+			&& (bool) apply_filters( 'faz_bot_render_cache_veto', true )
+			&& $this->hide_from_bots_enabled()
+			&& ! $this->is_cache_compatibility_enabled()
+			&& ! $this->is_geo_bootstrap_cache_active();
+
+		$this->bot_variant_render = $variant;
+		return $variant;
+	}
+
+	/**
+	 * Keep a User-Agent-variant render out of every shared page cache.
+	 *
+	 * `hide_from_bots` makes the rendered HTML depend on the User-Agent: a
+	 * crawler receives no banner container, no banner stylesheet and no
+	 * runtime. Nothing in the response ever said so, and no page cache varies
+	 * by User-Agent, so the first crawler to warm a URL stored a banner-less
+	 * copy that the cache then served to every human visitor — no consent UI,
+	 * trackers unblocked, and nothing on the page to reveal it.
+	 *
+	 * Reported on kalabron.com (o2switch: LiteSpeed Web ADC in front of
+	 * LiteSpeed Cache), where the banner vanished whenever LiteSpeed was
+	 * enabled and came back the moment the host turned it off. A request with a
+	 * Googlebot User-Agent returned the page with no `#fazBannerTemplate`, no
+	 * `script.min.js` and no banner CSS — under
+	 * `x-litespeed-cache-control: public,max-age=14400`, i.e. explicitly
+	 * cacheable for four hours and keyed without the User-Agent.
+	 *
+	 * This is the country-variance hazard one dimension over, so it gets the
+	 * same answer and the same header set as send_geo_cache_headers().
+	 *
+	 * @return bool Whether the veto is in force for this request.
+	 */
+	private function veto_page_cache_for_bot_variance() {
+		if ( $this->bot_variance_cache_vetoed ) {
+			return true;
+		}
+		// LSCache decides cacheability from this action and the request-time
+		// header, not from a response-side `Cache-Control: no-store` (see the
+		// rest_pre_dispatch note in faz-cookie-manager.php). Fire it either way:
+		// it only records intent, which LSCWP applies when it buffers output.
+		do_action( 'litespeed_control_set_nocache', 'FAZ Cookie Manager crawler-only banner render' );
+		if ( headers_sent() ) {
+			// Output has already started, so the directive the edge cache reads
+			// can no longer be set. Report the veto as absent: the caller then
+			// renders the banner instead, which costs a crawler a few KB of
+			// markup. The other direction costs a human their consent notice.
+			return false;
+		}
+		header( 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0' );
+		header( 'Pragma: no-cache' );
+		header( 'X-LiteSpeed-Cache-Control: no-cache' );
+		header( 'Vary: User-Agent', false );
+		if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+			define( 'DONOTCACHEPAGE', true );
+		}
+		if ( ! defined( 'DONOTCACHEOBJECT' ) ) {
+			define( 'DONOTCACHEOBJECT', true );
+		}
+		$this->bot_variance_cache_vetoed = true;
+		return true;
+	}
+
+	/**
+	 * Whether the banner may actually be withheld from this crawler.
+	 *
+	 * Suppression and the cache veto are one decision, not two: the render may
+	 * only differ for a crawler if this response is also kept out of the shared
+	 * cache. When the veto cannot be installed, the banner renders.
+	 *
+	 * @return bool
+	 */
+	private function bot_suppression_applies() {
+		if ( ! $this->is_bot_variant_render() ) {
+			return false;
+		}
+		return $this->veto_page_cache_for_bot_variance();
+	}
+
+	/**
 	 * Whether the opt-in cache-safe jurisdiction bootstrap is active.
 	 *
 	 * The cached HTML is always the most-protective GDPR shell. script.js makes
@@ -1995,6 +2411,15 @@ class Frontend {
 		if ( $this->is_banner_disabled_by_settings() ) {
 			return $is_cacheable;
 		}
+		// FlyingPress reads neither DONOTCACHEPAGE nor `Cache-Control: no-store`,
+		// so the crawler veto has to be spoken in its own language too. Asked as
+		// the plain variance question rather than through
+		// bot_suppression_applies(): this filter runs while output is being
+		// assembled, when the header half of the veto is no longer available,
+		// and returning false here IS the veto.
+		if ( $this->is_bot_variant_render() ) {
+			return false;
+		}
 		if ( $this->is_country_dependent_output() ) {
 			// The jurisdiction bootstrap renders one strict, visitor-invariant
 			// document and resolves the live law through a no-store REST request
@@ -2032,6 +2457,13 @@ class Frontend {
 		if ( $this->is_banner_disabled_by_settings() ) {
 			return;
 		}
+		// Install the crawler veto here, while nothing has been sent yet. It is
+		// independent of the country dimension below: a site with one global
+		// banner and no geo targeting still renders differently for a crawler,
+		// and that difference is exactly what a User-Agent-blind page cache
+		// freezes for everyone. Resolving it on `send_headers` also means the
+		// verdict is already memoised by the time wp_head asks.
+		$this->bot_suppression_applies();
 		if ( ! $this->is_country_dependent_output() || headers_sent() ) {
 			return;
 		}
@@ -3413,18 +3845,11 @@ class Frontend {
 		// hide_from_bots: mirror the enqueue_scripts() gate so a crawler gets
 		// no banner container markup or placeholder CSS either — the setting
 		// promises "cleaner HTML to crawlers", and skipping only the script
-		// left the full (visually hidden) container in the bot's copy. Same
-		// Cache Compatibility guard as the enqueue gate: under full-page
-		// caching the render must stay visitor-invariant, or a bot-warmed
-		// cache copy would hide the banner from every human visitor. (#158)
-		// Same requirement under the cached jurisdiction shell.
-		if ( ! $this->is_cache_compatibility_enabled() && ! $this->is_geo_bootstrap_cache_active() ) {
-			$bot_settings = $this->get_faz_settings();
-			if ( ! isset( $bot_settings['banner_control']['hide_from_bots'] ) || ! empty( $bot_settings['banner_control']['hide_from_bots'] ) ) {
-				if ( faz_is_bot() ) {
-					return true;
-				}
-			}
+		// left the full (visually hidden) container in the bot's copy. The
+		// shared predicate carries the cache conditions; see
+		// veto_page_cache_for_bot_variance().
+		if ( $this->bot_suppression_applies() ) {
+			return true;
 		}
 
 		// Runtime geo-routing opt-in fallback with no matching banner: keep
@@ -3666,13 +4091,51 @@ class Frontend {
 		// data-faz-src + data-faz-category) but preserves the enclosing
 		// <noscript> wrapper, and it is that PROCESSED block that gets stashed
 		// and later restored.
+		// 0. Every <iframe srcdoc> is lifted out of the buffer BEFORE any other
+		// pass runs, and put back verbatim after the last one. The attribute's
+		// value is markup, and every pass below is a regex over markup: the
+		// script pass re-typed a <script src> inside it, the <img> pass renamed
+		// its src, the <link> and <style> passes did the same — each writing a
+		// double-quoted attribute INTO a double-quoted value, which ends the
+		// value at the first injected quote. The engine then read the tracker's
+		// URL as the frame's src and a truncated document as its srcdoc; with a
+		// single-quoted srcdoc the inner <img> was delivered parked into a
+		// document that has no runtime to restore it.
+		//
+		// So the srcdoc is judged whole here (a sub-document's fetches are
+		// beyond any gate once it is parsed), its token is replaced by a marker
+		// no pass can match, and the marker is swapped back at the very end for
+		// the ORIGINAL token: `srcdoc=…` when allowed, `data-faz-srcdoc=…` when
+		// parked, bytes and quoting untouched either way. Runs ahead of the
+		// <noscript> stash as well, because a single-quoted srcdoc can carry a
+		// literal <noscript> that the stash would otherwise cut out of the
+		// attribute.
+		//
+		// The opening-tag pattern uses ATTR_WALK, and the reason that walk
+		// exists is this pass: walking "anything but a quote, or a quoted run"
+		// let the apostrophe in `title=it's` open a run that swallowed the next
+		// iframe, and the `[^>]*` the other passes used stops at the first `>`
+		// of the document inside the value.
+		// Both stashes mark their place with a per-request nonce the page
+		// cannot know: with a fixed marker, a paragraph that spelled
+		// `__FAZ_SRCDOC_STASH_0__` received the srcdoc token as live markup.
+		$stash_nonce   = $this->stash_nonce();
+		$srcdoc_stash  = array();
+		$srcdoc_marker = '';
+		$result        = $this->stash_iframe_srcdocs( $html, $providers, $blocked_categories, $stash_nonce, $srcdoc_stash, $srcdoc_marker );
+		if ( null === $result ) {
+			$pcre_failed = true;
+		} else {
+			$html = $result;
+		}
+
 		$noscript_stash = array();
 		if ( false !== stripos( $html, '<noscript' ) ) {
 			$result = preg_replace_callback(
-				'#<noscript\b[^>]*>(.*?)</noscript>#is',
-				function ( $m ) use ( $providers, $blocked_categories, &$noscript_stash ) {
+				'#<noscript(?=[\s/>])' . self::ATTR_WALK . '(?:/\s*+)?>(.*?)</noscript(?=[\s/>])[^>]*>#is',
+				function ( $m ) use ( $providers, $blocked_categories, &$noscript_stash, $stash_nonce ) {
 					$processed              = $this->process_noscript_tag( $m, $providers, $blocked_categories );
-					$key                    = '__FAZ_NOSCRIPT_STASH_' . count( $noscript_stash ) . '__';
+					$key                    = '__FAZ_NOSCRIPT_STASH_' . $stash_nonce . '_' . count( $noscript_stash ) . '__';
 					$noscript_stash[ $key ] = $processed;
 					return $key;
 				},
@@ -3688,9 +4151,56 @@ class Frontend {
 		// 1. Block <script> tags.
 		if ( false !== stripos( $html, '<script' ) ) {
 			$result = preg_replace_callback(
-				'#<script\b([^>]*)>(.*?)</script>#is',
+				'#<script(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>(.*?)</script(?=[\s/>])[^>]*>#is',
 				function ( $m ) use ( $providers, $blocked_categories ) {
 					return $this->process_script_tag( $m, $providers, $blocked_categories );
+				},
+				$html
+			);
+			if ( null === $result ) {
+				$pcre_failed = true;
+			} else {
+				$html = $result;
+			}
+		}
+
+		// 1-bis. The SVG namespace. <image> is an <img> by another name and
+		// <use href="https://x/sprite.svg#icon"> fetches an external document,
+		// both through `href` or its legacy spelling `xlink:href` — attributes
+		// no pass here had ever looked at, so an SVG tracking pixel in server
+		// markup went out before consent. Measured per engine in
+		// tests/browser-intent/write-stream-differential.spec.ts, which printed
+		// it as an accepted limit of the element set until this pass.
+		// <feImage> fetches through href exactly as <image> does. The tag name
+		// must be followed by whitespace, a slash or `>`: a word boundary let
+		// <use-case> and <image-gallery> custom elements through and mutilated
+		// them.
+		if ( false !== stripos( $html, '<image' ) || false !== stripos( $html, '<use' ) || false !== stripos( $html, '<feimage' ) ) {
+			$result = preg_replace_callback(
+				'#<(image|use|feImage)(?=[\s/>])(' . self::ATTR_WALK . ')(/?)\s*+>#is',
+				function ( $m ) use ( $providers, $blocked_categories ) {
+					return $this->process_svg_href_tag( $m, $providers, $blocked_categories );
+				},
+				$html
+			);
+			if ( null === $result ) {
+				$pcre_failed = true;
+			} else {
+				$html = $result;
+			}
+		}
+
+		// 1-ter. The legacy `background` presentation attribute. It fetches an
+		// image on <body> and on every table part, and no pass here looked at
+		// it — measured fetching in all three engines by
+		// tests/browser-intent/write-stream-differential.spec.ts.
+		// The pre-check accepts the same `background = "…"` spacing the
+		// pattern does; a plain `background=` lookup skipped it.
+		if ( preg_match( '/\bbackground\s*=/i', $html ) ) {
+			$result = preg_replace_callback(
+				'#<(body|table|thead|tbody|tfoot|tr|td|th)(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>#is',
+				function ( $m ) use ( $providers, $blocked_categories ) {
+					return $this->process_background_attr_tag( $m, $providers, $blocked_categories );
 				},
 				$html
 			);
@@ -3704,9 +4214,9 @@ class Frontend {
 		// 2. Block <iframe> tags (YouTube, Facebook, Maps, etc.).
 		if ( false !== stripos( $html, '<iframe' ) ) {
 			$result = preg_replace_callback(
-				'#<iframe\b([^>]*)(?:>(.*?)</iframe>|/>)#is',
-				function ( $m ) use ( $providers, $blocked_categories ) {
-					return $this->process_iframe_tag( $m, $providers, $blocked_categories );
+				'#<iframe(?=[\s/>])(' . self::ATTR_WALK . ')(?:>(.*?)</iframe(?=[\s/>])[^>]*>|/\s*+>)#is',
+				function ( $m ) use ( $providers, $blocked_categories, $srcdoc_marker ) {
+					return $this->process_iframe_tag( $m, $providers, $blocked_categories, $srcdoc_marker );
 				},
 				$html
 			);
@@ -3725,7 +4235,7 @@ class Frontend {
 		//    inside a <style> (fonts, background-image, cursor, mask, @import).
 		if ( false !== stripos( $html, '<style' ) ) {
 			$result = preg_replace_callback(
-				'#<style\b([^>]*)>(.*?)</style>#is',
+				'#<style(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>(.*?)</style(?=[\s/>])[^>]*>#is',
 				function ( $m ) use ( $providers, $blocked_categories ) {
 					return $this->process_style_tag( $m, $providers, $blocked_categories );
 				},
@@ -3751,7 +4261,7 @@ class Frontend {
 		// the fetch before any script runs.
 		if ( false !== stripos( $html, '<img' ) ) {
 			$result = preg_replace_callback(
-				'#<img\b([^>]*)/?>#is',
+				'#<img(?=[\s/>])(' . self::ATTR_WALK . '(?:/\s*+)?)>#is',
 				function ( $m ) use ( $providers, $blocked_categories ) {
 					return $this->process_img_tag( $m, $providers, $blocked_categories );
 				},
@@ -3786,7 +4296,7 @@ class Frontend {
 			// `rel="preload stylesheet"` (the standard async-CSS pair) both
 			// slipped past and fetched the provider pre-consent.
 			$result = preg_replace_callback(
-				'#<link\b([^>]*)/?>#is',
+				'#<link(?=[\s/>])(' . self::ATTR_WALK . '(?:/\s*+)?)>#is',
 				function ( $m ) use ( $providers, $blocked_categories ) {
 					return $this->process_link_tag( $m, $providers, $blocked_categories );
 				},
@@ -3802,12 +4312,12 @@ class Frontend {
 		// 6. Block <script data-faz-waitfor="category"> (deferred dependency scripts).
 		if ( false !== stripos( $html, 'data-faz-waitfor' ) ) {
 			$result = preg_replace_callback(
-				'#<script\b([^>]*data-faz-waitfor\s*=\s*["\']([^"\']+)["\'][^>]*)>(.*?)</script>#is',
+				'#<script(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>(.*?)</script(?=[\s/>])[^>]*>#is',
 				function ( $m ) use ( $blocked_categories ) {
 					$attrs    = $m[1];
-					$wait_cat = $m[2];
-					$content  = $m[3];
-					if ( ! in_array( $wait_cat, $blocked_categories, true ) ) {
+					$content  = $m[2];
+					$wait_cat = $this->extract_tag_attr( $attrs, 'data-faz-waitfor' );
+					if ( '' === $wait_cat || ! in_array( $wait_cat, $blocked_categories, true ) ) {
 						return $m[0]; // Category is allowed — let it run.
 					}
 					// Block: change type to text/plain so JS won't execute.
@@ -3852,6 +4362,12 @@ class Frontend {
 		$html = $this->process_social_embeds( $html, $blocked_categories );
 		$html = $this->process_elementor_video_widgets( $html, $blocked_categories, $providers );
 		$html = $this->process_bricks_map_widgets( $html, $blocked_categories, $providers );
+
+		// Put every srcdoc back, last of all, so no pass above — the embed
+		// detectors included — ever saw its markup.
+		if ( ! empty( $srcdoc_stash ) ) {
+			$html = strtr( $html, $srcdoc_stash );
+		}
 
 		if ( ! $pcre_failed ) {
 			Embed_Inventory::complete_render();
@@ -3905,16 +4421,20 @@ class Frontend {
 		if ( $this->is_whitelisted( $attrs, $content ) ) {
 			return $full;
 		}
+		// The type is the `type` TOKEN, read through the tokenizer: a substring
+		// match found `type='text/plain'` inside an alt value and left the
+		// script live, and so did `data-fazcookie` spelled in a decoy.
+		$type = strtolower( trim( $this->extract_tag_attr( $attrs, 'type' ) ) );
 		// Skip already-blocked scripts.
-		if ( preg_match( '/type\s*=\s*["\']text\/plain["\']/', $attrs ) ) {
+		if ( 'text/plain' === $type ) {
 			return $full;
 		}
 		// Skip scripts already tagged with data-fazcookie.
-		if ( false !== strpos( $attrs, 'data-fazcookie' ) ) {
+		if ( $this->has_attr_token( $attrs, 'data-fazcookie' ) ) {
 			return $full;
 		}
 		// Skip non-executable script types (structured data, templates, etc.).
-		if ( preg_match( '/type\s*=\s*["\'](?:application\/(?:ld\+json|json)|text\/(?:template|html)|importmap)["\']/', $attrs ) ) {
+		if ( in_array( $type, array( 'application/ld+json', 'application/json', 'text/template', 'text/html', 'importmap' ), true ) ) {
 			return $full;
 		}
 
@@ -3955,9 +4475,7 @@ class Frontend {
 			return $full;
 		}
 
-		$new_attrs = $this->set_script_type_plain( $attrs );
-		$new_attrs .= ' data-faz-category="' . esc_attr( $matched_category ) . '"';
-		return '<script' . $new_attrs . '>' . $content . '</script>';
+		return '<script' . $this->label_category_first( $this->set_script_type_plain( $attrs ), $matched_category ) . '>' . $content . '</script>';
 	}
 
 	/**
@@ -4063,14 +4581,27 @@ class Frontend {
 	 * @param array $blocked_categories Currently blocked category slugs.
 	 * @return string
 	 */
-	private function process_iframe_tag( $m, $providers, $blocked_categories ) {
+	private function process_iframe_tag( $m, $providers, $blocked_categories, $srcdoc_marker = '' ) {
 		$attrs = $m[1];
 		$full  = $m[0];
 
 		if ( $this->is_whitelisted( $attrs, '' ) ) {
 			return $full;
 		}
-		if ( false !== strpos( $attrs, 'data-faz-src' ) ) {
+		// The token, not a substring: `data-faz-src` is the start of
+		// `data-faz-srcdoc`, and matching it made every srcdoc frame look
+		// already parked, leaving its src live.
+		if ( $this->has_attr_token( $attrs, 'data-faz-src' ) && ! $this->has_attr_token( $attrs, 'src' ) ) {
+			return $full; // Parked, and nothing live left (a bare sentinel does not exempt).
+		}
+		// A frame whose srcdoc is in the stash has nothing to park here: src
+		// is inert while srcdoc is present, so a blocked src on an ALLOWED
+		// srcdoc (the "lite embed" pattern) fetches nothing — and wrapping it
+		// in the placeholder sent the bare marker through wp_kses, which
+		// stripped it, so the srcdoc never came back. A parked srcdoc already
+		// took src with it. The marker carries the request nonce, so the page
+		// cannot spell it.
+		if ( '' !== $srcdoc_marker && false !== strpos( $attrs, $srcdoc_marker . 'LIVE_' ) ) {
 			return $full;
 		}
 
@@ -4092,9 +4623,10 @@ class Frontend {
 			}
 		}
 
-		// Rename src → data-faz-src (avoid matching data-src).
-		$new_attrs = preg_replace( '/(^|\s)src\s*=\s*/i', '$1data-faz-src=', $attrs, 1 );
-		$new_attrs .= ' data-faz-category="' . esc_attr( $matched_category ) . '"';
+		// Rename src → data-faz-src on the token the tokenizer would produce,
+		// whatever precedes it.
+		list( $new_attrs ) = $this->rename_attr_tokens( $attrs, array( 'src' => 'data-faz-src' ) );
+		$new_attrs         = $this->label_category_first( $new_attrs, $matched_category );
 
 		$inner = isset( $m[2] ) ? $m[2] : '';
 		$blocked_iframe = isset( $m[2] )
@@ -4124,10 +4656,7 @@ class Frontend {
 	 * @return string URL or empty string.
 	 */
 	private function extract_src_from_attrs( $attrs ) {
-		if ( preg_match( '/\bsrc\s*=\s*["\']([^"\']+)["\']/i', $attrs, $m ) ) {
-			return $m[1];
-		}
-		return '';
+		return $this->normalize_resource_url( $this->extract_tag_attr( $attrs, 'src' ) );
 	}
 
 	/**
@@ -4188,7 +4717,7 @@ class Frontend {
 		$tag_whitelisted = array();
 		$tag_categories = array();
 		$tag_svcs       = array();
-		if ( preg_match_all( '#<(?:img|iframe)\b[^>]*#i', $content, $embedded_matches ) ) {
+		if ( preg_match_all( '#<(?:img|iframe)(?=[\s/>])' . self::ATTR_WALK . '#i', $content, $embedded_matches ) ) {
 			foreach ( $embedded_matches[0] as $embedded_tag ) {
 				$whitelisted       = $this->is_whitelisted( $embedded_tag, '' );
 				$embedded_tags[]   = $embedded_tag;
@@ -4272,7 +4801,7 @@ class Frontend {
 		// each match its own target and the aliasing unrepresentable.
 		$rewrite_index   = -1;
 		$blocked_content = preg_replace_callback(
-			'#<(?:img|iframe)\b[^>]*#i',
+			'#<(?:img|iframe)(?=[\s/>])' . self::ATTR_WALK . '#i',
 			function ( $m ) use ( &$rewrite_index, $gate, $tag_categories, $content_matched ) {
 				$rewrite_index++;
 				$tag = $m[0];
@@ -4292,19 +4821,16 @@ class Frontend {
 				if ( ! $label_category ) {
 					$label_category = $content_matched ? $content_matched : 'functional';
 				}
-				$rewritten = preg_replace( '/(\s)src\s*=/i', '$1data-faz-src=', $tag, 1 );
-				// preg_replace returns null on a PCRE failure and the subject
-				// unchanged when nothing matched; neither is a tag to rewrite.
-				if ( null === $rewritten || $rewritten === $tag ) {
+				// The match is `<img` or `<iframe` plus its attributes; rename
+				// src on its token, whatever precedes it.
+				if ( ! preg_match( '/^<(?:img|iframe)/i', $tag, $open ) ) {
 					return $tag;
 				}
-				$rewritten = preg_replace(
-					'/^(<(?:img|iframe)\b)/i',
-					'$1 data-faz-category="' . esc_attr( $label_category ) . '"',
-					$rewritten,
-					1
-				);
-				return null === $rewritten ? $tag : $rewritten;
+				list( $rewritten, $renamed ) = $this->rename_attr_tokens( substr( $tag, strlen( $open[0] ) ), array( 'src' => 'data-faz-src' ) );
+				if ( empty( $renamed ) ) {
+					return $tag;
+				}
+				return $open[0] . $this->label_category_first( $rewritten, $label_category );
 			},
 			$content
 		);
@@ -4336,7 +4862,11 @@ class Frontend {
 		$attrs = $m[1];
 		$full  = $m[0];
 
-		if ( false !== strpos( $attrs, 'data-faz-src' ) ) {
+		// Already parked means parked AND nothing live left: a forged empty
+		// `data-faz-src=""` next to a live src used to exempt the tag. The
+		// token, not a substring: `data-faz-src` is also the start of
+		// `data-faz-srcset`.
+		if ( $this->has_attr_token( $attrs, 'data-faz-src' ) && ! $this->has_attr_token( $attrs, 'src' ) && ! $this->has_attr_token( $attrs, 'srcset' ) ) {
 			return $full;
 		}
 		if ( $this->is_whitelisted( $attrs, '' ) ) {
@@ -4365,17 +4895,16 @@ class Frontend {
 		// `data-faz-srcset` is the attribute the client's own restore pass
 		// already looks for (script.js: document.querySelectorAll('[data-faz-srcset]')),
 		// so no new convention is introduced.
-		$new_attrs = preg_replace( '/(^|\s)srcset\s*=\s*/i', '$1data-faz-srcset=', $attrs, 1 );
-		if ( null === $new_attrs ) {
-			return $full; // PCRE failure — never ship a half-rewritten tag.
-		}
-		$parked_srcset = ( $new_attrs !== $attrs );
-
-		$with_src = preg_replace( '/(^|\s)src\s*=\s*/i', '$1data-faz-src=', $new_attrs, 1 );
-		if ( null === $with_src ) {
-			return $full;
-		}
-		$parked_src = ( $with_src !== $new_attrs );
+		// Both renamed on their tokens, whatever precedes them.
+		list( $with_src, $renamed ) = $this->rename_attr_tokens(
+			$attrs,
+			array(
+				'srcset' => 'data-faz-srcset',
+				'src'    => 'data-faz-src',
+			)
+		);
+		$parked_srcset = ! empty( $renamed['srcset'] );
+		$parked_src    = ! empty( $renamed['src'] );
 		if ( ! $parked_src && ! $parked_srcset ) {
 			return $full; // Nothing fetchable to park — leave the tag alone.
 		}
@@ -4383,12 +4912,623 @@ class Frontend {
 		// an XHTML-style closing slash inside $attrs (`<img ... />`), so appending
 		// metadata after it produced invalid `<img ... / data-faz-category=...>`.
 		// Prefixing preserves both ordinary and self-closing source markup.
-		$metadata = ' data-faz-category="' . esc_attr( $matched_category ) . '"';
+		$with_src = $this->label_category_first( $with_src, $matched_category );
 		if ( $parked_srcset ) {
-			// The srcset restore reads its category from its own attribute.
-			$metadata .= ' data-faz-srcset-category="' . esc_attr( $matched_category ) . '"';
+			// The srcset restore reads its category from its own attribute;
+			// the matcher's, alone, for the same reason.
+			$with_src = ' data-faz-srcset-category="' . esc_attr( $matched_category ) . '"' . $this->strip_attr_tokens( $with_src, 'data-faz-srcset-category' );
 		}
-		return '<img' . $metadata . $with_src . '>';
+		return '<img' . $with_src . '>';
+	}
+
+	/**
+	 * Process an SVG <image> / <use> / <feImage> tag for a blocked href.
+	 *
+	 * Both spellings — `href` and the legacy `xlink:href` — park into ONE
+	 * attribute, `data-faz-href`, which is what the client's restore pass reads.
+	 * One parked name means one restore branch; two would be two branches that
+	 * can disagree, and a resource a restore pass cannot select is not delayed,
+	 * it is dead.
+	 *
+	 * Both spellings are REMOVED when both are present: sprites and exports
+	 * commonly carry the pair, and parking the first left the second live,
+	 * which fetches. The parked value is the SVG2 `href` when there is one,
+	 * because that is the one an engine honours over `xlink:href` when both
+	 * are present; the restore writes it back as `href`, which every engine in
+	 * the support matrix reads.
+	 *
+	 * @param array $m                  Regex match: tag name, attributes, closing slash.
+	 * @param array $providers          Provider-to-category map.
+	 * @param array $blocked_categories Currently blocked category slugs.
+	 * @return string
+	 */
+	private function process_svg_href_tag( $m, $providers, $blocked_categories ) {
+		$tag   = strtolower( isset( $m[1] ) ? $m[1] : '' );
+		$attrs = isset( $m[2] ) ? $m[2] : '';
+		$close = isset( $m[3] ) ? $m[3] : '';
+		$full  = isset( $m[0] ) ? $m[0] : '';
+
+		if ( ( $this->has_attr_token( $attrs, 'data-faz-href' ) || $this->has_attr_token( $attrs, 'data-faz-src' ) )
+			&& ! $this->has_attr_token( $attrs, 'href' ) && ! $this->has_attr_token( $attrs, 'xlink:href' ) && ! $this->has_attr_token( $attrs, 'src' ) ) {
+			return $full; // Parked, and nothing live left (a bare sentinel does not exempt).
+		}
+		if ( $this->is_whitelisted( $attrs, '' ) ) {
+			return $full;
+		}
+
+		$matched_category = $this->match_script_to_provider( $attrs, '', $providers, $blocked_categories );
+		$svc_blocked      = $this->check_per_service_blocking( $attrs, '' );
+
+		if ( ! $matched_category || ! in_array( $matched_category, $blocked_categories, true ) ) {
+			if ( true !== $svc_blocked ) {
+				return $full;
+			}
+			if ( ! $matched_category ) {
+				$matched_category = 'functional';
+			}
+		} elseif ( false === $svc_blocked ) {
+			return $full;
+		}
+
+		// Every href/xlink:href token leaves; the first SVG2 value (else the
+		// first legacy one) is what gets parked. Outside <svg> the tree
+		// builder turns <image> into <img>, which fetches `src`, so on that
+		// tag src is parked as data-faz-src too — the restore pass for <img>
+		// reads it there. `srcset` goes with it for the reason the <img> pass
+		// gives: the tree builder keeps every attribute, and the browser picks
+		// a candidate from srcset in PREFERENCE to src, so a responsive beacon
+		// needs no src at all. Listing only src left a tag carrying srcset
+		// alone with nothing to park, and the early return below handed it
+		// back untouched. Edits from the end, so earlier offsets stay valid.
+		$wanted = 'image' === $tag ? array( 'href', 'xlink:href', 'src', 'srcset' ) : array( 'href', 'xlink:href' );
+		$tokens = $this->tokenize_tag_attrs( $attrs, $wanted );
+		$value  = '';
+		$legacy = '';
+		$parked = $attrs;
+		$src    = false;
+		$srcset = false;
+		for ( $i = count( $tokens ) - 1; $i >= 0; $i-- ) {
+			$token = $tokens[ $i ];
+			if ( null === $token['value'] ) {
+				continue;
+			}
+			if ( 'srcset' === $token['key'] ) {
+				$parked = substr_replace( $parked, ' data-faz-srcset=' . $token['value'], $token['offset'], $token['length'] );
+				$srcset = true;
+				continue;
+			}
+			if ( 'src' === $token['key'] ) {
+				$parked = substr_replace( $parked, ' data-faz-src=' . $token['value'], $token['offset'], $token['length'] );
+				$src    = true;
+				continue;
+			}
+			if ( 'href' === $token['key'] ) {
+				$value = $token['value']; // Walking backwards: the last assignment is the first token.
+			} elseif ( '' === $value ) {
+				$legacy = $token['value'];
+			}
+			$parked = substr_replace( $parked, ' ', $token['offset'], $token['length'] );
+		}
+		if ( '' === $value ) {
+			$value = $legacy;
+		}
+		if ( '' === $value && ! $src && ! $srcset ) {
+			return $full; // Nothing fetchable to park.
+		}
+
+		// Metadata BEFORE the captured attributes, for the same reason as
+		// process_img_tag(): a self-closing tag keeps its slash inside $attrs.
+		$metadata = '' !== $value ? ' data-faz-href=' . $value : '';
+		$out      = $this->label_category_first( $metadata . $parked, $matched_category );
+		if ( $srcset ) {
+			// The srcset restore reads its category from its own attribute, as
+			// it does on an <img>; the matcher's, alone.
+			$out = ' data-faz-srcset-category="' . esc_attr( $matched_category ) . '"' . $this->strip_attr_tokens( $out, 'data-faz-srcset-category' );
+		}
+		return '<' . $tag . $out . $close . '>';
+	}
+
+	/**
+	 * Process the legacy `background` presentation attribute.
+	 *
+	 * Obsolete in the spec, still honoured by every engine, and a one-attribute
+	 * tracking pixel on a <body> or a <td> is as much a request as an <img>.
+	 * Parked into data-faz-background, which the client's restore pass reads.
+	 *
+	 * @param array $m                  Regex match: tag name, attributes.
+	 * @param array $providers          Provider-to-category map.
+	 * @param array $blocked_categories Currently blocked category slugs.
+	 * @return string
+	 */
+	private function process_background_attr_tag( $m, $providers, $blocked_categories ) {
+		$tag   = strtolower( isset( $m[1] ) ? $m[1] : '' );
+		$attrs = isset( $m[2] ) ? $m[2] : '';
+		$full  = isset( $m[0] ) ? $m[0] : '';
+
+		// The pattern matches every table part; only one carrying the
+		// attribute is worth the provider match.
+		if ( ! $this->has_attr_token( $attrs, 'background' ) ) {
+			return $full;
+		}
+		// A live background is judged whether or not a parked one sits next
+		// to it (a bare sentinel does not exempt); the pre-filter above
+		// already returned when there is none.
+		if ( $this->is_whitelisted( $attrs, '' ) ) {
+			return $full;
+		}
+
+		$matched_category = $this->match_script_to_provider( $attrs, '', $providers, $blocked_categories );
+		$svc_blocked      = $this->check_per_service_blocking( $attrs, '' );
+
+		if ( ! $matched_category || ! in_array( $matched_category, $blocked_categories, true ) ) {
+			if ( true !== $svc_blocked ) {
+				return $full;
+			}
+			if ( ! $matched_category ) {
+				$matched_category = 'functional';
+			}
+		} elseif ( false === $svc_blocked ) {
+			return $full;
+		}
+
+		list( $parked, $renamed ) = $this->rename_attr_tokens( $attrs, array( 'background' => 'data-faz-background' ) );
+		if ( empty( $renamed ) ) {
+			return $full;
+		}
+
+		return '<' . $tag . $this->label_category_first( $parked, $matched_category ) . '>';
+	}
+
+	/**
+	 * Stash an <iframe srcdoc>, parking it when its markup names a blocked
+	 * provider.
+	 *
+	 * The attribute is a document, so the unit of judgement is the whole
+	 * attribute: the sub-document's resources are fetched by a parser that no
+	 * gate on either side of the plugin can reach once the context exists.
+	 * Every absolute URL the DECODED markup names is matched through the
+	 * ordinary provider matcher, and the first blocked one decides.
+	 *
+	 * Whatever the verdict, the srcdoc token leaves the buffer here and comes
+	 * back only when every other pass has run, byte-for-byte: the passes are
+	 * regexes over markup and the value IS markup. A parked srcdoc takes the
+	 * frame's src with it, because the engine ignores src while srcdoc is
+	 * present and removing srcdoc would activate it; both park under ONE
+	 * data-faz-category, and the frame is hidden like a parked-src frame.
+	 *
+	 * @param array $m                  Regex match: the iframe's attributes.
+	 * @param array $providers          Provider-to-category map.
+	 * @param array $blocked_categories Currently blocked category slugs.
+	 * @param array $stash              Marker => original token, filled here.
+	 * @return string
+	 */
+	private function process_iframe_srcdoc_tag( $m, $providers, $blocked_categories, array &$stash, $marker_prefix ) {
+		$attrs = isset( $m[1] ) ? $m[1] : '';
+		$close = isset( $m[2] ) ? $m[2] : '';
+		$full  = isset( $m[0] ) ? $m[0] : '';
+
+		// EVERY srcdoc and data-faz-srcdoc token leaves the buffer. The parser
+		// keeps the first of a duplicated attribute, so the first live srcdoc
+		// is the one judged — and once it is parked the next one would become
+		// THE srcdoc, so a parked verdict applies to all of them. A parked
+		// token is protected, not re-judged; a live one next to it is judged
+		// all the same, because the parked one is no verdict on it and the
+		// engine loads the live one.
+		$tokens = $this->tokenize_tag_attrs( $attrs, array( 'srcdoc', 'data-faz-srcdoc' ) );
+		if ( array() === $tokens ) {
+			return $full;
+		}
+		$doc = null;
+		foreach ( $tokens as $token ) {
+			if ( 'srcdoc' === $token['key'] && null !== $token['value'] && '' !== $token['value'] ) {
+				$doc = $token;
+				break;
+			}
+		}
+
+		// The marker names its kind: LIVE for a `srcdoc` token, KEPT for an
+		// already-parked data-faz-srcdoc. The iframe pass skips a frame only
+		// on a LIVE one, because only a live srcdoc makes src inert.
+		$rest = $attrs;
+		foreach ( $tokens as $i => $token ) {
+			$tokens[ $i ]['marker'] = $marker_prefix . ( 'srcdoc' === $token['key'] ? 'LIVE_' : 'KEPT_' ) . count( $stash ) . '__';
+			$stash[ $tokens[ $i ]['marker'] ] = substr( $attrs, $token['offset'], $token['length'] );
+		}
+		for ( $i = count( $tokens ) - 1; $i >= 0; $i-- ) {
+			// Padded where the token was glued to its neighbour: the marker is
+			// name characters, and `srcdoc="…"src=…` with the marker dropped
+			// in bare became ONE token, so the src was never renamed and the
+			// frame navigated to it once its srcdoc was gone.
+			$at     = $tokens[ $i ]['offset'];
+			$end    = $at + $tokens[ $i ]['length'];
+			$before = $at > 0 ? $rest[ $at - 1 ] : ' ';
+			$after  = $end < strlen( $rest ) ? $rest[ $end ] : ' ';
+			$marker = ( ctype_space( $before ) || '/' === $before ? '' : ' ' ) . $tokens[ $i ]['marker'] . ( ctype_space( $after ) || '/' === $after ? '' : ' ' );
+			$rest   = substr_replace( $rest, $marker, $at, $tokens[ $i ]['length'] );
+		}
+		if ( null === $doc ) {
+			return '<iframe' . $rest . $close . '>';
+		}
+
+		$raw   = $doc['value'];
+		$inner = ( strlen( $raw ) >= 2 && ( '"' === $raw[0] || "'" === $raw[0] ) ) ? substr( $raw, 1, -1 ) : $raw;
+		if ( '' === $inner ) {
+			return '<iframe' . $rest . $close . '>';
+		}
+
+		// The whitelist reads the frame's own src/id/class, so it is asked of
+		// the attributes WITHOUT the document in them.
+		$matched_category = '';
+		if ( ! $this->is_whitelisted( $rest, '' ) ) {
+			// Judged on what the engine would parse, not on the entity-encoded
+			// source: `src=&quot;https://…&quot;` is a quoted URL to the parser.
+			// Decoded until stable (the attribute decodes once, the document it
+			// becomes decodes again, so `&amp;#97;` is a letter by the time the
+			// request goes out) and stripped of tab/LF/CR the way the URL
+			// parser strips them, or `&NewLine;` inside a host hid it from the
+			// URL pattern below.
+			$markup = $inner;
+			for ( $pass = 0; $pass < 3; $pass++ ) {
+				$decoded = html_entity_decode( $markup, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+				if ( $decoded === $markup ) {
+					break;
+				}
+				$markup = $decoded;
+			}
+			$markup = str_replace( array( "\t", "\n", "\r" ), '', $markup );
+			// Every `\` is a `/` to the URL parser the document will run, so
+			// `\\host`, `/\host` and `\/host` are all `//host` here, and a meta
+			// refresh to `\\host` is one too. For judging only.
+			$markup = str_replace( '\\', '/', $markup );
+			// `https:/host` and `https:host` are special-scheme URLs the engine
+			// resolves to `https://host`; the normaliser gives them their slashes.
+			if ( preg_match_all( '#(?:https?:(?://|/?)|//)[^\s"\'<>)]+#i', $markup, $found ) ) {
+				foreach ( $found[0] as $url ) {
+					$category = $this->match_script_to_provider( ' src="' . $this->normalize_resource_url( $url ) . '"', '', $providers, $blocked_categories );
+					if ( $category && in_array( $category, $blocked_categories, true ) ) {
+						$matched_category = $category;
+						break;
+					}
+				}
+			}
+		}
+		if ( '' === $matched_category ) {
+			return '<iframe' . $rest . $close . '>';
+		}
+
+		foreach ( $tokens as $token ) {
+			if ( 'srcdoc' === $token['key'] ) {
+				$stash[ $token['marker'] ] = 'data-faz-srcdoc=' . $token['value'];
+			}
+		}
+		// src goes with it, on its token in $rest, where the markers are plain
+		// names and every offset is current.
+		list( $rest ) = $this->rename_attr_tokens( $rest, array( 'src' => 'data-faz-src' ) );
+		// One category: a parked token next to this one may have brought its
+		// own. Metadata BEFORE the captured attributes, as in
+		// process_img_tag(): a self-closing tag keeps its slash separate.
+		return self::faz_add_hidden_class( '<iframe' . $this->label_category_first( $rest, $matched_category ) . $close . '>' );
+	}
+
+	/**
+	 * Walk a tag's attribute string the way the HTML tokenizer reads it and
+	 * return the tokens named in $wanted, in document order.
+	 *
+	 * Streaming: one preg_match per token, anchored at the previous token's
+	 * end, keeping only what the caller asked for. The first shape of this
+	 * method materialised EVERY token with preg_match_all and offset capture,
+	 * about 1.3 KB each, so 100k attributes on one iframe cost 132 MB — a
+	 * fatal under a 40 MB memory limit — and it ran for every <iframe> as soon
+	 * as the page contained the word "srcdoc".
+	 *
+	 * A name counts wherever the tokenizer would start one: right after a
+	 * closing quote (`title="x"src=…`) or a slash (`<img/src=…>`) as much as
+	 * after whitespace. Every rename and lookup in this class goes through
+	 * these tokens, so a `name=` inside another attribute's value is never
+	 * mistaken for the attribute.
+	 *
+	 * @param string   $attrs  Attribute string, as captured after the tag name.
+	 * @param string[] $wanted Attribute names to return, any case.
+	 * @return array[] Each: name, key (lower-cased name), offset of the name,
+	 *                 length of name-through-value, value (quotes included) or
+	 *                 null for a bare attribute.
+	 */
+	private function tokenize_tag_attrs( $attrs, array $wanted ) {
+		$tokens = array();
+		$this->each_attr_token(
+			$attrs,
+			$wanted,
+			function ( $token ) use ( &$tokens ) {
+				$tokens[] = $token;
+				return true;
+			}
+		);
+		return $tokens;
+	}
+
+	/**
+	 * The streaming walk behind every token helper: one anchored preg_match
+	 * per token, the callback invoked for each wanted one with the same shape
+	 * tokenize_tag_attrs() returns, nothing kept. The callback returns false
+	 * to stop the walk.
+	 *
+	 * @param string   $attrs    Attribute string.
+	 * @param string[] $wanted   Attribute names, any case.
+	 * @param callable $callback function ( array $token ): bool
+	 * @return void
+	 */
+	private function each_attr_token( $attrs, array $wanted, $callback ) {
+		$attrs  = (string) $attrs;
+		$length = strlen( $attrs );
+		$lookup = array_fill_keys( array_map( 'strtolower', $wanted ), true );
+		$offset = 0;
+		while ( $offset < $length && preg_match( self::ATTR_TOKEN, $attrs, $f, PREG_OFFSET_CAPTURE, $offset ) ) {
+			$end = $f[0][1] + strlen( $f[0][0] );
+			if ( $end <= $offset ) {
+				break; // Cannot happen with this pattern; never loop forever if it did.
+			}
+			$offset = $end;
+			$key    = strtolower( $f[1][0] );
+			if ( ! isset( $lookup[ $key ] ) ) {
+				continue;
+			}
+			$has_value = isset( $f[2] ) && -1 !== $f[2][1];
+			$token     = array(
+				'name'   => $f[1][0],
+				'key'    => $key,
+				'offset' => $f[1][1],
+				'length' => $end - $f[1][1],
+				'value'  => $has_value ? $f[2][0] : null,
+			);
+			if ( false === $callback( $token ) ) {
+				return;
+			}
+		}
+	}
+
+	/**
+	 * Rewrite the wanted tokens in ONE pass over the string: the output is
+	 * built from substr() slices between tokens, so a megabyte of repeated
+	 * attributes costs one copy, not one copy per token. A per-token
+	 * substr_replace() over 75k `type` tokens took 3.2 s and 65 MB — a fatal
+	 * in the output buffer under an ordinary memory limit.
+	 *
+	 * @param string   $attrs   Attribute string.
+	 * @param string[] $wanted  Attribute names, any case.
+	 * @param callable $replace function ( array $token ): ?string — the text
+	 *                          replacing the token, or null to keep it.
+	 * @return string
+	 */
+	private function rewrite_attr_tokens( $attrs, array $wanted, $replace ) {
+		$attrs = (string) $attrs;
+		$out   = '';
+		$pos   = 0;
+		$this->each_attr_token(
+			$attrs,
+			$wanted,
+			function ( $token ) use ( &$out, &$pos, $attrs, $replace ) {
+				$replacement = $replace( $token );
+				if ( null === $replacement ) {
+					return true;
+				}
+				$out .= substr( $attrs, $pos, $token['offset'] - $pos ) . $replacement;
+				$pos  = $token['offset'] + $token['length'];
+				return true;
+			}
+		);
+		return $out . substr( $attrs, $pos );
+	}
+
+	/**
+	 * Remove every token of this name, any casing or spacing.
+	 *
+	 * @param string $attrs Attribute string.
+	 * @param string $name  Attribute name.
+	 * @return string
+	 */
+	private function strip_attr_tokens( $attrs, $name ) {
+		return $this->rewrite_attr_tokens(
+			$attrs,
+			array( $name ),
+			function () {
+				return '';
+			}
+		);
+	}
+
+	/**
+	 * The matcher's category, FIRST and alone. A page-authored
+	 * data-faz-category="necessary" next to a live tracker attribute is a
+	 * restore order — the runtime restores a parked resource whose category
+	 * is allowed, before consent — so when a pass parks a live attribute every
+	 * category token already on the tag is removed and exactly one, the
+	 * matcher's, is written ahead of the captured attributes. Only a tag with
+	 * nothing live to park keeps what it carries, and those return earlier.
+	 *
+	 * @param string $attrs    Attribute string, already rewritten.
+	 * @param string $category The matcher's category.
+	 * @return string
+	 */
+	private function label_category_first( $attrs, $category ) {
+		return ' data-faz-category="' . esc_attr( $category ) . '"' . $this->strip_attr_tokens( $attrs, 'data-faz-category' );
+	}
+
+	/**
+	 * Whether the attribute string carries a token of this name.
+	 *
+	 * @param string $attrs Attribute string.
+	 * @param string $name  Attribute name.
+	 * @return bool
+	 */
+	private function has_attr_token( $attrs, $name ) {
+		$found = false;
+		$this->each_attr_token(
+			$attrs,
+			array( $name ),
+			function () use ( &$found ) {
+				$found = true;
+				return false;
+			}
+		);
+		return $found;
+	}
+
+	/**
+	 * Rename every token named in $map to the mapped name, in place, on the
+	 * tokens the tokenizer produces. A bare attribute (no value) fetches
+	 * nothing and is left alone. Every occurrence is renamed, because a
+	 * duplicated attribute is kept first-wins by the parser and renaming the
+	 * first alone left the second live.
+	 *
+	 * @param string $attrs Attribute string.
+	 * @param array  $map   name => new name.
+	 * @return array{0:string,1:array} The rewritten string and the keys renamed.
+	 */
+	private function rename_attr_tokens( $attrs, array $map ) {
+		$attrs   = (string) $attrs;
+		$renamed = array();
+		$out     = $this->rewrite_attr_tokens(
+			$attrs,
+			array_keys( $map ),
+			function ( $token ) use ( &$renamed, $attrs, $map ) {
+				if ( null === $token['value'] ) {
+					return null;
+				}
+				$renamed[ $token['key'] ] = true;
+				// A leading space when the token sits right after a quote or a
+				// slash, where the new name would otherwise glue to it.
+				$glued = $token['offset'] > 0 && ! ctype_space( $attrs[ $token['offset'] - 1 ] );
+				return ( $glued ? ' ' : '' ) . $map[ $token['key'] ] . '=' . $token['value'];
+			}
+		);
+		return array( $out, $renamed );
+	}
+
+	/**
+	 * A resource URL as the engine resolves it, for matching only.
+	 *
+	 * Chromium decodes character references, strips tab, LF and CR anywhere
+	 * in the input, and percent-decodes the host before it resolves anything,
+	 * so `cdn.tr&#97;cker.test`, `cdn.tra&Tab;cker.test`, a literal newline
+	 * inside the host and `cdn.tracker%2Etest` are all one host to it and
+	 * were four different strings to a substring match on the raw bytes. A
+	 * contributor can write any of them through wp_kses. The decode loops
+	 * until stable, capped, so a doubly-encoded reference is seen through as
+	 * well; only the host is percent-decoded, the path keeps its bytes.
+	 *
+	 * @param string $value Raw attribute value.
+	 * @return string
+	 */
+	private function normalize_resource_url( $value ) {
+		$value = (string) $value;
+		if ( '' === $value ) {
+			return '';
+		}
+		for ( $i = 0; $i < 3; $i++ ) {
+			$decoded = html_entity_decode( $value, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+			if ( $decoded === $value ) {
+				break;
+			}
+			$value = $decoded;
+		}
+		$value = str_replace( array( "\t", "\n", "\r" ), '', $value );
+		// WHATWG turns every `\` into `/` for a special scheme, BEFORE the
+		// host is read: `https:\\host/p` is `https://host/p`, and
+		// `https://cdn.tracker.test\@site.test/p` has host cdn.tracker.test
+		// with `@site.test` in its path. A parse of the raw bytes read the
+		// decoy as the host, which the whitelist then trusted.
+		// The class is `[\\/]` in the pattern, i.e. a backslash or a slash:
+		// written as `[\\/]` in a single-quoted string it was `[\/]`, only
+		// ever a slash, and `\\host` was never normalised.
+		if ( preg_match( '#^\s*(?:https?:|[\\\\/]{2})#i', $value ) ) {
+			$value = str_replace( '\\', '/', $value );
+		}
+		// A special scheme takes exactly two slashes whatever was written:
+		// `https:/host` and `https:host` resolve to `https://host`.
+		$value = preg_replace( '#^(\s*https?:)/*#i', '$1//', $value );
+		if ( preg_match( '#^(\s*(?:[a-z][a-z0-9+.\-]*:)?//)([^/?\#\s]+)(.*)$#is', $value, $p ) ) {
+			// The host is what follows the LAST `@` of the authority: the
+			// engine reads `https://site.test@cdn.tracker.test/` from
+			// cdn.tracker.test, and once the backslashes above are slashes,
+			// `site.test\@cdn.tracker.test` has already closed its authority
+			// at site.test. Dropping the userinfo here is what lets the
+			// boundary check work on host and path alone, with no `@`
+			// separator that would over-park a decoy in a path or a query.
+			$authority = $p[2];
+			$at        = strrpos( $authority, '@' );
+			if ( false !== $at ) {
+				$authority = substr( $authority, $at + 1 );
+			}
+			$value = $p[1] . rawurldecode( $authority ) . $p[3];
+		}
+		return $value;
+	}
+
+	/**
+	 * The same, for a comma-separated candidate list (srcset, imagesrcset).
+	 *
+	 * @param string $value Raw list.
+	 * @return string
+	 */
+	private function normalize_resource_list( $value ) {
+		$value = (string) $value;
+		if ( '' === $value ) {
+			return '';
+		}
+		$parts = explode( ',', $value );
+		foreach ( $parts as $i => $part ) {
+			$parts[ $i ] = $this->normalize_resource_url( ltrim( $part ) );
+		}
+		return implode( ', ', $parts );
+	}
+
+	/**
+	 * A per-request nonce for the stash markers. A fixed marker could be
+	 * spelled by the page — a paragraph containing `__FAZ_SRCDOC_STASH_0__`
+	 * received the srcdoc token as live markup — so the markers carry
+	 * something the page cannot know.
+	 *
+	 * @return string
+	 */
+	/**
+	 * Replace every iframe srcdoc token with a marker no later pass can match.
+	 *
+	 * Shared by both entry points on purpose. This protection first existed
+	 * only in process_output_buffer(), and filter_content_blocking() — which
+	 * runs the same script and iframe passes over `the_content` — did not have
+	 * it, so a <script> inside a srcdoc was re-typed in place and the injected
+	 * double-quoted attribute ended the srcdoc value at its first quote. One
+	 * helper, one place to keep right.
+	 *
+	 * @param string $html               Markup to walk.
+	 * @param array  $providers          Provider-to-category map.
+	 * @param array  $blocked_categories Currently blocked category slugs.
+	 * @param string $stash_nonce        Per-request nonce the page cannot know.
+	 * @param array  $stash              Marker => original token, filled here.
+	 * @param string $marker             Marker prefix, set here.
+	 * @return string|null Markup with the tokens stashed, or null on PCRE error.
+	 */
+	private function stash_iframe_srcdocs( $html, $providers, $blocked_categories, $stash_nonce, array &$stash, &$marker ) {
+		$marker = '__FAZ_SRCDOC_' . $stash_nonce . '_';
+		$stash  = array();
+		if ( false === stripos( $html, 'srcdoc' ) ) {
+			return $html;
+		}
+		return preg_replace_callback(
+			'#<iframe(?=[\s/>])(' . self::ATTR_WALK . ')(/?)\s*+>#is',
+			function ( $m ) use ( $providers, $blocked_categories, &$stash, $marker ) {
+				return $this->process_iframe_srcdoc_tag( $m, $providers, $blocked_categories, $stash, $marker );
+			},
+			$html
+		);
+	}
+
+	private function stash_nonce() {
+		try {
+			return bin2hex( random_bytes( 6 ) );
+		} catch ( \Exception $e ) {
+			return substr( md5( uniqid( '', true ) ), 0, 12 );
+		}
 	}
 
 	private function process_link_tag( $m, $providers, $blocked_categories ) {
@@ -4400,10 +5540,10 @@ class Frontend {
 		// Only fetching rels are gated: dns-prefetch and preconnect resolve DNS
 		// and open a socket but transfer no URL and set no cookie, so gating them
 		// would break unrelated performance work for no privacy gain.
-		if ( ! preg_match( '/\brel\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'>]+))/i', $attrs, $rel_match ) ) {
+		$rel_value = $this->extract_tag_attr( $attrs, 'rel' );
+		if ( '' === $rel_value ) {
 			return $full;
 		}
-		$rel_value  = '' !== $rel_match[1] ? $rel_match[1] : ( '' !== $rel_match[2] ? $rel_match[2] : ( isset( $rel_match[3] ) ? $rel_match[3] : '' ) );
 		$rel_tokens = preg_split( '/\s+/', strtolower( trim( $rel_value ) ), -1, PREG_SPLIT_NO_EMPTY );
 		if ( ! $rel_tokens || ! array_intersect( $rel_tokens, array( 'stylesheet', 'preload', 'modulepreload', 'prefetch', 'prerender' ) ) ) {
 			return $full;
@@ -4418,8 +5558,9 @@ class Frontend {
 		if ( $this->is_whitelisted( $attrs, '' ) ) {
 			return $full;
 		}
-		if ( false !== strpos( $attrs, 'data-faz-href' ) || false !== strpos( $attrs, 'data-faz-imagesrcset' ) ) {
-			return $full;
+		if ( ( $this->has_attr_token( $attrs, 'data-faz-href' ) || $this->has_attr_token( $attrs, 'data-faz-imagesrcset' ) )
+			&& ! $this->has_attr_token( $attrs, 'href' ) && ! $this->has_attr_token( $attrs, 'imagesrcset' ) ) {
+			return $full; // Parked, and nothing live left (a bare sentinel does not exempt).
 		}
 
 		$matched_category = $this->match_script_to_provider( $attrs, '', $providers, $blocked_categories );
@@ -4443,16 +5584,19 @@ class Frontend {
 		// `<link rel="preload" as="image" imagesrcset="https://tracker/…">` was
 		// correctly recognised as blocked and then left able to fetch: renaming
 		// href alone does nothing to a preload whose URL lives in imagesrcset.
-		// The attribute name cannot collide with the srcset rule below it —
-		// `(^|\s)srcset` needs whitespace before it, which `imagesrcset=` does
-		// not provide.
-		$new_attrs = preg_replace( '/(^|\s)imagesrcset\s*=\s*/i', '$1data-faz-imagesrcset=', $attrs, 1 );
-		// Rename href → data-faz-href (avoid matching data-href).
-		$new_attrs = preg_replace( '/(^|\s)href\s*=\s*/i', '$1data-faz-href=', $new_attrs, 1 );
+		// Both renamed on their tokens, every occurrence: a duplicated
+		// attribute is kept first-wins by the parser, so renaming only the
+		// first left the second one live.
+		list( $new_attrs ) = $this->rename_attr_tokens(
+			$attrs,
+			array(
+				'imagesrcset' => 'data-faz-imagesrcset',
+				'href'        => 'data-faz-href',
+			)
+		);
 		// As with <img>, $attrs may already end in the source tag's `/`.
 		// Prefix metadata so the slash remains the final token before `>`.
-		$metadata = ' data-faz-category="' . esc_attr( $matched_category ) . '"';
-		return '<link' . $metadata . $new_attrs . '>';
+		return '<link' . $this->label_category_first( $new_attrs, $matched_category ) . '>';
 	}
 
 	/**
@@ -4475,7 +5619,7 @@ class Frontend {
 		$content = isset( $m[2] ) ? $m[2] : '';
 		$full    = isset( $m[0] ) ? $m[0] : '';
 
-		if ( '' === trim( $content ) || false !== strpos( $attrs, 'data-faz-css' ) ) {
+		if ( '' === trim( $content ) ) {
 			return $full;
 		}
 		if ( $this->is_whitelisted( $attrs, '' ) ) {
@@ -4488,12 +5632,10 @@ class Frontend {
 			return $full;
 		}
 
-		$category = reset( $categories );
-		$new_attrs = $attrs;
-		$new_attrs .= ' data-faz-css="' . esc_attr( base64_encode( $content ) ) . '"'; // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- inert transport for original CSS text, decoded only after consent.
-		$new_attrs .= ' data-faz-category="' . esc_attr( $category ) . '"';
+		$category  = reset( $categories );
+		$new_attrs = ' data-faz-css="' . esc_attr( base64_encode( $content ) ) . '"' . $this->strip_attr_tokens( $attrs, 'data-faz-css' ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- inert transport for original CSS text, decoded only after consent.
 
-		return '<style' . $new_attrs . '>' . $rewritten . '</style>';
+		return '<style' . $this->label_category_first( $new_attrs, $category ) . '>' . $rewritten . '</style>';
 	}
 
 	/**
@@ -4573,6 +5715,18 @@ class Frontend {
 		if ( '' === $url || '#' === $url[0] || 0 === stripos( $url, 'data:' ) || 0 === stripos( $url, 'blob:' ) ) {
 			return false;
 		}
+		// Normalise before matching, for the same reason every other route
+		// does. has_provider_boundary() stopped treating `@` as a boundary on
+		// the grounds that userinfo is dropped first — true of the haystacks
+		// get_provider_match_context() builds, and this route passed the raw
+		// token, so `url(https://x@cdn.tracker.test/p.png)` had its host behind
+		// an `@` that was no longer a boundary and matched nothing. Firefox
+		// fetches subresources with embedded credentials. Relative values are
+		// returned unchanged, so a decoy in a path or a query stays unmatched.
+		$url = $this->normalize_resource_url( $url );
+		if ( '' === $url ) {
+			return false;
+		}
 
 		$service_consent = $this->get_service_consent();
 		$pattern_map     = ! empty( $service_consent ) ? $this->get_pattern_service_map() : array();
@@ -4622,8 +5776,9 @@ class Frontend {
 		$whitelist = $this->get_whitelist();
 		$attr_values = array_filter(
 			array(
-				$this->extract_tag_attr( $attrs, 'src' ),
-				$this->extract_tag_attr( $attrs, 'href' ),
+				$this->normalize_resource_url( $this->extract_tag_attr( $attrs, 'src' ) ),
+				$this->normalize_resource_url( $this->extract_tag_attr( $attrs, 'href' ) ),
+				$this->normalize_resource_url( $this->extract_tag_attr( $attrs, 'xlink:href' ) ),
 				$this->extract_tag_attr( $attrs, 'id' ),
 				$this->extract_tag_attr( $attrs, 'class' ),
 			)
@@ -4650,21 +5805,23 @@ class Frontend {
 	 * @return string
 	 */
 	private function extract_tag_attr( $attrs, $name ) {
-		// Called for every attribute of every tag the output buffer inspects —
-		// build each attribute's pattern string once per request.
-		static $patterns = array();
-		if ( ! isset( $patterns[ $name ] ) ) {
-			$patterns[ $name ] = '/(?<![a-z0-9\-])' . preg_quote( $name, '/' ) . '\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))/i';
-		}
-		if ( preg_match( $patterns[ $name ], $attrs, $matches ) ) {
-			for ( $i = 1; $i <= 3; $i++ ) {
-				if ( isset( $matches[ $i ] ) && '' !== $matches[ $i ] ) {
-					return $matches[ $i ];
+		// The first token of that name, as the tokenizer would produce it:
+		// the old lookbehind pattern found `src=` inside another attribute's
+		// value and parked a local image for the URL in its alt text. The
+		// walk stops at the first one; the rest of the tag is never read.
+		$value = '';
+		$this->each_attr_token(
+			$attrs,
+			array( $name ),
+			function ( $token ) use ( &$value ) {
+				$raw = $token['value'];
+				if ( null !== $raw ) {
+					$value = ( strlen( $raw ) >= 2 && ( '"' === $raw[0] || "'" === $raw[0] ) ) ? substr( $raw, 1, -1 ) : $raw;
 				}
+				return false;
 			}
-		}
-
-		return '';
+		);
+		return $value;
 	}
 
 	/**
@@ -4682,6 +5839,15 @@ class Frontend {
 		$pattern = trim( (string) $pattern );
 		if ( '' === $value || '' === $pattern ) {
 			return false;
+		}
+		// A whitelist token in the query or the fragment is not the resource:
+		// `pixel.png?x=jquery.min.js` is the pixel. Unless the pattern itself
+		// names a query or a fragment, the value is matched without them.
+		if ( false === strpbrk( $pattern, '?#' ) ) {
+			$cut = strpbrk( $value, '?#' );
+			if ( false !== $cut ) {
+				$value = substr( $value, 0, strlen( $value ) - strlen( $cut ) );
+			}
 		}
 
 		// Domain+path patterns ("googleapis.com/maps/api/", "hcaptcha.com/")
@@ -5532,9 +6698,23 @@ class Frontend {
 	 * @return array
 	 */
 	private function get_provider_match_context( $attrs, $content ) {
-		$url = $this->extract_tag_attr( $attrs, 'src' );
+		// Every URL value is matched as the engine resolves it, not as it is
+		// written: see normalize_resource_url().
+		$url = $this->normalize_resource_url( $this->extract_tag_attr( $attrs, 'src' ) );
 		if ( '' === $url ) {
-			$url = $this->extract_tag_attr( $attrs, 'href' );
+			$url = $this->normalize_resource_url( $this->extract_tag_attr( $attrs, 'href' ) );
+		}
+		if ( '' === $url ) {
+			// The legacy SVG spelling is its own token to the tokenizer; the
+			// lookbehind pattern this replaced used to find `href` inside it.
+			$url = $this->normalize_resource_url( $this->extract_tag_attr( $attrs, 'xlink:href' ) );
+		}
+		if ( '' === $url ) {
+			// The legacy `background` presentation attribute carries a URL that
+			// the CSS-less engine still fetches. Last in the chain because it is
+			// only ever the URL when there is no src and no href, so no existing
+			// caller's answer changes.
+			$url = $this->normalize_resource_url( $this->extract_tag_attr( $attrs, 'background' ) );
 		}
 		// srcset / imagesrcset are matched IN ADDITION to src, never as a mere
 		// fallback: a responsive image can pair a perfectly innocent src with a
@@ -5546,7 +6726,7 @@ class Frontend {
 		// Descriptors ("2x", "640w") and inter-candidate commas are harmless to
 		// fragment matching.
 		$srcset_haystack = trim(
-			$this->extract_tag_attr( $attrs, 'srcset' ) . ' ' . $this->extract_tag_attr( $attrs, 'imagesrcset' )
+			$this->normalize_resource_list( $this->extract_tag_attr( $attrs, 'srcset' ) ) . ' ' . $this->normalize_resource_list( $this->extract_tag_attr( $attrs, 'imagesrcset' ) )
 		);
 
 		$normalized_content  = (string) $content;
@@ -5619,7 +6799,12 @@ class Frontend {
 	private function has_provider_boundary( $target, $index, $length ) {
 		if ( $index > 0 ) {
 			$before = substr( $target, $index - 1, 1 );
-			if ( ! preg_match( '/[\/.:\s"\'`=;,(<{\[]/', $before ) ) {
+			// `\` is a slash to every special-scheme URL parser. Userinfo is
+			// not a separator here: normalize_resource_url() drops it, so the
+			// host after an `@` is matched at a `/`, while an `@` inside a
+			// path or a query (`/local.png?u=me@cdn.tracker.test`) is not a
+			// boundary and does not over-park.
+			if ( ! preg_match( '/[\/.:\s"\'`=;,(<{\[\\\\]/', $before ) ) {
 				return false;
 			}
 		}
@@ -5639,7 +6824,7 @@ class Frontend {
 		$after_pos = $index + $length;
 		if ( $after_pos < strlen( $target ) ) {
 			$after = substr( $target, $after_pos, 1 );
-			if ( ! preg_match( '/[\/.:\?#\s"\'=;,&)<}\]]/', $after ) ) {
+			if ( ! preg_match( '/[\/.:\?#\s"\'=;,&)<}\]\\\\]/', $after ) ) {
 				return false;
 			}
 		}
@@ -6155,24 +7340,30 @@ class Frontend {
 	 * @return string Modified attributes string.
 	 */
 	private function set_script_type_plain( $attrs ) {
-		$type_match = preg_match( '/type\s*=\s*["\']([^"\']*)["\']/i', $attrs, $tm );
-		if ( 1 === $type_match ) {
-			$original = $tm[1];
-			$replaced = preg_replace( '/type\s*=\s*["\'][^"\']*["\']/i', 'type="text/plain"', $attrs );
-			if ( null === $replaced ) {
-				return self::script_attrs_type_plain_without_regex( $attrs );
-			}
-			$attrs = $replaced;
-			// Preserve non-default types (e.g. "module") so JS can restore them.
-			if ( 'text/plain' !== $original && 'text/javascript' !== $original && '' !== $original ) {
-				$attrs .= ' data-faz-original-type="' . esc_attr( $original ) . '"';
-			}
-			return $attrs;
+		// The `type` TOKEN, every occurrence of it, rewritten in place: a
+		// regex over the attribute string rewrote `type='module'` inside an
+		// alt value and left the script with no real type at all, executing.
+		if ( ! $this->has_attr_token( $attrs, 'type' ) ) {
+			// No type: PREPEND one, so that if the tokenizer failed on a tag
+			// that does carry a type the parser's first-wins rule still reads
+			// the inert one.
+			return ' type="text/plain"' . $attrs;
 		}
-		if ( false === $type_match ) {
-			return self::script_attrs_type_plain_without_regex( $attrs );
+		$original = $this->extract_tag_attr( $attrs, 'type' );
+		$source   = $attrs;
+		$attrs    = $this->rewrite_attr_tokens(
+			$source,
+			array( 'type' ),
+			function ( $token ) use ( $source ) {
+				$glued = $token['offset'] > 0 && ! ctype_space( $source[ $token['offset'] - 1 ] );
+				return ( $glued ? ' ' : '' ) . 'type="text/plain"';
+			}
+		);
+		// Preserve non-default types (e.g. "module") so JS can restore them.
+		if ( 'text/plain' !== $original && 'text/javascript' !== $original && '' !== $original && ! $this->has_attr_token( $attrs, 'data-faz-original-type' ) ) {
+			$attrs .= ' data-faz-original-type="' . esc_attr( $original ) . '"';
 		}
-		return $attrs . ' type="text/plain"';
+		return $attrs;
 	}
 
 	/**
@@ -7298,8 +8489,9 @@ class Frontend {
 
 	/**
 	 * Inject opt-out hints into our own `<script>` tags so cache /
-	 * optimisation plugins leave them alone. A deferred or delayed
-	 * consent banner defeats the plugin's purpose: the banner (and the
+	 * optimisation plugins preserve our loading order. Native defer is
+	 * protected by the inline bootstrap; delaying until user interaction
+	 * would prevent the runtime from taking over. The banner (and the
 	 * `_fazCreateElementBackup` interceptor that blocks third-party
 	 * trackers pre-consent) must run at page load, not at first user
 	 * interaction — otherwise ads and analytics scripts released by the
@@ -7335,7 +8527,7 @@ class Frontend {
 		// (excluding ones we have already neutralised to `text/plain` or
 		// that already carry the hints from a prior filter pass).
 		$new_tag = preg_replace_callback(
-			'#<script\b([^>]*?)(/?)>#i',
+			'#<script(?=[\s/>])(' . self::ATTR_WALK . ')(/?)\s*+>#i',
 			function ( $m ) use ( $hints ) {
 				$attrs = $m[1];
 				// Skip blocked scripts and idempotent re-runs.
@@ -7819,7 +9011,7 @@ class Frontend {
 	 * @return string
 	 */
 	public function filter_inline_script_tag( $tag, $id, $handle = '' ) {
-		if ( ! preg_match( '/<script\b([^>]*)>(.*)<\/script>/si', $tag, $match ) ) {
+		if ( ! preg_match( '#<script(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>(.*)</script(?=[\s/>])[^>]*>#si', $tag, $match ) ) {
 			return $tag;
 		}
 		$category = $this->inline_script_block_category( $match[1], $match[2], $id, $handle );
@@ -8914,12 +10106,34 @@ class Frontend {
 			return $content;
 		}
 
+		// An iframe's srcdoc is markup inside an attribute value, and every pass
+		// below is a regex over markup: without this the script pass re-typed a
+		// <script src> INSIDE the value and wrote `data-faz-category="…"` into a
+		// double-quoted attribute, which ends the srcdoc at the first injected
+		// quote. The embedded document was then truncated — destroyed rather
+		// than delayed — and the leftovers became stray attributes on the frame.
+		// process_output_buffer() has had this protection since the same defect
+		// was found there; this entry point runs the same passes and did not.
+		$stash_nonce   = $this->stash_nonce();
+		$srcdoc_stash  = array();
+		$srcdoc_marker = '';
+		$stashed       = $this->stash_iframe_srcdocs( $content, $providers, $blocked_categories, $stash_nonce, $srcdoc_stash, $srcdoc_marker );
+		if ( null === $stashed ) {
+			// Fail-secure, as the passes below: a srcdoc that cannot be walked
+			// is a document whose fetches nothing downstream can gate.
+			error_log( '[FAZ Cookie Manager] PCRE error ' . preg_last_error() . ' in filter_content_blocking (srcdoc)' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			$srcdoc_stash  = array();
+			$srcdoc_marker = '';
+		} else {
+			$content = $stashed;
+		}
+
 		// Block <script> tags in content.
 		// Fail-secure: on PCRE error, strip scripts entirely rather than serving
 		// them unblocked, which would violate consent requirements.
 		if ( false !== stripos( $content, '<script' ) ) {
 			$result = preg_replace_callback(
-				'#<script\b([^>]*)>(.*?)</script>#is',
+				'#<script(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>(.*?)</script(?=[\s/>])[^>]*>#is',
 				function ( $m ) use ( $providers, $blocked_categories ) {
 					return $this->process_script_tag( $m, $providers, $blocked_categories );
 				},
@@ -8929,16 +10143,16 @@ class Frontend {
 				$content = $result;
 			} else {
 				error_log( '[FAZ Cookie Manager] PCRE error ' . preg_last_error() . ' in filter_content_blocking (scripts)' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-				$content = preg_replace( '#<script\b[^>]*>.*?</script>#is', '', $content ) ?? $content;
+				$content = preg_replace( '#<script\b[^>]*>.*?</script(?=[\s/>])[^>]*>#is', '', $content ) ?? $content;
 			}
 		}
 
 		// Block <iframe> tags in content.
 		if ( false !== stripos( $content, '<iframe' ) ) {
 			$result = preg_replace_callback(
-				'#<iframe\b([^>]*)(?:>(.*?)</iframe>|/>)#is',
-				function ( $m ) use ( $providers, $blocked_categories ) {
-					return $this->process_iframe_tag( $m, $providers, $blocked_categories );
+				'#<iframe(?=[\s/>])(' . self::ATTR_WALK . ')(?:>(.*?)</iframe(?=[\s/>])[^>]*>|/\s*+>)#is',
+				function ( $m ) use ( $providers, $blocked_categories, $srcdoc_marker ) {
+					return $this->process_iframe_tag( $m, $providers, $blocked_categories, $srcdoc_marker );
 				},
 				$content
 			);
@@ -8946,7 +10160,7 @@ class Frontend {
 				$content = $result;
 			} else {
 				error_log( '[FAZ Cookie Manager] PCRE error ' . preg_last_error() . ' in filter_content_blocking (iframes)' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-				$content = preg_replace( '#<iframe\b[^>]*>.*?</iframe>#is', '', $content ) ?? $content;
+				$content = preg_replace( '#<iframe\b[^>]*>.*?</iframe(?=[\s/>])[^>]*>#is', '', $content ) ?? $content;
 			}
 		}
 
@@ -8958,6 +10172,14 @@ class Frontend {
 		// data-settings, so the generic <iframe> blocker above never sees one).
 		$content = $this->process_elementor_video_widgets( $content, $blocked_categories, $providers );
 		$content = $this->process_bricks_map_widgets( $content, $blocked_categories, $providers );
+
+		// Last, so no pass above can have written into the value: the marker
+		// goes back to the ORIGINAL token — `srcdoc=…` when the document is
+		// allowed, `data-faz-srcdoc=…` when it is parked — bytes and quoting
+		// untouched either way.
+		if ( ! empty( $srcdoc_stash ) ) {
+			$content = strtr( $content, $srcdoc_stash );
+		}
 
 		return $content;
 	}
@@ -9051,15 +10273,22 @@ class Frontend {
 
 		// Neutralize the embed: wrap iframes, disable scripts.
 		$blocked_html = $html;
-		// Rename iframe src to prevent loading.
-		$blocked_html = preg_replace( '/(<iframe\b[^>]*\s)src\s*=\s*/i', '$1data-faz-src=', $blocked_html );
-		// Add data-faz-category to iframes.
-		$blocked_html = preg_replace( '/(<iframe\b)/', '$1 data-faz-category="' . esc_attr( $matched_category ) . '"', $blocked_html );
+		// Rename iframe src to prevent loading and label the frame, in one walk
+		// over its attributes.
+		$frame_category = $matched_category;
+		$blocked_html   = preg_replace_callback(
+			'#<iframe(?=[\s/>])(' . self::ATTR_WALK . '(?:/\s*+)?)>#i',
+			function ( $m ) use ( $frame_category ) {
+				list( $attrs ) = $this->rename_attr_tokens( $m[1], array( 'src' => 'data-faz-src' ) );
+				return '<iframe data-faz-category="' . esc_attr( $frame_category ) . '"' . $attrs . '>';
+			},
+			$blocked_html
+		) ?? $blocked_html;
 		$blocked_html = self::faz_add_hidden_class( $blocked_html );
 		// Disable scripts using set_script_type_plain() for consistent type handling.
 		$cat_attr = $matched_category;
 		$result = preg_replace_callback(
-			'#<script\b([^>]*)>(.*?)</script>#is',
+			'#<script(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>(.*?)</script(?=[\s/>])[^>]*>#is',
 			function ( $m ) use ( $cat_attr ) {
 				$attrs = $this->set_script_type_plain( $m[1] );
 				if ( false === strpos( $attrs, 'data-faz-category' ) ) {
@@ -9073,7 +10302,7 @@ class Frontend {
 			$blocked_html = $result;
 		} else {
 			error_log( '[FAZ Cookie Manager] PCRE error ' . preg_last_error() . ' in block_oembed (scripts)' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-			$blocked_html = preg_replace( '#<script\b[^>]*>.*?</script>#is', '', $blocked_html ) ?? $blocked_html;
+			$blocked_html = preg_replace( '#<script\b[^>]*>.*?</script(?=[\s/>])[^>]*>#is', '', $blocked_html ) ?? $blocked_html;
 		}
 
 		return Placeholder_Builder::build( $service_id, $service_name, $matched_category, $blocked_html, $thumb_url );
@@ -9635,13 +10864,9 @@ class Frontend {
 	 */
 	private function block_script_tag_safely( string $tag, string $category, string $context ): string {
 		$blocked = preg_replace_callback(
-			'/<script\b([^>]*)>/i',
+			'#<script(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>#i',
 			function ( $match ) use ( $category ) {
-				$new_attrs = $this->set_script_type_plain( $match[1] );
-				if ( false === strpos( $new_attrs, 'data-faz-category' ) ) {
-					$new_attrs .= ' data-faz-category="' . esc_attr( $category ) . '"';
-				}
-				return '<script' . $new_attrs . '>';
+				return '<script' . $this->label_category_first( $this->set_script_type_plain( $match[1] ), $category ) . '>';
 			},
 			$tag,
 			1

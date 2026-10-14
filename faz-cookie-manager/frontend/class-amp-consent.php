@@ -167,6 +167,55 @@ class AMP_Consent {
 	}
 
 	/**
+	 * Whether the AMP consent UI may be withheld from this crawler.
+	 *
+	 * `hide_from_bots` makes the amphtml document depend on the User-Agent, and
+	 * an AMP page is cached harder than any other: the host's page cache, the
+	 * Google AMP Cache and the Bing AMP Cache all store it, none of them keyed
+	 * on the User-Agent. A crawler-shaped copy therefore reaches human readers
+	 * and leaves them with no consent control at all.
+	 *
+	 * So suppression is paired with a no-store veto, exactly as in
+	 * Frontend::veto_page_cache_for_bot_variance(), and when the veto cannot be
+	 * installed the consent UI renders. Cache Compatibility Mode needs an
+	 * invariant document and never suppresses — the gate it was missing.
+	 *
+	 * @since 1.34.1
+	 * @return bool
+	 */
+	private function bot_suppression_applies() {
+		if ( ! function_exists( 'faz_is_bot' ) || ! faz_is_bot() ) {
+			return false;
+		}
+		/** This filter is documented in frontend/class-frontend.php. */
+		if ( ! apply_filters( 'faz_bot_render_cache_veto', true ) ) {
+			return false;
+		}
+		$settings = $this->get_faz_settings();
+		if ( isset( $settings['banner_control']['hide_from_bots'] ) && empty( $settings['banner_control']['hide_from_bots'] ) ) {
+			return false;
+		}
+		if ( $this->is_cache_compatibility_enabled() ) {
+			return false;
+		}
+		do_action( 'litespeed_control_set_nocache', 'FAZ Cookie Manager crawler-only AMP render' );
+		if ( headers_sent() ) {
+			return false;
+		}
+		header( 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0' );
+		header( 'Pragma: no-cache' );
+		header( 'X-LiteSpeed-Cache-Control: no-cache' );
+		header( 'Vary: User-Agent', false );
+		if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+			define( 'DONOTCACHEPAGE', true );
+		}
+		if ( ! defined( 'DONOTCACHEOBJECT' ) ) {
+			define( 'DONOTCACHEOBJECT', true );
+		}
+		return true;
+	}
+
+	/**
 	 * Mirror the classic banner's request/settings suppression on AMP.
 	 *
 	 * @return bool
@@ -177,10 +226,6 @@ class AMP_Consent {
 		}
 		$settings = $this->get_faz_settings();
 		if ( empty( $settings['banner_control']['status'] ) ) {
-			return true;
-		}
-		if ( ( ! isset( $settings['banner_control']['hide_from_bots'] ) || ! empty( $settings['banner_control']['hide_from_bots'] ) )
-			&& function_exists( 'faz_is_bot' ) && faz_is_bot() ) {
 			return true;
 		}
 		$excluded = isset( $settings['banner_control']['excluded_pages'] ) && is_array( $settings['banner_control']['excluded_pages'] )
@@ -199,6 +244,33 @@ class AMP_Consent {
 				&& faz_path_matches_pattern( trim( $exclusion ), $current_path ) ) {
 				return true;
 			}
+		}
+		// Last, because it is the only gate here with a side effect: it vetoes
+		// the page cache for the crawler-only render. A page the banner never
+		// reaches (status off, or excluded by path) does not vary by
+		// User-Agent, so it must reach this point and keep its cache entry.
+		// Frontend::enqueue_scripts() orders these the same way.
+		//
+		// "Excluded by path", and not by id, on part of the version range this
+		// plugin supports — which is worth spelling out because WordPress
+		// changed the answer. Frontend::send_geo_cache_headers() runs on
+		// `send_headers`, and WP::main() reordered in 6.1: up to 6.0 it fired
+		// send_headers() BEFORE query_posts(), so get_the_ID() was false there
+		// and the numeric entries of excluded_pages could never match; from
+		// 6.1 query_posts(), handle_404() and register_globals() all run first,
+		// so on a parsed request the ID is available and a numeric exclusion
+		// does match. `Requires at least` is 5.0, so both orders are live in
+		// the field.
+		//
+		// Either way this call stays last and the hook stays put. On 6.1+ the
+		// veto is simply correct. On 6.0 and earlier a page excluded by ID
+		// still takes it, and the cost is one crawler response that could have
+		// been cached — cheaper than the alternatives, which are moving the
+		// hook to template_redirect (changing when headers are sent) or
+		// resolving the ID with url_to_postid() (a query on every front-end
+		// request). Stated rather than silently implied.
+		if ( $this->bot_suppression_applies() ) {
+			return true;
 		}
 		return false;
 	}
