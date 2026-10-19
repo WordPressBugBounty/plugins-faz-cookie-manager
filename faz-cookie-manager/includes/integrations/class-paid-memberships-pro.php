@@ -141,6 +141,18 @@ class Paid_Memberships_Pro {
 	}
 
 	/**
+	 * The name a consent cookie has on this site: suffixed per network and
+	 * blog when the consent state is site-bound, the bare name otherwise or
+	 * when the helper is not loaded.
+	 *
+	 * @param string $name Bare cookie name.
+	 * @return string
+	 */
+	private static function cookie_key( $name ) {
+		return function_exists( 'faz_consent_cookie_name' ) ? faz_consent_cookie_name( $name ) : $name;
+	}
+
+	/**
 	 * Keep consent-tracking cookies aligned with the user's current PMP
 	 * exemption state.
 	 *
@@ -150,10 +162,14 @@ class Paid_Memberships_Pro {
 	 * cookie from a previous membership state.
 	 */
 	public function sync_consent_cookie() {
+		// Revision-only on purpose: this runs on init (priority 5), before any
+		// banner is selected, so no scope exists yet — the case the helper's
+		// null scope is documented for. The necessary-only state written below
+		// carries no scope and is valid under every banner.
 		$current_cookie    = function_exists( 'faz_get_valid_consent_cookie' ) ? faz_get_valid_consent_cookie() : '';
 		$is_pmp_managed    = function_exists( 'faz_is_pmp_managed_consent_cookie' ) ? faz_is_pmp_managed_consent_cookie( $current_cookie ) : false;
-		$has_vendor_cookie = ! empty( $_COOKIE['fazVendorConsent'] );
-		$has_tcf_cookie    = ! empty( $_COOKIE['euconsent-v2'] );
+		$has_vendor_cookie = ! empty( $_COOKIE[ self::cookie_key( 'fazVendorLI' ) ] ) || ! empty( $_COOKIE[ self::cookie_key( 'fazVendorConsent' ) ] );
+		$has_tcf_cookie    = ! empty( $_COOKIE[ self::cookie_key( 'euconsent-v2' ) ] );
 		$is_exempted       = $this->is_current_user_exempted();
 
 		if ( ! $is_exempted ) {
@@ -177,15 +193,16 @@ class Paid_Memberships_Pro {
 			// presence of vendor cookies would loop: clear → banner → re-accept
 			// → vendor cookie re-created → clear → …). The marker breaks that
 			// tie without re-introducing the loop.
-			$pmp_vendor_marker = isset( $_COOKIE['fazVendorSource'] ) && 'pmp' === $_COOKIE['fazVendorSource'];
+			$pmp_vendor_marker = isset( $_COOKIE[ self::cookie_key( 'fazVendorSource' ) ] ) && 'pmp' === $_COOKIE[ self::cookie_key( 'fazVendorSource' ) ];
 			if ( $is_pmp_managed && function_exists( 'faz_clear_consent_tracking_cookies' ) ) {
 				faz_clear_consent_tracking_cookies();
 			}
 			if ( ( $is_pmp_managed || $pmp_vendor_marker ) && function_exists( 'faz_expire_browser_cookie' ) ) {
 				faz_expire_browser_cookie( 'fazVendorConsent' );
+				faz_expire_browser_cookie( 'fazVendorLI' );
 				faz_expire_browser_cookie( 'euconsent-v2' );
 				faz_expire_browser_cookie( 'fazVendorSource' );
-				unset( $_COOKIE['fazVendorConsent'], $_COOKIE['euconsent-v2'], $_COOKIE['fazVendorSource'] );
+				unset( $_COOKIE[ self::cookie_key( 'fazVendorLI' ) ], $_COOKIE[ self::cookie_key( 'fazVendorConsent' ) ], $_COOKIE[ self::cookie_key( 'euconsent-v2' ) ], $_COOKIE[ self::cookie_key( 'fazVendorSource' ) ] );
 			}
 			return;
 		}
@@ -226,8 +243,12 @@ class Paid_Memberships_Pro {
 		// value is stable, so this logs once and cannot flood on page reloads.
 		$is_new_state = ( '' === $current_cookie || ( $is_pmp_managed && $current_cookie !== $desired_cookie ) );
 
+		// The vendor records and the TC string of an earlier choice do not
+		// describe the necessary-only state written below; the Right-to-Object
+		// record (fazVendorLI) included, or its objections would be re-applied.
 		if ( function_exists( 'faz_expire_browser_cookie' ) ) {
 			faz_expire_browser_cookie( 'fazVendorConsent' );
+			faz_expire_browser_cookie( 'fazVendorLI' );
 			faz_expire_browser_cookie( 'euconsent-v2' );
 		}
 		// Companion marker: flag that this member's vendor/TCF state is
@@ -240,7 +261,7 @@ class Paid_Memberships_Pro {
 		// no personal data — only the literal string "pmp".
 		if ( function_exists( 'faz_set_browser_cookie' ) ) {
 			faz_set_browser_cookie( 'fazVendorSource', 'pmp', time() + ( 365 * DAY_IN_SECONDS ) );
-			$_COOKIE['fazVendorSource'] = 'pmp';
+			$_COOKIE[ self::cookie_key( 'fazVendorSource' ) ] = 'pmp';
 		}
 		$this->set_consent_cookie( $desired_cookie );
 
@@ -396,7 +417,7 @@ class Paid_Memberships_Pro {
 		// Same contract — and same justification — as faz_set_browser_cookie().
 		// phpcs:ignore WordPressVIPMinimum.Functions.RestrictedFunctions.cookies_setcookie
 		setcookie( // nosemgrep
-			'fazcookie-consent',
+			self::cookie_key( 'fazcookie-consent' ),
 			$value,
 			array( // nosemgrep
 				'expires'  => $expiry,
@@ -407,7 +428,7 @@ class Paid_Memberships_Pro {
 				'samesite' => 'Lax',
 			)
 		);
-		$_COOKIE['fazcookie-consent'] = $value;
+		$_COOKIE[ self::cookie_key( 'fazcookie-consent' ) ] = $value;
 	}
 
 	/**
