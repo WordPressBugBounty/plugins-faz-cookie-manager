@@ -323,6 +323,14 @@ defined( 'ABSPATH' ) || exit;
 			</div>
 			<div class="faz-form-group">
 				<label class="faz-toggle">
+					<input type="checkbox" data-path="script_blocking.allow_antispam_before_consent">
+					<span class="faz-toggle-track"></span>
+					<span class="faz-toggle-label"><?php esc_html_e( 'Allow anti-spam services before consent', 'faz-cookie-manager' ); ?></span>
+				</label>
+				<div class="faz-help"><?php echo wp_kses_post( __( 'Lets Google reCAPTCHA, hCaptcha and Cloudflare Turnstile load before consent, as protection of the forms a visitor submits. Whether that counts as strictly necessary depends on your legal advice: in some countries reCAPTCHA is expected to wait for consent because it sends data to Google. If you switch this off, these services are held under the Functional category until the visitor accepts it, so <strong>forms protected by them will not submit before consent</strong>. The CAPTCHA entries this plugin adds to Script Blocking Exceptions by default are ignored while this is off; any exception you wrote yourself still wins.', 'faz-cookie-manager' ) ); ?></div>
+			</div>
+			<div class="faz-form-group">
+				<label class="faz-toggle">
 					<input type="checkbox" data-path="script_blocking.aggressive_css_url_blocking">
 					<span class="faz-toggle-track"></span>
 					<span class="faz-toggle-label"><?php esc_html_e( 'Advanced inline CSS URL blocking', 'faz-cookie-manager' ); ?></span>

@@ -188,6 +188,13 @@ class Frontend {
 	private $blocked_categories_cache = null;
 	private $provider_map_cache       = null;
 	private $whitelist_cache          = null;
+
+	/**
+	 * Request cache for get_consentable_category_slugs().
+	 *
+	 * @var string[]|null
+	 */
+	private $consentable_categories_cache = null;
 	private $service_consent_cache    = null;
 	/**
 	 * The visitor's OWN blocked set and per-service map, kept apart from the
@@ -3851,15 +3858,15 @@ class Frontend {
 		$known            = Known_Providers::get_all();
 		$provider_services = array(); // pattern => service id (per-service embed resolution).
 		foreach ( $known as $known_id => $service ) {
-			if ( 'necessary' === $service['category'] ) {
-				continue;
-			}
-			if ( ! in_array( $service['category'], $valid_categories, true ) ) {
-				continue;
-			}
 			foreach ( $service['patterns'] as $pattern ) {
+				// Per pattern, not per service, so the CAPTCHA reclassification
+				// below resolves exactly as it does in get_provider_category_map().
+				$category = $this->known_provider_category( $service['category'], $pattern, $valid_categories );
+				if ( 'necessary' === $category || ! in_array( $category, $valid_categories, true ) ) {
+					continue;
+				}
 				if ( ! isset( $this->providers[ $pattern ] ) ) {
-					$this->providers[ $pattern ] = array( $service['category'] );
+					$this->providers[ $pattern ] = array( $category );
 				}
 			}
 		}
@@ -3947,16 +3954,19 @@ class Frontend {
 		$store['_providersToBlock'] = $providers;
 
 		// User-defined whitelist patterns for client-side network interceptors.
-		$user_whitelist = isset( $settings['script_blocking']['whitelist_patterns'] )
-			? array_values( array_filter( array_map( 'sanitize_text_field', (array) $settings['script_blocking']['whitelist_patterns'] ) ) )
-			: array();
+		$user_whitelist = $this->get_user_whitelist_patterns();
 		// Plus the always-allowed gateway tokens whenever an explicit rule
 		// overlapped one and was therefore KEPT on the client list (see
 		// apply_client_provider_exemptions()). The server releases a gateway's
 		// own urls through get_whitelist(), not by dropping the rule, so the
 		// client needs the same tokens to resolve them the same way. Empty on
 		// every install without such a rule: the payload is unchanged there.
-		$store['_userWhitelist'] = array_values( array_unique( array_merge( $user_whitelist, $client_gateway_whitelist ) ) );
+		// The anti-spam endpoints the server exempts must be exempt on the client
+		// too, or a CAPTCHA a form loads after DOMContentLoaded is held by the
+		// runtime that the server just let through (#343). Off, they are judged
+		// on both sides like any other provider.
+		$client_antispam = $this->antispam_allowed_before_consent() ? self::ANTISPAM_CHALLENGE_PATTERNS : array();
+		$store['_userWhitelist'] = array_values( array_unique( array_merge( $user_whitelist, $client_gateway_whitelist, $client_antispam ) ) );
 		// Non-filterable commerce configuration invariant mirrored by the
 		// runtime MutationObserver/createElement interceptor. Keep it separate
 		// from the editable whitelist so an empty Settings field cannot remove
@@ -7955,6 +7965,134 @@ class Frontend {
 	}
 
 	/**
+	 * Anti-abuse challenge endpoints (CAPTCHA and bot challenges) that are
+	 * allowed before consent unless the owner switches that off (#343).
+	 * Substring patterns: 'hcaptcha.com' also covers js.hcaptcha.com, and
+	 * 'google.com/recaptcha' covers recaptcha/api.js.
+	 */
+	const ANTISPAM_CHALLENGE_PATTERNS = array(
+		'google.com/recaptcha',
+		// phpcs:ignore PluginCheck.CodeAnalysis.Offloading.OffloadedContent -- Matching a third-party challenge URL in the consent whitelist; this string does not load a plugin asset.
+		'gstatic.com/recaptcha',
+		'hcaptcha.com',
+		// phpcs:ignore PluginCheck.CodeAnalysis.Offloading.OffloadedContent -- Matching a third-party challenge URL in the consent whitelist; this string does not load a plugin asset.
+		'challenges.cloudflare.com/turnstile',
+	);
+
+	/**
+	 * Whether reCAPTCHA, hCaptcha and Turnstile load before consent.
+	 *
+	 * Settings → Script Blocking → "Allow anti-spam services before consent",
+	 * on by default. Anything but an explicit false keeps the default, so an
+	 * install that predates the setting behaves as before.
+	 *
+	 * @return bool
+	 */
+	private function antispam_allowed_before_consent() {
+		$settings = $this->get_faz_settings();
+		if ( ! isset( $settings['script_blocking'] ) || ! is_array( $settings['script_blocking'] )
+			|| ! array_key_exists( 'allow_antispam_before_consent', $settings['script_blocking'] ) ) {
+			return true;
+		}
+		return false !== $settings['script_blocking']['allow_antispam_before_consent'];
+	}
+
+	/**
+	 * Category a built-in provider pattern is blocked under.
+	 *
+	 * The catalogue files reCAPTCHA, hCaptcha and Turnstile (and the WPForms /
+	 * Ninja Forms CAPTCHA handles) as necessary, and necessary patterns are
+	 * never blocked. With "Allow anti-spam services before consent" off that
+	 * would leave the switch doing nothing unless the owner also wrote a custom
+	 * rule, so those patterns are held under functional instead, the category
+	 * a CAPTCHA belongs to once it is not treated as strictly necessary (#343).
+	 * The category must be one the visitor can accept: a hidden category never
+	 * reaches the banner, so a CAPTCHA held under it would stay blocked for
+	 * good. Functional first, then uncategorized, then any other category the
+	 * banner shows. Falling back to necessary would let the CAPTCHA load
+	 * before consent with the switch off, so that happens only on a site
+	 * whose banner offers nothing but necessary, where nothing could hold it.
+	 *
+	 * @param string   $category         Category from the provider catalogue.
+	 * @param string   $pattern          The provider pattern.
+	 * @param string[] $valid_categories Category slugs that exist on this site.
+	 * @return string
+	 */
+	private function known_provider_category( $category, $pattern, $valid_categories ) {
+		if ( 'necessary' !== $category ) {
+			return $category;
+		}
+		if ( 1 !== preg_match( '/recaptcha|hcaptcha|turnstile/i', (string) $pattern ) ) {
+			return $category;
+		}
+		if ( $this->antispam_allowed_before_consent() ) {
+			return $category;
+		}
+		$consentable = array_values( array_intersect( $this->get_consentable_category_slugs(), $valid_categories ) );
+		foreach ( array( 'functional', 'uncategorized' ) as $preferred ) {
+			if ( in_array( $preferred, $consentable, true ) ) {
+				return $preferred;
+			}
+		}
+		return isset( $consentable[0] ) ? $consentable[0] : $category;
+	}
+
+	/**
+	 * Slugs of the categories a visitor can accept in the banner: visible,
+	 * not necessary, not wordpress-internal (the same filter as
+	 * get_cookie_groups()). Cached for the request.
+	 *
+	 * @return string[]
+	 */
+	private function get_consentable_category_slugs() {
+		if ( null !== $this->consentable_categories_cache ) {
+			return $this->consentable_categories_cache;
+		}
+		$slugs = array();
+		foreach ( \FazCookie\Admin\Modules\Cookies\Includes\Category_Controller::get_instance()->get_items() as $cat_data ) {
+			$category = new \FazCookie\Admin\Modules\Cookies\Includes\Cookie_Categories( $cat_data );
+			$slug     = $category->get_slug();
+			if ( false === $category->get_visibility() || in_array( $slug, array( 'necessary', 'wordpress-internal' ), true ) ) {
+				continue;
+			}
+			$slugs[] = $slug;
+		}
+		$this->consentable_categories_cache = $slugs;
+		return $slugs;
+	}
+
+	/**
+	 * Script Blocking Exceptions as the blocker should honour them.
+	 *
+	 * With "Allow anti-spam services before consent" off, the CAPTCHA entries a
+	 * fresh install stores there are dropped: they are the plugin's default,
+	 * not a choice the owner made, and since every exception wins over every
+	 * rule they would keep reCAPTCHA live and make the switch a no-op on a
+	 * default install (#343). Only exact copies of those shipped strings go;
+	 * any other entry, including a broader "recaptcha" the owner typed, stays.
+	 *
+	 * @return string[]
+	 */
+	private function get_user_whitelist_patterns() {
+		$settings = $this->get_faz_settings();
+		$patterns = isset( $settings['script_blocking']['whitelist_patterns'] )
+			? array_values( array_filter( array_map( 'sanitize_text_field', (array) $settings['script_blocking']['whitelist_patterns'] ) ) )
+			: array();
+		if ( $this->antispam_allowed_before_consent() ) {
+			return $patterns;
+		}
+		$shipped = array_map( 'strtolower', Settings::DEFAULT_ANTISPAM_EXCEPTIONS );
+		return array_values(
+			array_filter(
+				$patterns,
+				function ( $pattern ) use ( $shipped ) {
+					return ! in_array( strtolower( trim( $pattern ) ), $shipped, true );
+				}
+			)
+		);
+	}
+
+	/**
 	 * Build and cache the whitelist array (once per request).
 	 *
 	 * @return string[]
@@ -8024,17 +8162,17 @@ class Frontend {
 		// global and 'akismet' (a server-side filter with no browser asset that
 		// needs unblocking) — both are generic handles the rule above rightly
 		// rejects.
-		$whitelist = array_merge(
-			$whitelist,
-			array(
-				'google.com/recaptcha',
-				// phpcs:ignore PluginCheck.CodeAnalysis.Offloading.OffloadedContent -- Matching a third-party challenge URL in the consent whitelist; this string does not load a plugin asset.
-				'gstatic.com/recaptcha',
-				'hcaptcha.com',
-				// phpcs:ignore PluginCheck.CodeAnalysis.Offloading.OffloadedContent -- Matching a third-party challenge URL in the consent whitelist; this string does not load a plugin asset.
-				'challenges.cloudflare.com/turnstile',
-			)
-		);
+		//
+		// Whether a CAPTCHA counts as strictly necessary is the site owner's
+		// call, not ours: some legal advisors (notably in Germany) want
+		// reCAPTCHA held until consent because it sends data to Google. The
+		// switch is on by default, so nothing changes for existing sites; off,
+		// these endpoints leave the whitelist, the shipped CAPTCHA exceptions
+		// are ignored (get_user_whitelist_patterns()) and the catalogue holds
+		// them under functional (known_provider_category()) (#343).
+		if ( $this->antispam_allowed_before_consent() ) {
+			$whitelist = array_merge( $whitelist, self::ANTISPAM_CHALLENGE_PATTERNS );
+		}
 
 		// ── WooCommerce core infrastructure ──
 		if ( class_exists( 'WooCommerce', false ) ) {
@@ -8053,11 +8191,7 @@ class Frontend {
 		}
 
 		// Merge user-defined whitelist patterns from Settings → Script Blocking.
-		$faz_settings_wl = $this->get_faz_settings();
-		$user_patterns   = isset( $faz_settings_wl['script_blocking']['whitelist_patterns'] )
-			? array_filter( array_map( 'sanitize_text_field', (array) $faz_settings_wl['script_blocking']['whitelist_patterns'] ) )
-			: array();
-		$whitelist = array_merge( $whitelist, $user_patterns );
+		$whitelist = array_merge( $whitelist, $this->get_user_whitelist_patterns() );
 
 		// Sanitise: trim, deduplicate, remove empty strings (stripos('x','') === 0 always).
 		$this->whitelist_cache = array_values(
@@ -9296,6 +9430,7 @@ class Frontend {
 		// 2. Known providers database.
 		$known_map        = Known_Providers::get_pattern_map();
 		foreach ( $known_map as $pattern => $category ) {
+			$category = $this->known_provider_category( $category, $pattern, $valid_categories );
 			if ( 'necessary' === $category ) {
 				continue;
 			}
@@ -13059,9 +13194,7 @@ class Frontend {
 			return $this->whitelisted_cookie_patterns_cache;
 		}
 		$settings       = $this->get_faz_settings();
-		$user_whitelist = isset( $settings['script_blocking']['whitelist_patterns'] )
-			? array_values( array_filter( array_map( 'sanitize_text_field', (array) $settings['script_blocking']['whitelist_patterns'] ) ) )
-			: array();
+		$user_whitelist = $this->get_user_whitelist_patterns();
 		$this->whitelisted_cookie_patterns_cache = $this->compute_whitelisted_cookie_patterns( $user_whitelist, $this->get_valid_category_slugs() );
 		return $this->whitelisted_cookie_patterns_cache;
 	}
