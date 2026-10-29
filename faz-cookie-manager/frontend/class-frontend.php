@@ -268,6 +268,8 @@ class Frontend {
 	private $definition_category_memo_dirty = false;
 	private $cookie_allowed_cache = array();
 	private $server_cookie_guard_started = false;
+	/** @var bool Whether this request printed the banner stylesheet as a non-blocking media="print" link. */
+	private $banner_css_non_blocking = false;
 	/**
 	 * Precomputed provider-pattern metadata (lowercased pattern, URL-vs-code
 	 * classification) for the output-buffer matching hot loop.
@@ -410,9 +412,11 @@ class Frontend {
 		add_filter( 'wp_redirect', array( $this, 'filter_server_cookies_before_redirect' ), PHP_INT_MAX, 2 );
 		add_filter( 'script_loader_tag', array( $this, 'filter_script_loader_tag' ), 10, 3 );
 		add_filter( 'script_loader_tag', array( $this, 'defer_runtime_script_tag' ), 25, 2 );
+		add_filter( 'script_loader_tag', array( $this, 'prioritize_runtime_script_tag' ), 26, 2 );
 		// After every enqueue hook has run, before anything is printed.
 		add_action( 'wp_print_scripts', array( $this, 'warn_on_undeferred_handles' ), PHP_INT_MAX );
 		add_filter( 'style_loader_tag', array( $this, 'filter_style_loader_tag' ), 10, 4 );
+		add_filter( 'style_loader_tag', array( $this, 'mark_banner_stylesheet' ), 15, 2 );
 
 		// Auto-exclusion from cache/optimization plugins' defer + delay +
 		// combine + minify features. Consent banners MUST run before
@@ -498,6 +502,50 @@ class Frontend {
 			// Autoptimize exclude helper.
 			add_filter( 'autoptimize_filter_js_exclude', array( $this, 'autoptimize_exclude_own_scripts' ) );
 
+			// WP-Optimize "Minify" reads none of the data-* hints either: on 4.x it
+			// merged script.min.js, the config file, a11y AND the inline bootstrap
+			// into a deferred wpo-minify-header bundle, so the bootstrap ran after
+			// the parse it is meant to guard. Its exclusion list is filterable by
+			// URL substring (WP_Optimize_Minify_Functions::get_default_ignore()).
+			add_filter( 'wp-optimize-minify-default-exclusions', array( $this, 'wpo_exclude_own_scripts' ) );
+
+			// SiteGround Optimizer (Speed Optimizer). Its minify, async and
+			// combine passes exclude by script handle; "Remove Query Strings"
+			// by URL substring, and it stripped the `?ver=` from script.min.js on
+			// 7.x, which is the runtime-skew hazard the LiteSpeed `_litespeed_rm_qs`
+			// escape guards against.
+			add_filter( 'sgo_js_minify_exclude', array( $this, 'sgo_exclude_own_handles' ) );
+			add_filter( 'sgo_js_async_exclude', array( $this, 'sgo_exclude_own_handles' ) );
+			add_filter( 'sgo_javascript_combine_exclude_ids', array( $this, 'sgo_exclude_own_handles' ) );
+			add_filter( 'sgo_css_minify_exclude', array( $this, 'sgo_exclude_own_handles' ) );
+			add_filter( 'sgo_css_combine_exclude', array( $this, 'sgo_exclude_own_handles' ) );
+			add_filter( 'sgo_rqs_exclude', array( $this, 'sgo_exclude_own_urls' ) );
+			add_filter( 'sgo_javascript_combine_excluded_internal_paths', array( $this, 'sgo_exclude_own_urls' ) );
+			add_filter( 'sgo_javascript_combine_excluded_inline_content', array( $this, 'rocket_exclude_own_inline' ) );
+
+			// Hummingbird Asset Optimization asks per handle whether a resource
+			// may be minified or combined (core/modules/minify/class-minify-group.php).
+			add_filter( 'wphb_minify_resource', array( $this, 'hummingbird_keep_own_resource' ), 10, 2 );
+			add_filter( 'wphb_combine_resource', array( $this, 'hummingbird_keep_own_resource' ), 10, 2 );
+
+			// Jetpack Boost. "Defer non-essential JavaScript" moves every script
+			// tag to the end of the document unless it carries its ignore
+			// attribute; the filter receives the matched tags and returns the
+			// ones still to move. "Concatenate JS" asks `js_do_concat` per
+			// handle (and already skips deferred handles on its own).
+			add_filter( 'jetpack_boost_render_blocking_js_exclude_scripts', array( $this, 'jetpack_boost_keep_own_scripts' ) );
+			add_filter( 'js_do_concat', array( $this, 'jetpack_boost_do_concat' ), 10, 2 );
+			add_filter( 'css_do_concat', array( $this, 'jetpack_boost_do_concat' ), 10, 2 );
+
+			// W3 Total Cache "Minify (auto)" reads none of the data-* hints: on
+			// 2.8.x it folded script.min.js, the content-hashed config file and
+			// a11y into its own deferred bundle (wp-content/cache/minify/*.js).
+			// Its per-tag seam is this pair of filters (Minify_AutoJs.php /
+			// Minify_AutoCss.php, `$do_tag_minification`); returning false
+			// leaves the tag exactly as it was printed.
+			add_filter( 'w3tc_minify_js_do_tag_minification', array( $this, 'w3tc_keep_own_tag' ), 10, 3 );
+			add_filter( 'w3tc_minify_css_do_tag_minification', array( $this, 'w3tc_keep_own_tag' ), 10, 3 );
+
 			// Cross-version FlyingPress compatibility — DO NOT remove any of these
 			// as "dead code", each covers a different FlyingPress line (verified
 			// against FlyingPress 5.5.0 source):
@@ -563,6 +611,15 @@ class Frontend {
 		// part of the FlyingPress reports in issue #125. Registered
 		// unconditionally: with FlyingPress absent the filter never runs.
 		add_filter( 'flying_press_is_cacheable', array( $this, 'flying_press_is_cacheable' ) );
+
+		// Super Page Cache decides on its own bypass list and then REPLACES
+		// Cache-Control with its Cloudflare value (`s-maxage=31536000`): on
+		// 5.3.x the crawler-only render went out as cacheable for a year at
+		// the edge. Its `swcfpc_cache_bypass` filter is asked right before
+		// that, after every FAZ veto has defined DONOTCACHEPAGE. A page-cache
+		// veto, not an optimiser exclusion, so it is registered outside the
+		// `faz_auto_exclude_cache_plugins` block, like the FlyingPress one.
+		add_filter( 'swcfpc_cache_bypass', array( $this, 'super_page_cache_bypass' ) );
 
 		// Content-level blocking (defense-in-depth — runs before output buffer).
 		add_filter( 'the_content', array( $this, 'filter_content_blocking' ), 1000 );
@@ -819,18 +876,20 @@ class Frontend {
 			// the container. The id selector outranks WP's zero-specificity
 			// :where(), and border-radius is unaffected.
 			$css .= '#faz-consent{border-style:none}';
-			$css .= '.faz-hidden{display:none!important;visibility:hidden!important}'
-				. '.faz-consent-bridge{width:0;height:0;border:0}'
-				// Inline age-confirmation row (GDPR Art. 8) injected by script.js
-				// above the accept surfaces. Inherits the banner's text direction
-				// (RTL support) from its container. The [hidden] attribute keeps
-				// the validation message out of the flow until an un-affirmed
-				// accept reveals it.
-				. '.faz-age-confirm{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;margin:0 0 12px;font-size:13px;line-height:1.4}'
+			// Inline age-confirmation row (GDPR Art. 8) injected by script.js
+			// above the accept surfaces. Inherits the banner's text direction
+			// (RTL support) from its container. The [hidden] attribute keeps
+			// the validation message out of the flow until an un-affirmed
+			// accept reveals it.
+			$css .= '.faz-age-confirm{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;margin:0 0 12px;font-size:13px;line-height:1.4}'
 				. '.faz-age-confirm-cb{margin:2px 0 0;flex:0 0 auto}'
 				. '.faz-age-confirm-label{cursor:pointer}'
-				. '.faz-age-confirm-error{flex-basis:100%;margin:2px 0 0;color:#b00020;font-size:12px}'
-				. '.video-placeholder-normal,.video-placeholder-youtube{min-height:200px;display:flex;align-items:center;justify-content:center;width:100%;max-width:100%;box-sizing:border-box}';
+				. '.faz-age-confirm-error{flex-basis:100%;margin:2px 0 0;color:#b00020;font-size:12px}';
+			// The rules that style PAGE content rather than the banner. Kept in
+			// the full stylesheet too, so every delivery path stays complete
+			// (the [faz_cookie_settings] button rules are already in it, via
+			// prepare_banner_styles()).
+			$css .= self::page_utility_css();
 			$css_handle = $this->plugin_name . '-css';
 			// Serve the compiled banner CSS (~30 KB) as a real, content-hashed
 			// stylesheet instead of inlining it into every page's <head> where
@@ -845,7 +904,33 @@ class Frontend {
 				$external_css_url = $this->get_static_asset_url( 'banner-' . md5( $css ) . '.css', $css );
 			}
 			if ( '' !== $external_css_url ) {
-				wp_enqueue_style( $css_handle, $external_css_url, array(), null );
+				/**
+				 * Whether the external banner stylesheet loads without blocking
+				 * the first paint.
+				 *
+				 * Nothing on the page needs it before script.js runs: the banner
+				 * is built from a <script type="text/template"> by script.js, and
+				 * the few rules that style server-rendered page content
+				 * (.faz-hidden on blocked embeds, the placeholder floor, the
+				 * [faz_cookie_settings] button) are printed inline below. So the
+				 * link is printed as media="print" — fetched at low priority,
+				 * never render-blocking — and script.js switches it to "all"
+				 * and holds the banner reveal until it has loaded. No inline
+				 * onload handler is used, so strict CSPs (script-src-attr) are
+				 * unaffected. Return false to restore a render-blocking link.
+				 *
+				 * @since 1.34.4
+				 * @param bool $non_blocking Default true.
+				 */
+				$this->banner_css_non_blocking = (bool) apply_filters( 'faz_banner_css_non_blocking', true );
+				wp_enqueue_style( $css_handle, $external_css_url, array(), null, $this->banner_css_non_blocking ? 'print' : 'all' );
+				if ( $this->banner_css_non_blocking ) {
+					$page_handle = $css_handle . '-page';
+					wp_register_style( $page_handle, false, array(), $this->version );
+					wp_enqueue_style( $page_handle );
+					// Same LiteSpeed exclusion marker as the inline fallback below.
+					wp_add_inline_style( $page_handle, '/* faz-cookie-manager/assets/ */' . self::page_content_css() . self::pending_banner_css() );
+				}
 			} else {
 				wp_register_style( $css_handle, false, array(), $this->version );
 				wp_enqueue_style( $css_handle );
@@ -1418,6 +1503,64 @@ class Frontend {
 		// inline bootstrap plus the runtime's <script src>. Returning null from
 		// a tag filter drops all of it from the page — the consent banner with
 		// it. Same guard tag_own_scripts_nooptimize() already uses.
+		return is_string( $new_tag ) ? $new_tag : $tag;
+	}
+
+	/**
+	 * Fetch the consent runtime at high priority.
+	 *
+	 * Chrome downloads deferred scripts at low priority, behind the page's
+	 * images, and the banner cannot paint until the runtime has run. On a shop
+	 * home page (wp.org topic render-blocking-requests-2) script.min.js
+	 * finished downloading at 2.8 s on a throttled mobile load, and the banner
+	 * text — the largest text block, so PageSpeed's LCP element — painted
+	 * after it. With fetchpriority="high" on the runtime alone, the same page
+	 * measured LCP 3.31 s → 3.02 s (median of 8 interleaved runs each), for a
+	 * 0.16 s later first paint. The config file and the banner stylesheet keep
+	 * their priority, and nothing else changes in when the runtime executes:
+	 * defer still holds the config → runtime order. Only the external runtime
+	 * tag is touched, so the alternative-asset (inline) mode is unaffected.
+	 *
+	 * @param string $tag    Rendered script markup for the handle.
+	 * @param string $handle Script handle.
+	 * @return string
+	 */
+	public function prioritize_runtime_script_tag( $tag, $handle ) {
+		if ( is_admin() || $this->plugin_name !== $handle ) {
+			return $tag;
+		}
+		/**
+		 * Whether the consent runtime is fetched with fetchpriority="high".
+		 *
+		 * @since 1.34.4
+		 * @param bool $high Default true.
+		 */
+		if ( ! apply_filters( 'faz_runtime_fetchpriority', true ) ) {
+			return $tag;
+		}
+		// A priority registered for the handle through WordPress (6.9+:
+		// wp_script_add_data( $handle, 'fetchpriority', … ) or the
+		// 'fetchpriority' script arg) is a deliberate choice. 'auto' prints no
+		// attribute and 'low' can be lifted to 'auto' by a dependent, so the
+		// markup alone cannot show it: read the registration and keep it.
+		if ( function_exists( 'wp_scripts' ) ) {
+			$registered = wp_scripts()->get_data( $handle, 'fetchpriority' );
+			if ( is_string( $registered ) && '' !== $registered ) {
+				return $tag;
+			}
+		}
+		$id      = preg_quote( $handle . '-js', '#' );
+		$new_tag = preg_replace_callback( '#<script(?=[\s/>])(' . self::ATTR_WALK . ')(?:/\s*+)?>#i', function ( $match ) use ( $id ) {
+			$attributes = $match[1];
+			if ( ! preg_match( '/(?:^|\s)src\s*=/i', $attributes )
+				|| ! preg_match( '#(?:^|\s)id\s*=\s*([\'"])' . $id . '\1#i', $attributes )
+				|| preg_match( '/(?:^|\s)fetchpriority\s*=/i', $attributes ) ) {
+				return $match[0];
+			}
+			return '<script fetchpriority="high"' . $attributes . '>';
+		}, $tag );
+		// Same guard as defer_runtime_script_tag(): a PCRE failure must not
+		// drop the bootstrap and the runtime from the page.
 		return is_string( $new_tag ) ? $new_tag : $tag;
 	}
 
@@ -3317,7 +3460,7 @@ class Frontend {
 		// denied `consent default` behind the gtag snippets it must precede,
 		// and Google treats a tag that fires without a default as granted.
 		$hints = apply_filters( 'faz_auto_exclude_cache_plugins', true )
-			? ' data-no-defer="1" data-no-optimize="1" data-no-minify="1" data-cfasync="false" data-ao-skip="1"'
+			? ' data-no-defer="1" data-no-optimize="1" data-no-minify="1" data-cfasync="false" data-ao-skip="1" data-noptimize="1"'
 			: '';
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- inline JS bootstrap; the id is a plugin constant passed through esc_attr, $hints is a literal, and every interpolated value is a bool/int or wp_json_encode of plugin-controlled constants, no user input.
@@ -10487,6 +10630,109 @@ class Frontend {
 	}
 
 	/**
+	 * Rules for the [faz_cookie_settings] "manage consent preferences" button.
+	 *
+	 * Not the floating .faz-btn-revisit widget. Rendered inside page content
+	 * (outside #faz-consent), so it can't inherit the banner's scoped
+	 * rules — replicate the primary "accept" button here. The COLOUR
+	 * properties consume the same --faz-accept-button-* custom properties
+	 * the admin sets in Banner > Colours, which script.js exposes on :root;
+	 * the --faz-btn-* sizing properties (font/line-height/padding/radius)
+	 * are static design constants shared with the template's .faz-btn rule
+	 * (never JS-set), so the gdpr.json defaults below are the effective
+	 * values and the button still looks right before JS runs.
+	 *
+	 * @return string
+	 */
+	private static function settings_button_css() {
+		return '.faz-cookie-settings-btn{'
+			. 'display:inline-block;'
+			. 'font-family:inherit;'
+			. 'font-size:var(--faz-btn-font-size,14px);'
+			. 'line-height:var(--faz-btn-line-height,24px);'
+			. 'font-weight:500;'
+			. 'padding:var(--faz-btn-padding,8px 27px);'
+			. 'border-radius:var(--faz-btn-border-radius,2px);'
+			. 'border-width:var(--faz-accept-button-border-width,2px);'
+			. 'border-style:var(--faz-accept-button-border-style,solid);'
+			. 'border-color:var(--faz-accept-button-border-color,#1863dc);'
+			. 'background:var(--faz-accept-button-background-color,#1863dc);'
+			. 'color:var(--faz-accept-button-color,#ffffff);'
+			. 'white-space:nowrap;text-align:center;text-transform:none;'
+			. 'text-decoration:none;text-shadow:none;box-shadow:none;'
+			. 'cursor:pointer;min-height:0;-webkit-appearance:none;appearance:none;'
+			. 'transition:opacity .15s ease;'
+			. '}'
+			. '.faz-cookie-settings-btn:hover{opacity:.8;}'
+			. '.faz-cookie-settings-btn:focus-visible{'
+			. 'outline:2px solid var(--faz-accept-button-background-color,#1863dc);outline-offset:2px;'
+			. '}';
+	}
+
+	/**
+	 * Rules that style server-rendered PAGE content rather than the banner.
+	 *
+	 * They have to apply at first paint, before script.js runs, so when the
+	 * banner stylesheet is delivered as a non-blocking link they are also
+	 * printed inline:
+	 *
+	 * - `.faz-hidden` hides the original of a blocked social embed that
+	 *   process_social_embeds() marks server-side; a late rule would let the
+	 *   tracker-backed markup show for a moment.
+	 * - `.video-placeholder-*` is the size floor for the placeholders
+	 *   _fazAddPlaceholder inserts next to blocked iframes (outside
+	 *   #faz-consent, so the scoped template rules never reach them); without
+	 *   it lazy-loaded iframes (Bricks/Elementor/Divi Video) collapse to 0×0
+	 *   (issue #87).
+	 * - `.faz-consent-bridge` keeps the consent-forwarding iframe invisible.
+	 * - The [faz_cookie_settings] button sits in the page content.
+	 *
+	 * @return string
+	 */
+	private static function page_content_css() {
+		return self::page_utility_css() . self::settings_button_css();
+	}
+
+	/**
+	 * Keep the rendered-but-unrevealed banner out of the page flow.
+	 *
+	 * script.js inserts the overlay, revisit widget, notice and preference
+	 * modal at the top of <body> before the non-blocking banner stylesheet
+	 * may have arrived. #faz-style-inline only hides them (visibility keeps
+	 * their space), and the rules that take them out of the flow live in
+	 * that stylesheet, so until it applies the invisible preference modal
+	 * pushed the page down by its full height and everything jumped back on
+	 * load — a layout shift on exactly the slow visits the non-blocking
+	 * delivery is for. Scoped to `html:not(.faz-ready)`: script.js adds
+	 * faz-ready only once the sheet applies, so the banner's own positioning
+	 * takes over in the same frame. pointer-events:none because the
+	 * container and modal boxes themselves carry no data-faz-tag, so they stay
+	 * hit-testable while transparent: fixed at the top of the viewport they
+	 * would swallow taps meant for the page. Printed only with the non-blocking link;
+	 * a render-blocking sheet is always in place before the banner exists.
+	 *
+	 * @return string
+	 */
+	private static function pending_banner_css() {
+		return 'html:not(.faz-ready) .faz-overlay,html:not(.faz-ready) .faz-btn-revisit-wrapper,'
+			. 'html:not(.faz-ready) .faz-consent-container,html:not(.faz-ready) .faz-modal{position:fixed!important;pointer-events:none!important}';
+	}
+
+	/**
+	 * The utility half of page_content_css(): every rule except the
+	 * [faz_cookie_settings] button, which prepare_banner_styles() already
+	 * puts in the banner stylesheet.
+	 *
+	 * @return string
+	 */
+	private static function page_utility_css() {
+		return '.faz-hidden{display:none!important;visibility:hidden!important}'
+			. '.faz-hide{display:none!important}'
+			. '.faz-consent-bridge{width:0;height:0;border:0}'
+			. '.video-placeholder-normal,.video-placeholder-youtube{min-height:200px;display:flex;align-items:center;justify-content:center;width:100%;max-width:100%;box-sizing:border-box}';
+	}
+
+	/**
 	 * Assemble the exact CSS shipped for a banner template.
 	 *
 	 * The live jurisdiction endpoint must return the same scoped/reset/utility
@@ -10554,39 +10800,7 @@ class Frontend {
 		$css_fixes .= '#faz-consent [data-faz-tag="detail-consent-id"],.faz-modal [data-faz-tag="detail-consent-id"]{display:block;margin:12px 24px;font-size:12px;color:var(--faz-detail-description-color,#212121);}'
 			. '#faz-consent [data-faz-tag="detail-consent-id"][hidden],.faz-modal [data-faz-tag="detail-consent-id"][hidden]{display:none;}'
 			. '#faz-consent [data-faz-tag="detail-consent-id"] input,.faz-modal [data-faz-tag="detail-consent-id"] input{display:block;width:100%;max-width:100%;margin-top:4px;padding:6px 8px;border:1px solid #c5c7cb;border-radius:4px;background:transparent;color:inherit;font-size:12px;}';
-		// [faz_cookie_settings] "manage consent preferences" button (not the
-		// floating .faz-btn-revisit widget). Rendered inside page content
-		// (outside #faz-consent), so it can't inherit the banner's scoped
-		// rules — replicate the primary "accept" button here. The COLOUR
-		// properties consume the same --faz-accept-button-* custom properties
-		// the admin sets in Banner > Colours, which script.js exposes on :root;
-		// the --faz-btn-* sizing properties (font/line-height/padding/radius)
-		// are static design constants shared with the template's .faz-btn rule
-		// (never JS-set), so the gdpr.json defaults below are the effective
-		// values and the button still looks right before JS runs.
-		$css_settings_btn = '.faz-cookie-settings-btn{'
-			. 'display:inline-block;'
-			. 'font-family:inherit;'
-			. 'font-size:var(--faz-btn-font-size,14px);'
-			. 'line-height:var(--faz-btn-line-height,24px);'
-			. 'font-weight:500;'
-			. 'padding:var(--faz-btn-padding,8px 27px);'
-			. 'border-radius:var(--faz-btn-border-radius,2px);'
-			. 'border-width:var(--faz-accept-button-border-width,2px);'
-			. 'border-style:var(--faz-accept-button-border-style,solid);'
-			. 'border-color:var(--faz-accept-button-border-color,#1863dc);'
-			. 'background:var(--faz-accept-button-background-color,#1863dc);'
-			. 'color:var(--faz-accept-button-color,#ffffff);'
-			. 'white-space:nowrap;text-align:center;text-transform:none;'
-			. 'text-decoration:none;text-shadow:none;box-shadow:none;'
-			. 'cursor:pointer;min-height:0;-webkit-appearance:none;appearance:none;'
-			. 'transition:opacity .15s ease;'
-			. '}'
-			. '.faz-cookie-settings-btn:hover{opacity:.8;}'
-			. '.faz-cookie-settings-btn:focus-visible{'
-			. 'outline:2px solid var(--faz-accept-button-background-color,#1863dc);outline-offset:2px;'
-			. '}';
-		$css = $css_reset . $css . $css_fixes . $css_settings_btn . self::compact_mobile_css( $layout );
+		$css = $css_reset . $css . $css_fixes . self::settings_button_css() . self::compact_mobile_css( $layout );
 
 		set_transient( $cache_key, $css, DAY_IN_SECONDS );
 		return $css;
@@ -11198,6 +11412,10 @@ class Frontend {
 	 *
 	 * The attributes below are recognised by the major plugins:
 	 *   - `data-no-defer`        — LiteSpeed Cache, Hummingbird, SG Optimizer
+	 *   - `data-noptimize`       — Autoptimize: the tag is neither merged, moved
+	 *                              nor delayed. Breeze (its fork) only stops
+	 *                              moving it; its merge ignores every exclusion
+	 *                              (see readme.txt, Breeze)
 	 *   - `data-no-optimize`     — LiteSpeed Cache, WP Rocket, W3 Total Cache
 	 *   - `data-no-minify`       — WP Rocket
 	 *   - `data-cfasync="false"` — Autoptimize, Cloudflare Rocket Loader
@@ -11218,7 +11436,7 @@ class Frontend {
 		if ( ! $this->is_own_script_handle( $handle ) ) {
 			return $tag;
 		}
-		$hints = ' data-no-defer="1" data-no-optimize="1" data-no-minify="1" data-cfasync="false" data-ao-skip="1"';
+		$hints = ' data-no-defer="1" data-no-optimize="1" data-no-minify="1" data-cfasync="false" data-ao-skip="1" data-noptimize="1"';
 		// `script_loader_tag` receives the *composite* markup for this
 		// handle — the external `<script src>` PLUS any inline before/after
 		// snippets registered via `wp_add_inline_script()` concatenated in
@@ -11295,8 +11513,29 @@ class Frontend {
 			$attributes['data-no-minify']   = '1';
 			$attributes['data-cfasync']     = 'false';
 			$attributes['data-ao-skip']     = '1';
+			$attributes['data-noptimize']   = '1';
 		}
 		return $attributes;
+	}
+
+	/**
+	 * Mark the non-blocking banner stylesheet so script.js can find it.
+	 *
+	 * script.js switches this link from media="print" to "all" and holds the
+	 * banner reveal until it has loaded (_fazWhenBannerCssReady). The marker
+	 * is an attribute rather than the generated id so it survives a renamed
+	 * plugin handle and CDN URL rewriting alike.
+	 *
+	 * @param string $tag    Rendered stylesheet link.
+	 * @param string $handle Registered WordPress style handle.
+	 * @return string
+	 */
+	public function mark_banner_stylesheet( $tag, $handle ) {
+		if ( ! $this->banner_css_non_blocking || $this->plugin_name . '-css' !== $handle || false !== strpos( $tag, 'data-faz-banner-css' ) ) {
+			return $tag;
+		}
+		$tagged = preg_replace( '/<link\b/i', '<link data-faz-banner-css="1"', $tag, 1 );
+		return is_string( $tagged ) ? $tagged : $tag;
 	}
 
 	/**
@@ -11912,6 +12151,209 @@ class Frontend {
 			}
 		}
 		return $excluded;
+	}
+
+	/**
+	 * W3 Total Cache auto-minify: keep every FAZ tag out of its bundles.
+	 *
+	 * `$tag` is the full `<script …>` / `<link …>` markup and `$file` the URL
+	 * W3TC resolved for it. A FAZ tag is recognised by the hints every own
+	 * handle carries (tag_own_scripts_nooptimize(), filter_style_loader_tag())
+	 * or, for a tag printed by another path, by its own asset URL.
+	 *
+	 * @param bool   $do   Whether W3TC may minify/combine this tag.
+	 * @param string $tag  The tag markup.
+	 * @param string $file The resolved file URL.
+	 * @return bool
+	 */
+	public function w3tc_keep_own_tag( $do, $tag = '', $file = '' ) {
+		if ( ! $do ) {
+			return $do;
+		}
+		$tag = is_string( $tag ) ? $tag : '';
+		if ( false !== strpos( $tag, 'data-no-minify' ) || false !== strpos( $tag, 'data-no-optimize' ) ) {
+			return false;
+		}
+		foreach ( array( 'faz-cookie-manager', 'faz-fw', 'faz-dsar-form', 'faz-dnsmpi-form' ) as $keyword ) {
+			if ( false !== strpos( $tag, $keyword ) ) {
+				return false;
+			}
+		}
+		if ( is_string( $file ) && '' !== $file && $this->is_own_asset_url( $file ) ) {
+			return false;
+		}
+		return $do;
+	}
+
+	/**
+	 * SiteGround Optimizer: own handles for its minify / async / combine
+	 * exclusion lists (compared with in_array() against the handle).
+	 *
+	 * @param array $handles Handles SiteGround Optimizer already excludes.
+	 * @return array
+	 */
+	public function sgo_exclude_own_handles( $handles ) {
+		if ( ! is_array( $handles ) ) {
+			return $handles;
+		}
+		// Every handle enqueue_scripts() registers, under both base names
+		// (the default and the alternative-asset family), plus the shortcode
+		// handles. See is_own_script_handle() for the prefix contract.
+		$own = array( 'faz-dsar-form', 'faz-dnsmpi-form', 'faz-dsar' );
+		foreach ( array( (string) $this->plugin_name, 'faz-fw' ) as $base ) {
+			if ( '' === $base ) {
+				continue;
+			}
+			$own[] = $base;
+			// The non-blocking stylesheet also registers a separate inline
+			// -css-page handle for page content and pending-banner rules.
+			foreach ( array( '-static-config', '-css', '-css-page', '-gcm', '-tcf-cmp', '-a11y', '-wca', '-microsoft-consent' ) as $suffix ) {
+				$own[] = $base . $suffix;
+			}
+		}
+		// The combinator compares the printed tag's id attribute, which carries
+		// WordPress's `-js` / `-css` suffix (and `-js-before` / `-js-extra` on
+		// the inline parts); the minify and async passes compare the handle.
+		foreach ( $own as $handle ) {
+			foreach ( array( '-js', '-js-before', '-js-after', '-js-extra', '-js-translations', '-css' ) as $suffix ) {
+				$own[] = $handle . $suffix;
+			}
+		}
+		foreach ( $own as $handle ) {
+			if ( ! in_array( $handle, $handles, true ) ) {
+				$handles[] = $handle;
+			}
+		}
+		return $handles;
+	}
+
+	/**
+	 * Super Page Cache: bypass its cache (and keep its Cloudflare Cache-Control
+	 * off the response) on every response FAZ vetoed.
+	 *
+	 * @param bool $bypass Whether Super Page Cache already bypasses this response.
+	 * @return bool
+	 */
+	public function super_page_cache_bypass( $bypass ) {
+		if ( $bypass ) {
+			return $bypass;
+		}
+		return defined( 'DONOTCACHEPAGE' ) && DONOTCACHEPAGE;
+	}
+
+	/**
+	 * SiteGround Optimizer "Remove Query Strings": keep `?ver=` on FAZ assets
+	 * (compared as URL substrings).
+	 *
+	 * @param array $urls URL fragments SiteGround Optimizer already excludes.
+	 * @return array
+	 */
+	public function sgo_exclude_own_urls( $urls ) {
+		if ( ! is_array( $urls ) ) {
+			return $urls;
+		}
+		foreach ( array( 'faz-cookie-manager', 'faz-fw' ) as $keyword ) {
+			if ( ! in_array( $keyword, $urls, true ) ) {
+				$urls[] = $keyword;
+			}
+		}
+		return $urls;
+	}
+
+	/**
+	 * Hummingbird Asset Optimization: never minify or combine an own handle.
+	 *
+	 * @param bool   $allowed Whether Hummingbird may process the resource.
+	 * @param string $handle  Script or style handle.
+	 * @return bool
+	 */
+	public function hummingbird_keep_own_resource( $allowed, $handle = '' ) {
+		if ( $allowed && ( 'faz-dsar' === $handle || $this->is_own_script_handle( $handle ) ) ) {
+			return false;
+		}
+		return $allowed;
+	}
+
+	/**
+	 * Jetpack Boost "Defer non-essential JavaScript": keep FAZ tags where
+	 * they are. A moved tag would run after every third-party script that
+	 * was not moved, and the inline bootstrap would guard nothing.
+	 *
+	 * Boost builds the list with preg_match_all( …, PREG_OFFSET_CAPTURE ), so
+	 * each element is `array( markup, byte offset )`
+	 * (class-render-blocking-js.php, get_script_tags()); a plain string is
+	 * accepted as well in case that ever changes. An element of any other
+	 * shape is left to Boost.
+	 *
+	 * @param array $script_tags Script tags Boost is about to move to the end of the document.
+	 * @return array The same list without FAZ's own tags.
+	 */
+	public function jetpack_boost_keep_own_scripts( $script_tags ) {
+		if ( ! is_array( $script_tags ) ) {
+			return $script_tags;
+		}
+		return array_values(
+			array_filter(
+				$script_tags,
+				function ( $entry ) {
+					$tag = $entry;
+					if ( is_array( $entry ) ) {
+						$tag = isset( $entry[0] ) ? $entry[0] : '';
+					}
+					if ( ! is_string( $tag ) || '' === $tag ) {
+						return true;
+					}
+					if ( false !== strpos( $tag, 'data-no-defer' ) ) {
+						return false;
+					}
+					foreach ( array( 'faz-cookie-manager', 'faz-fw', 'faz-dsar-form', 'faz-dnsmpi-form', '_fazBootstrap', '_fazConfig', '_fazCfg', '_fazGcm', '_fazTcfConfig', '_fazConsentLog' ) as $keyword ) {
+						if ( false !== strpos( $tag, $keyword ) ) {
+							return false;
+						}
+					}
+					return true;
+				}
+			)
+		);
+	}
+
+	/**
+	 * Jetpack Boost (and WordPress.com page-optimize) concatenation: never
+	 * fold an own handle into a combined file.
+	 *
+	 * @param bool   $do_concat Whether the handle may be concatenated.
+	 * @param string $handle    Script or style handle.
+	 * @return bool
+	 */
+	public function jetpack_boost_do_concat( $do_concat, $handle = '' ) {
+		// 'faz-dsar' is the data request form's stylesheet handle; the script
+		// handles all carry a prefix is_own_script_handle() knows.
+		if ( $do_concat && ( 'faz-dsar' === $handle || $this->is_own_script_handle( $handle ) ) ) {
+			return false;
+		}
+		return $do_concat;
+	}
+
+	/**
+	 * WP-Optimize minify: keep FAZ assets out of its merged bundles.
+	 *
+	 * The list is matched as URL substrings against every script and
+	 * stylesheet WP-Optimize considers; a match is printed untouched, with its
+	 * inline before/after data in place.
+	 *
+	 * @param array $exclusions WP-Optimize's default exclusion list.
+	 * @return array
+	 */
+	public function wpo_exclude_own_scripts( $exclusions ) {
+		if ( ! is_array( $exclusions ) ) {
+			return $exclusions;
+		}
+		foreach ( array( 'faz-cookie-manager', 'faz-fw' ) as $keyword ) {
+			if ( ! in_array( $keyword, $exclusions, true ) ) {
+				$exclusions[] = $keyword;
+			}
+		}
+		return $exclusions;
 	}
 
 	/**

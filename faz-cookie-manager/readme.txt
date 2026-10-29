@@ -4,7 +4,7 @@ Donate link: https://buymeacoffee.com/fabiodalez
 Tags: cookie, gdpr, ccpa, consent, privacy
 Requires at least: 5.0
 Tested up to: 7.1
-Stable tag: 1.34.3
+Stable tag: 1.34.4
 Requires PHP: 7.4
 License: GPL-3.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
@@ -412,9 +412,18 @@ When jurisdiction enforcement is off, Cache Compatibility Mode can still keep no
 = Verified compatible (no extra configuration needed) =
 * **LiteSpeed Cache** — uses the explicit `litespeed_control_set_nocache` action, `LSCACHE_NO_CACHE` and the `X-LiteSpeed-Cache-Control` header. Every page-cache bypass also sends `Cache-Control: private, no-store`, `CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control` and `Surrogate-Control: no-store` for QUIC.cloud and other edges. FAZ asset URLs carry `_litespeed_rm_qs=0`, so "Remove Query Strings" keeps their `?ver=` and an update is never served with the previous consent runtime.
 * **WP Rocket** — honors `DONOTCACHEPAGE` natively.
-* **W3 Total Cache** — honors `DONOTCACHEPAGE` natively; its object and database caches keep working on the pages FAZ keeps out of the page cache.
+* **W3 Total Cache** — honors `DONOTCACHEPAGE` natively; its object and database caches keep working on the pages FAZ keeps out of the page cache. "Minify (auto)" leaves the consent runtime, its configuration file and the banner stylesheet out of its bundles (through `w3tc_minify_js_do_tag_minification` / `w3tc_minify_css_do_tag_minification`).
 * **WP Super Cache** — honors `DONOTCACHEPAGE` natively.
-* **Hummingbird (WPMU DEV)** — honors `DONOTCACHEPAGE` natively.
+* **WP Fastest Cache** — reads `DONOTCACHEPAGE` only on a 403, a Wordfence 503 and under the Divi theme, and never reads `Cache-Control`, so on its own it stored the crawler-only render, a consenting visitor's render and the data request form page for everyone. The plugin calls its per-page exclusion (`wpfc_exclude_current_page()`) on every one of its page vetoes, and purges it on save.
+* **Hummingbird (WPMU DEV)** — honors `DONOTCACHEPAGE` natively; Asset Optimization is asked to leave FAZ handles alone (`wphb_minify_resource`, `wphb_combine_resource`), and the page cache is purged on save.
+* **WP-Optimize** — honors `DONOTCACHEPAGE` natively; the page cache is purged on save, and "Minify" keeps FAZ assets out of its merged files (`wp-optimize-minify-default-exclusions`), since merging them put the inline bootstrap into a deferred bundle.
+* **Surge** — honors `DONOTCACHEPAGE` and `Cache-Control: no-cache`; a save and a plugin update expire its whole cache through its `surge_flush_actions` list and flag expiry.
+* **Jetpack Boost (Cache Site Pages)** — honors `DONOTCACHEPAGE`; purged on save and on update through `jetpack_boost_clear_page_cache_all`. "Defer non-essential JavaScript" leaves FAZ tags in place (`jetpack_boost_render_blocking_js_exclude_scripts`) and "Concatenate JS/CSS" skips FAZ handles (`js_do_concat` / `css_do_concat`).
+* **Autoptimize** — FAZ assets are excluded (`autoptimize_filter_js_exclude`) and every FAZ tag carries `data-noptimize`, so "also minify excluded files" and inline aggregation leave them alone.
+* **SiteGround Optimizer (Speed Optimizer)** — minify, async and combine exclude FAZ handles (`sgo_js_minify_exclude`, `sgo_js_async_exclude`, `sgo_javascript_combine_exclude_ids`, `sgo_css_minify_exclude`) and "Remove Query Strings" keeps `?ver=` on FAZ assets (`sgo_rqs_exclude`), so an update is never served with the previous runtime.
+* **Super Page Cache (formerly WP Cloudflare Super Page Cache)** — purged on save and on update through `swcfpc_purge_cache`. On its own it replaces the response's `Cache-Control` with its Cloudflare value (`s-maxage=31536000`) on every page it does not bypass, including the crawler-only render and a consenting visitor's render; the plugin now answers its `swcfpc_cache_bypass` filter on every page it vetoes, so those responses leave as `no-store` and are stored neither on disk nor at the edge.
+* **Cachify** — honors `DONOTCACHEPAGE` natively (DB and disk modes); purged on save and on update through its `cachify_flush_cache` action.
+* **Breeze** — honors `DONOTCACHEPAGE` natively and is purged on save. Its "Group JS" / "Include inline JS" / "Delay all JavaScript" passes merge every script, FAZ's included, into one bundle that Breeze runs at DOMContentLoaded: the banner still appears without interaction and the server-side blocking holds, but the early inline guard runs with that bundle instead of before the runtime downloads. Breeze offers no filter a plugin can use to stay out of the merge (its own "Exclude JavaScript" list and the `data-noptimize` attribute only stop a tag being moved); to keep the early guard, switch off "Include inline JS" and add `faz-cookie-manager` to Breeze → Exclude JavaScript.
 * **FlyingPress** — the plugin purges FlyingPress's cached HTML pages automatically whenever a banner, cookie, category or setting is saved, so a change never keeps serving stale banner markup. Only the rendered HTML is purged (that is all a consent change alters); FlyingPress's site-wide preload crawl is not triggered, matching the purge-only behaviour of the other supported caches. FlyingPress does not honor `DONOTCACHEPAGE`, so the plugin also hooks its documented `flying_press_is_cacheable` filter to skip caching on country-dependent pages, matching the bypass every other supported cache gets. The consent scripts are excluded automatically from minification, "Delay all JavaScript" and "Delay third-party scripts", and the banner selectors are kept by "Remove unused CSS": FlyingPress 4.x receives them through its delay/defer filters, FlyingPress 5 through its in-memory configuration, without changing your saved FlyingPress settings. If any FlyingPress pass still rewrites a FAZ script or the banner stylesheet (for example a "Delay selected scripts" keyword such as gtag or recaptcha that also matches the banner configuration), the plugin restores it before FlyingPress caches the page and writes one note a day to the PHP error log. If you see that note, or the banner appears only after the first click, add `faz-cookie-manager` to the exclusions of both "Delay JavaScript" and "Delay third-party scripts", and remove any "Delay selected scripts" keyword that matches the plugin.
 * **Redis Object Cache / Memcached (persistent object caches)** — the plugin's internal banner/cookie caches are epoch-invalidated on save, which works on external object-cache backends too (fixed: previously a stale copy could survive in Redis and a banner save appeared not to stick).
 * **Cloudflare APO** — honors the `Cache-Control: no-store` header, and the banner REST endpoint backs it with `CDN-Cache-Control: no-store` / `Cloudflare-CDN-Cache-Control: no-store` so country-dependent output is not stored at the edge even where the edge is configured to override browser cache directives. With CF in front, also enable the trust filter: it adds `Vary: CF-IPCountry` to the banner REST endpoint's *non*-country-dependent responses (`public, max-age=300`), so CF keys those short-lived entries per country instead of sharing one entry across countries.
@@ -423,7 +432,7 @@ When jurisdiction enforcement is off, Cache Compatibility Mode can still keep no
 = Known limitations =
 
 * **CDNs without origin Cache-Control honoring** (e.g. some legacy CloudFront configurations) — verify the response Cache-Control header reaches the edge. If not, add a CF-IPCountry or country-based cache key rule at the CDN level.
-* **Minor / regional cache plugins** (Comet Cache, Cachify, Swift Performance Lite) — not formally tested. Most still honor `DONOTCACHEPAGE`; verify by inspecting the response Cache-Control on a country-targeted page.
+* **Comet Cache** (last released 2017) and **Swift Performance Lite** — not verified. Comet Cache reads `DONOTCACHEPAGE` and is purged on update, but it could not be made to cache at all on the PHP 8.4 / WordPress 7.0 test site, so nothing about it was measured.
 
 Override the bypass logic per request via the `faz_country_dependent_banner_output` filter (return false to force the cache to ignore the country dimension on a specific URL).
 
@@ -433,6 +442,17 @@ The full changelog (every release back to 1.0.0) lives at:
 https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/blob/main/CHANGELOG.md
 and on the GitHub Releases page:
 https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/releases
+
+= 1.34.4 =
+* Fixed: WooCommerce product galleries remain visible when Divi regroups server-rendered images. Moving unchanged resources preserves the gallery; changed URL attributes still require a consent verdict.
+* Fixed: Video-placeholder buttons use service colours darkened enough for readable white text at WCAG AA contrast.
+* Changed: The external consent runtime is fetched at high priority without changing execution order. The effect depends on the page; faz_runtime_fetchpriority can disable the hint when it competes with the main image on returning visits.
+* Fixed: On Safari and iOS 16, a JavaScript scope incompatibility could leave the consent banner invisible. Runtime bindings are now accessible to the affected engine.
+* Fixed: The banner stylesheet loads without blocking the first paint. Page-content utilities remain inline, and the banner waits for its stylesheet before appearing, with a bounded fallback if the download fails.
+* Fixed: The first country override now persists when no overrides have been saved yet. The form also prevents overlapping submissions from silently replacing one another. Dynamically inserted scripts parked in place are reconsidered after consent. Restoration retains their original type, checks their service category and executes eligible scripts only once.
+* Fixed: WP Fastest Cache and Super Page Cache now honour every FAZ page-cache veto, preventing crawler or visitor-specific output from becoming the shared page. Surge, Jetpack Boost and Cachify page caches are purged after relevant changes and plugin updates. W3 Total Cache, WP-Optimize, SiteGround Optimizer, Hummingbird and Jetpack Boost receive their supported optimisation exclusions; own tags also carry the Autoptimize exclusion marker.
+* Fixed: Published cookie policies with incomplete required details are listed in wp-admin, with the missing fields and the visitor-visible outcome for each jurisdiction. The check includes older pages and ignores escaped shortcode examples.
+* Changed: The anti-spam setting help now explains the category fallback, custom exceptions and the Necessary-only banner case.
 
 = 1.34.3 =
 * Added: A new switch under Settings → Script Blocking, "Allow anti-spam services before consent", decides whether Google reCAPTCHA, hCaptcha and Cloudflare Turnstile load before consent (#343). It is on by default, so nothing changes for existing sites. Switched off, those services are held under the Functional category until the visitor accepts it, with no custom rule needed, and the CAPTCHA entries the plugin adds to Script Blocking Exceptions by default are ignored; exceptions written by the administrator still apply. Forms protected by a CAPTCHA cannot be submitted before consent while it is off.
