@@ -16,10 +16,10 @@
  * Plugin Name:       FAZ Cookie Manager
  * Plugin URI:        https://github.com/fabiodalez-dev/faz-cookie-manager
  * Description:       A comprehensive GDPR/CCPA cookie consent manager with built-in cookie scanner, local consent logging, Google Consent Mode v2, and IAB TCF v2.3 support.
- * Version:           1.34.4
+ * Version:           1.34.5
  * Requires at least: 5.0
  * Tested up to:      7.1
- * Stable tag:        1.34.4
+ * Stable tag:        1.34.5
  * Requires PHP:      7.4
  * Author:            Fabio D'Alessandro
  * Author URI:        https://fabiodalez.it/
@@ -51,7 +51,7 @@ if ( ! defined( 'WPINC' ) ) {
 	die;
 }
 
-define( 'FAZ_VERSION', '1.34.4' );
+define( 'FAZ_VERSION', '1.34.5' );
 define( 'FAZ_PLUGIN_BASENAME', plugin_basename( __FILE__ ) );
 define( 'FAZ_PLUGIN_BASEPATH', plugin_dir_path( __FILE__ ) );
 define( 'FAZ_PLUGIN_FILENAME', __FILE__ );
@@ -738,7 +738,16 @@ function faz_is_auto_granted_consent_cookie( $cookie = '' ) {
  */
 function faz_set_browser_cookie( $name, $value, $expires, $domain = null, $same_site = 'Lax', $force_secure = null ) {
 	$name = faz_consent_cookie_name( $name );
-	$domain = null === $domain ? faz_get_cookie_domain() : (string) $domain;
+	if ( null === $domain ) {
+		$domain = faz_get_cookie_domain();
+		// On a host outside that scope (a mirror, a translation proxy that
+		// forwards its own Host) the browser would reject the cookie outright.
+		if ( '' !== $domain && ! empty( $_SERVER['HTTP_HOST'] ) && function_exists( 'faz_cookie_domain_for_host' ) ) {
+			$domain = faz_cookie_domain_for_host( $domain, sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ) ) );
+		}
+	} else {
+		$domain = (string) $domain;
+	}
 	$same_site = in_array( $same_site, array( 'Lax', 'Strict', 'None' ), true ) ? $same_site : 'Lax';
 	$secure    = null === $force_secure ? is_ssl() : (bool) $force_secure;
 	// Browsers reject SameSite=None without Secure. Fold an invalid caller
@@ -947,6 +956,13 @@ $faz_loader->run();
 // Registered after the core CLI loader so Frontend can query it during
 // its own "is banner disabled" checks.
 \FazCookie\Includes\Integrations\Paid_Memberships_Pro::get_instance()->register_hooks();
+
+// CORS for the origins this site is also served on (Settings → Trusted
+// Alternate Domains, auto-detected GTranslate domains, `faz_trusted_origins`),
+// for the plugin's own /faz/v1/ routes and its public (nopriv) admin-ajax
+// actions only, faz_public_ajax_actions() —
+// faz_allowed_http_origins() returns core's list untouched for anything else.
+add_filter( 'allowed_http_origins', 'faz_allowed_http_origins' );
 
 // Cookie Policy Generator (Spec 002) — registers the [faz_cookie_policy]
 // shortcode and the faz/v1/cookie-policy/* REST API. Always loads (no

@@ -170,6 +170,10 @@
 			if (data.consent_forwarding && Array.isArray(data.consent_forwarding.target_domains)) {
 				data.consent_forwarding.target_domains = data.consent_forwarding.target_domains.join('\n');
 			}
+			// Trusted alternate domains: same array <-> one-per-line textarea.
+			if (data.trusted_origins && Array.isArray(data.trusted_origins.alternate_domains)) {
+				data.trusted_origins.alternate_domains = data.trusted_origins.alternate_domains.join('\n');
+			}
 			// PMP exempt levels: array of IDs -> comma-separated string for the input field.
 			if (data.integrations && data.integrations.paid_memberships_pro
 				&& Array.isArray(data.integrations.paid_memberships_pro.exempt_levels)) {
@@ -443,6 +447,15 @@
 					.map(function (s) { return s.trim(); })
 					.filter(Boolean);
 			}
+			if (formData.trusted_origins && typeof formData.trusted_origins.alternate_domains === 'string') {
+				// Lines or commas, the same rule the server applies to a REST
+				// payload (sanitize_option()): `example.de, example.pl` on one
+				// line is two entries, not one that gets dropped.
+				formData.trusted_origins.alternate_domains = formData.trusted_origins.alternate_domains
+					.split(/[\r\n,]+/)
+					.map(function (s) { return s.trim(); })
+					.filter(Boolean);
+			}
 
 			// Target regions: replace boolean from generic serializer with proper array
 			if (!formData.geolocation) formData.geolocation = {};
@@ -507,8 +520,22 @@
 			// Warn the admin instead of letting the generic success toast imply
 			// the A/B test is actually running.
 			var saveWarnings = collectSaveWarnings(current);
+			var submittedDomains = (current.trusted_origins && Array.isArray(current.trusted_origins.alternate_domains))
+				? current.trusted_origins.alternate_domains
+				: null;
 
-			return FAZ.post('settings', current).then(function () {
+			return FAZ.post('settings', current).then(function (saved) {
+				// The server keeps only what faz_normalize_trusted_origin()
+				// accepts, normalised (lowercase, origin only) and de-duplicated;
+				// collectSaveWarnings() has already named the lines it refuses.
+				// Show what was actually stored rather than the raw input.
+				var kept = saved && saved.trusted_origins && Array.isArray(saved.trusted_origins.alternate_domains)
+					? saved.trusted_origins.alternate_domains
+					: null;
+				if (submittedDomains && kept) {
+					var field = document.getElementById('faz-trusted-alternate-domains');
+					if (field) field.value = kept.join('\n');
+				}
 				return saveWarnings;
 			});
 		}).then(function (saveWarnings) {
@@ -618,6 +645,44 @@
 		}
 
 		abTestWarnings.forEach(function (w) { saveWarnings.push(w); });
+
+		// Trusted Alternate Domains: the server keeps a bare host or an http(s)
+		// URL and drops anything else (faz_normalize_trusted_origin()), so a
+		// wildcard, a typo or a single-label name vanished under a success
+		// toast. Name the dropped entries here. Mirrors the server's host rule:
+		// labels of letters, digits and hyphens, at least two of them, or an IP.
+		if (current.trusted_origins && current.trusted_origins.alternate_domains) {
+			var entries = current.trusted_origins.alternate_domains;
+			if (typeof entries === 'string') {
+				entries = entries.split(/[\r\n,]+/);
+			}
+			var hostRe = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+			var ipRe = /^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f:]+)$/i;
+			var dropped = (Array.isArray(entries) ? entries : []).filter(function (entry) {
+				var raw = String(entry || '').trim();
+				if (!raw) return false;
+				var host = raw;
+				var urlMatch = /^https?:\/\/([^/?#]+)/i.exec(raw);
+				if (urlMatch) {
+					// Authority without user info or port: what the server parses.
+					host = urlMatch[1].replace(/^[^@]*@/, '').replace(/:\d+$/, '');
+				} else if (raw.indexOf('://') !== -1) {
+					return true;
+				} else {
+					host = raw.replace(/[/?#].*$/, '').replace(/\.$/, '');
+				}
+				host = host.replace(/^\[|\]$/g, '');
+				if (ipRe.test(host) && (host.indexOf(':') !== -1 || /^\d/.test(host))) return false;
+				if (host.indexOf(':') !== -1) return true;
+				return !hostRe.test(host);
+			});
+			if (dropped.length) {
+				saveWarnings.push(fazI18n(
+					'settings.trustedOriginsDropped',
+					'These Trusted Alternate Domains entries are neither a domain nor an http(s) URL and will not be saved: %s'
+				).replace('%s', dropped.join(', ')));
+			}
+		}
 
 		// Choosing the footer link without a passing check saves fine — the
 		// server simply keeps forcing the revisit widget on, which is the

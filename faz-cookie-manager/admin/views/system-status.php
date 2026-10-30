@@ -57,6 +57,229 @@ $blocked_server_cookies = is_array( $blocked_server_cookies ) ? array_reverse( $
 		<div class="faz-card-body">
 			<table class="faz-status-table">
 				<tr><td><?php esc_html_e( 'Plugin Version', 'faz-cookie-manager' ); ?></td><td><code><?php echo esc_html( FAZ_VERSION ); ?></code></td></tr>
+				<?php
+				// The version the frontend runtime bundle was built for, read from
+				// the file the frontend actually serves (script.min.js unless
+				// SCRIPT_DEBUG). FAZ_VERSION comes from the main plugin file, so the
+				// two differ only when the plugin directory mixes two releases — an
+				// interrupted update, a partial deployment or staging sync — or when
+				// a second, older copy of the plugin defines FAZ_VERSION first. That
+				// install prints `?ver=<old>` on a newer bundle and fails in ways
+				// that look like anything but a version problem (wp.org thread
+				// "WooCommerce Express Checkout 3rd party buttons do not appear":
+				// `script.min.js?ver=1.28.1` printing a 1.34 message). Read only on
+				// this page.
+				$faz_bundle_file    = FAZ_PLUGIN_BASEPATH . 'frontend/js/script' . faz_asset_suffix( 'frontend/js/script' ) . '.js';
+				$faz_bundle_version = '';
+				if ( is_readable( $faz_bundle_file ) ) {
+					// phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- local plugin file, read-only diagnostic.
+					$faz_bundle_source = (string) file_get_contents( $faz_bundle_file );
+					if ( preg_match( '/_FAZ_BUILD\s*=\s*["\']([0-9]+(?:\.[0-9]+)+(?:-(?:rc|beta|alpha)\.?[0-9]+)?)\+/', $faz_bundle_source, $faz_bundle_match )
+						|| preg_match( '/["\']([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-(?:rc|beta|alpha)\.?[0-9]+)?)\+[A-Za-z0-9._-]+["\']/', $faz_bundle_source, $faz_bundle_match ) ) {
+						$faz_bundle_version = $faz_bundle_match[1];
+					}
+					unset( $faz_bundle_source );
+				}
+				// Every installed copy of the plugin, active or not: two folders
+				// carrying the same plugin are how an "updated" site keeps loading
+				// the old main file.
+				if ( ! function_exists( 'get_plugins' ) ) {
+					require_once ABSPATH . 'wp-admin/includes/plugin.php';
+				}
+				$faz_copies = array();
+				foreach ( (array) get_plugins() as $faz_plugin_file => $faz_plugin_data ) {
+					if ( isset( $faz_plugin_data['Name'] ) && 'FAZ Cookie Manager' === $faz_plugin_data['Name'] ) {
+						$faz_copies[ $faz_plugin_file ] = isset( $faz_plugin_data['Version'] ) ? (string) $faz_plugin_data['Version'] : '';
+					}
+				}
+				$faz_bundle_skew = '' !== $faz_bundle_version && FAZ_VERSION !== $faz_bundle_version;
+				?>
+				<tr>
+					<td><?php esc_html_e( 'Runtime Bundle', 'faz-cookie-manager' ); ?></td>
+					<td>
+						<code><?php echo esc_html( '' !== $faz_bundle_version ? $faz_bundle_version : __( 'unknown', 'faz-cookie-manager' ) ); ?></code>
+						<?php if ( $faz_bundle_skew ) : ?>
+							&#10060; <?php esc_html_e( 'differs from the plugin version', 'faz-cookie-manager' ); ?>
+							<div class="faz-help">
+								<?php
+								printf(
+									/* translators: 1: version of the frontend runtime bundle, 2: plugin version from the main plugin file. */
+									esc_html__( 'The frontend runtime is %1$s but the plugin reports %2$s: the plugin directory mixes files from two versions (an interrupted update, a partial deployment or staging sync, or a second copy of the plugin). Reinstall the plugin through Plugins → Add New → Upload Plugin or the updater, then purge every page, CDN and optimiser cache.', 'faz-cookie-manager' ),
+									esc_html( $faz_bundle_version ),
+									esc_html( FAZ_VERSION )
+								);
+								?>
+							</div>
+						<?php elseif ( '' !== $faz_bundle_version ) : ?>
+							&#9989; <?php esc_html_e( 'matches the plugin version', 'faz-cookie-manager' ); ?>
+						<?php endif; ?>
+						<?php if ( count( $faz_copies ) > 1 ) : ?>
+							<div class="faz-status-detail">
+								&#10060; <?php esc_html_e( 'More than one copy of the plugin is installed.', 'faz-cookie-manager' ); ?>
+								<?php
+								$faz_copy_lines = array();
+								foreach ( $faz_copies as $faz_plugin_file => $faz_plugin_version ) {
+									$faz_copy_lines[] = dirname( $faz_plugin_file ) . ( '' !== $faz_plugin_version ? ' (' . $faz_plugin_version . ')' : '' );
+								}
+								printf(
+									/* translators: 1: number of installed copies of the plugin, 2: comma-separated list of plugin folders with their versions. */
+									esc_html__( '%1$s copies of FAZ Cookie Manager are installed: %2$s. Keep one: delete the others from Plugins (or wp-content/plugins) so only one main file can load.', 'faz-cookie-manager' ),
+									esc_html( number_format_i18n( count( $faz_copies ) ) ),
+									esc_html( implode( ', ', $faz_copy_lines ) )
+								);
+								?>
+							</div>
+						<?php endif; ?>
+					</td>
+				</tr>
+				<?php
+				// The content-hashed files the frontend loads from uploads, and how
+				// the server actually serves the most recently used configuration
+				// file (mtime is its last-used marker). The console says only "the
+				// static configuration file failed to load" and the Network tab
+				// shows a 200 from disk cache; what decides it is here: a zero-byte
+				// or short copy, a non-JavaScript Content-Type (with nosniff the
+				// browser refuses to run it), or an HTML page from a login or
+				// staging-protection layer. One loopback request, 5 s at most,
+				// remembered for two minutes.
+				$faz_assets_dir   = \FazCookie\Includes\Filesystem::get_instance()->get_uploads_dir( 'faz-cookie-manager/assets' );
+				$faz_assets_path  = is_array( $faz_assets_dir ) && ! empty( $faz_assets_dir['path'] ) ? (string) $faz_assets_dir['path'] : '';
+				$faz_assets_url   = is_array( $faz_assets_dir ) && ! empty( $faz_assets_dir['url'] ) ? (string) $faz_assets_dir['url'] : '';
+				$faz_config_files = '' !== $faz_assets_path ? glob( $faz_assets_path . 'config-*.js' ) : array();
+				$faz_config_files = is_array( $faz_config_files ) ? $faz_config_files : array();
+				$faz_banner_files = '' !== $faz_assets_path ? glob( $faz_assets_path . 'banner-*.css' ) : array();
+				$faz_banner_files = is_array( $faz_banner_files ) ? $faz_banner_files : array();
+				$faz_empty_assets = 0;
+				$faz_latest_file  = '';
+				$faz_latest_mtime = 0;
+				foreach ( array_merge( $faz_config_files, $faz_banner_files ) as $faz_asset ) {
+					if ( 0 === (int) @filesize( $faz_asset ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- a vanished file reads as empty, which is what it is to a browser.
+						++$faz_empty_assets;
+					}
+				}
+				foreach ( $faz_config_files as $faz_asset ) {
+					$faz_mtime = (int) @filemtime( $faz_asset ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+					if ( $faz_mtime >= $faz_latest_mtime ) {
+						$faz_latest_mtime = $faz_mtime;
+						$faz_latest_file  = $faz_asset;
+					}
+				}
+				$faz_probe = null;
+				if ( '' !== $faz_latest_file && '' !== $faz_assets_url ) {
+					$faz_probe_url = $faz_assets_url . basename( $faz_latest_file );
+					$faz_probe_key = 'faz_system_status_asset_probe';
+					$faz_probe     = get_transient( $faz_probe_key );
+					if ( ! is_array( $faz_probe ) || ! isset( $faz_probe['url'], $faz_probe['error'] ) || $faz_probe['url'] !== $faz_probe_url ) {
+						$faz_response = wp_remote_get(
+							add_query_arg( 'faz-status', (string) time(), $faz_probe_url ),
+							array(
+								'timeout'     => 5,
+								'redirection' => 2,
+								// The relaxed local-request verification only for the
+								// site's own host: an uploads URL offloaded to a CDN is a
+								// remote host and keeps WordPress's default verification.
+								'sslverify'   => ( wp_parse_url( $faz_probe_url, PHP_URL_HOST ) === wp_parse_url( home_url( '/' ), PHP_URL_HOST ) )
+									? apply_filters( 'https_local_ssl_verify', false )
+									: apply_filters( 'https_ssl_verify', true ),
+							)
+						);
+						if ( is_wp_error( $faz_response ) ) {
+							$faz_probe = array(
+								'url'   => $faz_probe_url,
+								'error' => $faz_response->get_error_message(),
+							);
+						} else {
+							$faz_probe_body = (string) wp_remote_retrieve_body( $faz_response );
+							$faz_probe      = array(
+								'url'     => $faz_probe_url,
+								'error'   => '',
+								'status'  => (int) wp_remote_retrieve_response_code( $faz_response ),
+								'type'    => implode( ', ', (array) wp_remote_retrieve_header( $faz_response, 'content-type' ) ),
+								'nosniff' => false !== stripos( implode( ', ', (array) wp_remote_retrieve_header( $faz_response, 'x-content-type-options' ) ), 'nosniff' ),
+								'bytes'   => strlen( $faz_probe_body ),
+								'disk'    => (int) @filesize( $faz_latest_file ), // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+								'html'    => '<' === substr( ltrim( $faz_probe_body ), 0, 1 ),
+								'shape'   => 0 === strpos( ltrim( $faz_probe_body, "\xEF\xBB\xBF \t\r\n" ), 'window._fazStaticConfig=' ),
+							);
+							unset( $faz_probe_body );
+						}
+						set_transient( $faz_probe_key, $faz_probe, 2 * MINUTE_IN_SECONDS );
+					}
+				}
+				$faz_probe_issues = array();
+				if ( $faz_empty_assets > 0 ) {
+					$faz_probe_issues[] = sprintf(
+						/* translators: %s: number of generated asset files that are empty on disk. */
+						_n( '%s generated file is empty on disk; the next page view rewrites it, then purge any CDN or server cache of wp-content/uploads/faz-cookie-manager/assets/.', '%s generated files are empty on disk; the next page views rewrite them, then purge any CDN or server cache of wp-content/uploads/faz-cookie-manager/assets/.', $faz_empty_assets, 'faz-cookie-manager' ),
+						number_format_i18n( $faz_empty_assets )
+					);
+				}
+				if ( is_array( $faz_probe ) && '' === $faz_probe['error'] ) {
+					if ( 200 !== $faz_probe['status'] ) {
+						$faz_probe_issues[] = sprintf(
+							/* translators: %s: HTTP status code. */
+							__( 'The configuration file is not served (HTTP %s): check the web server, security or staging-protection rules for wp-content/uploads.', 'faz-cookie-manager' ),
+							$faz_probe['status']
+						);
+					} elseif ( $faz_probe['html'] ) {
+						$faz_probe_issues[] = __( 'An HTML page answered instead of the script: a login, maintenance or staging-protection layer intercepts static files under wp-content/uploads. Exempt that folder.', 'faz-cookie-manager' );
+					} elseif ( 0 === $faz_probe['bytes'] || $faz_probe['bytes'] < $faz_probe['disk'] || ! $faz_probe['shape'] ) {
+						$faz_probe_issues[] = sprintf(
+							/* translators: 1: bytes served, 2: bytes on disk. */
+							__( 'The served copy is empty, truncated or rewritten (%1$s of %2$s bytes): purge the server and CDN cache for wp-content/uploads/faz-cookie-manager/assets/, and exclude that folder from minification.', 'faz-cookie-manager' ),
+							number_format_i18n( $faz_probe['bytes'] ),
+							number_format_i18n( $faz_probe['disk'] )
+						);
+					}
+					if ( 200 === $faz_probe['status'] && ! $faz_probe['html'] && ! preg_match( '/javascript|ecmascript/i', $faz_probe['type'] ) ) {
+						$faz_probe_issues[] = sprintf(
+							/* translators: %s: the Content-Type header the file is served with. */
+							__( 'The file is served as "%s", not as JavaScript; with X-Content-Type-Options: nosniff a browser refuses to run it. Map .js to application/javascript for wp-content/uploads in the web server or CDN.', 'faz-cookie-manager' ),
+							'' !== $faz_probe['type'] ? $faz_probe['type'] : 'none'
+						);
+					}
+				}
+				?>
+				<tr>
+					<td><?php esc_html_e( 'Generated Assets', 'faz-cookie-manager' ); ?></td>
+					<td>
+						<code><?php echo esc_html( '' !== $faz_assets_path ? $faz_assets_path : __( 'unavailable', 'faz-cookie-manager' ) ); ?></code>
+						<div class="faz-status-detail">
+							<?php
+							printf(
+								/* translators: 1: number of config-*.js files, 2: number of banner-*.css files. */
+								esc_html__( '%1$s configuration files (config-*.js), %2$s banner stylesheets (banner-*.css).', 'faz-cookie-manager' ),
+								esc_html( number_format_i18n( count( $faz_config_files ) ) ),
+								esc_html( number_format_i18n( count( $faz_banner_files ) ) )
+							);
+							if ( is_array( $faz_probe ) ) {
+								echo '<br>';
+								if ( '' !== $faz_probe['error'] ) {
+									printf(
+										/* translators: 1: file name, 2: error message. */
+										esc_html__( 'Could not request %1$s from the server itself (%2$s). This check needs loopback requests; open the file in a browser and look at its status, Content-Type and size instead.', 'faz-cookie-manager' ),
+										'<code>' . esc_html( basename( $faz_probe['url'] ) ) . '</code>',
+										esc_html( $faz_probe['error'] )
+									);
+								} else {
+									echo wp_kses_post( empty( $faz_probe_issues ) ? faz_status_flag( true ) : faz_status_flag( false ) ) . ' ';
+									printf(
+										/* translators: 1: file name, 2: HTTP status code, 3: Content-Type header, 4: number of bytes served. */
+										esc_html__( 'Most recently used: %1$s — HTTP %2$s, Content-Type "%3$s", %4$s bytes.', 'faz-cookie-manager' ),
+										'<code>' . esc_html( basename( $faz_probe['url'] ) ) . '</code>',
+										esc_html( (string) $faz_probe['status'] ),
+										esc_html( '' !== $faz_probe['type'] ? $faz_probe['type'] : 'none' ),
+										esc_html( number_format_i18n( $faz_probe['bytes'] ) )
+									);
+								}
+							}
+							?>
+						</div>
+						<?php if ( ! empty( $faz_probe_issues ) ) : ?>
+							<div class="faz-help"><?php echo esc_html( implode( ' ', $faz_probe_issues ) ); ?></div>
+						<?php endif; ?>
+					</td>
+				</tr>
 				<tr><td><?php esc_html_e( 'WordPress Version', 'faz-cookie-manager' ); ?></td><td><code><?php echo esc_html( get_bloginfo( 'version' ) ); ?></code></td></tr>
 				<tr><td><?php esc_html_e( 'PHP Version', 'faz-cookie-manager' ); ?></td><td><code><?php echo esc_html( PHP_VERSION ); ?></code></td></tr>
 				<tr><td><?php esc_html_e( 'MySQL Version', 'faz-cookie-manager' ); ?></td><td><code><?php echo esc_html( $wpdb->db_version() ); ?></code></td></tr>
@@ -148,8 +371,30 @@ $blocked_server_cookies = is_array( $blocked_server_cookies ) ? array_reverse( $
 								esc_html( number_format_i18n( $faz_token_days ) )
 							);
 							echo ' ';
-							esc_html_e( 'A request with no same-origin signal, or no token at all, is normally automated traffic — but if that figure tracks your visitor numbers, your pages are being served on a host, scheme or port that differs from your WordPress Address: check that www and apex, http and https, and any non-default port all redirect to the canonical one. A database write failure is always a real visitor whose consent was lost.', 'faz-cookie-manager' );
+							esc_html_e( 'A request with no same-origin signal, or no token at all, is normally automated traffic — but if that figure tracks your visitor numbers, your pages are being served on a host, scheme or port that differs from your WordPress Address: check that www and apex, http and https, and any non-default port all redirect to the canonical one. If the site is served on another domain through a translation proxy (GTranslate, Weglot) or a mirror, add that domain under Settings → Trusted Alternate Domains (or the faz_trusted_origins filter). A database write failure is always a real visitor whose consent was lost.', 'faz-cookie-manager' );
 							echo ' ';
+							// Rate-limited records behind a translation proxy: every
+							// visitor of the translated domains reaches this origin from
+							// the proxy's few addresses, so the 10-second per-address
+							// window collides between unrelated people. Only said where
+							// that topology is known to exist, because on any other site
+							// the generic sentence below is the right one and naming a
+							// vendor's header would only confuse.
+							$faz_proxy_known = ! empty( \FazCookie\Includes\Integrations\Gtranslate::translated_hosts() )
+								|| ( function_exists( 'faz_trusted_origins' ) && ! empty( faz_trusted_origins() ) );
+							if ( $faz_proxy_known && ! empty( $faz_tally['causes']['throttled'] ) ) {
+								echo wp_kses(
+									sprintf(
+										/* translators: 1: the faz_trusted_proxy_cidrs filter name. 2: the faz_proxy_forwarded_header filter name. 3: the HTTP_X_GT_VIEWER_IP $_SERVER key. */
+										esc_html__( 'Rate-limited records on a site served through a translation proxy usually mean that every visitor of the translated domains reaches WordPress from the proxy\'s few addresses and shares one rate-limit window. Ask the proxy provider (GTranslate support) for its server address ranges, declare them with the %1$s filter, and read the visitor\'s own address from the header the proxy forwards (X-GT-Viewer-IP) with the %2$s filter returning %3$s. Forwarded headers are never believed from an undeclared address, because anyone can send them.', 'faz-cookie-manager' ),
+										'<code>faz_trusted_proxy_cidrs</code>',
+										'<code>faz_proxy_forwarded_header</code>',
+										'<code>HTTP_X_GT_VIEWER_IP</code>'
+									),
+									array( 'code' => array() )
+								);
+								echo ' ';
+							}
 							printf(
 								/* translators: %s: length of the reporting window, in days. */
 								esc_html__( 'This tally covers %s days whatever the token window is set to, and counts at most one refusal per visitor per cause every ten seconds, so it is a floor rather than an exact total.', 'faz-cookie-manager' ),
@@ -182,6 +427,44 @@ $blocked_server_cookies = is_array( $blocked_server_cookies ) ? array_reverse( $
 				<tr><td><?php esc_html_e( 'GTM Data Layer', 'faz-cookie-manager' ); ?></td><td><?php echo wp_kses_post( ! empty( $settings['banner_control']['gtm_datalayer'] ) ? faz_status_flag( true ) : faz_status_flag( false ) ); ?></td></tr>
 				<tr><td><?php esc_html_e( 'Age Gate', 'faz-cookie-manager' ); ?></td><td><?php echo wp_kses_post( ! empty( $settings['age_gate']['enabled'] ) ? faz_status_flag( true ) . ' ' . sprintf( /* translators: %d: minimum age in years. */ esc_html__( '(min age %d)', 'faz-cookie-manager' ), absint( $settings['age_gate']['min_age'] ?? 16 ) ) : faz_status_flag( false ) ); ?></td></tr>
 				<tr><td><?php esc_html_e( 'Cross-Domain Consent', 'faz-cookie-manager' ); ?></td><td><?php echo wp_kses_post( ! empty( $settings['consent_forwarding']['enabled'] ) ? faz_status_flag( true ) : faz_status_flag( false ) ); ?></td></tr>
+				<?php
+				// The effective list the same-origin gates read, with where each
+				// entry came from: a refusal tally that keeps counting
+				// `cross_origin` on a proxied site is answered by this row, and
+				// an entry that arrived through the filter is otherwise invisible.
+				$faz_trusted_effective = function_exists( 'faz_trusted_origins' ) ? faz_trusted_origins() : array();
+				$faz_trusted_detected  = \FazCookie\Includes\Integrations\Gtranslate::translated_hosts();
+				$faz_trusted_setting   = array();
+				if ( isset( $settings['trusted_origins']['alternate_domains'] ) && is_array( $settings['trusted_origins']['alternate_domains'] ) && function_exists( 'faz_normalize_trusted_origin' ) ) {
+					$faz_trusted_setting = array_filter( array_map( 'faz_normalize_trusted_origin', $settings['trusted_origins']['alternate_domains'] ) );
+				}
+				?>
+				<tr>
+					<td><?php esc_html_e( 'Trusted Alternate Domains', 'faz-cookie-manager' ); ?></td>
+					<td>
+						<?php if ( empty( $faz_trusted_effective ) ) : ?>
+							<?php esc_html_e( 'None — consent records and Do-Not-Sell submissions are accepted from the WordPress Address only.', 'faz-cookie-manager' ); ?>
+						<?php else : ?>
+							<?php
+							$faz_trusted_lines = array();
+							foreach ( $faz_trusted_effective as $faz_trusted_entry ) {
+								if ( in_array( $faz_trusted_entry, $faz_trusted_detected, true ) ) {
+									$faz_trusted_source = __( 'GTranslate, auto-detected', 'faz-cookie-manager' );
+								} elseif ( in_array( $faz_trusted_entry, $faz_trusted_setting, true ) ) {
+									$faz_trusted_source = __( 'Settings', 'faz-cookie-manager' );
+								} else {
+									$faz_trusted_source = __( 'faz_trusted_origins filter', 'faz-cookie-manager' );
+								}
+								$faz_trusted_lines[] = '<code>' . esc_html( $faz_trusted_entry ) . '</code> (' . esc_html( $faz_trusted_source ) . ')';
+							}
+							echo wp_kses_post( implode( ', ', $faz_trusted_lines ) );
+							?>
+						<?php endif; ?>
+						<?php if ( \FazCookie\Includes\Integrations\Gtranslate::is_active() && empty( $faz_trusted_detected ) ) : ?>
+							<div class="faz-help"><?php esc_html_e( 'GTranslate is active but its settings describe no translated domain of their own (the free widget and the sub-directory plan stay on this host), so nothing was auto-detected.', 'faz-cookie-manager' ); ?></div>
+						<?php endif; ?>
+					</td>
+				</tr>
 				<tr><td><?php esc_html_e( 'Ad-Blocker Compat', 'faz-cookie-manager' ); ?></td><td><?php echo wp_kses_post( ! empty( $settings['banner_control']['alternative_asset_path'] ) ? faz_status_flag( true ) : faz_status_flag( false ) ); ?></td></tr>
 				<tr><td><?php esc_html_e( 'Microsoft UET', 'faz-cookie-manager' ); ?></td><td><?php echo wp_kses_post( ! empty( $settings['microsoft']['uet_consent_mode'] ) ? faz_status_flag( true ) : faz_status_flag( false ) ); ?></td></tr>
 				<tr><td><?php esc_html_e( 'Microsoft Clarity', 'faz-cookie-manager' ); ?></td><td><?php echo wp_kses_post( ! empty( $settings['microsoft']['clarity_consent'] ) ? faz_status_flag( true ) : faz_status_flag( false ) ); ?></td></tr>

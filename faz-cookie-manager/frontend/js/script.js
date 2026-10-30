@@ -4,6 +4,232 @@
 if ( typeof window._fazConfig === 'undefined' && typeof window._fazCfg !== 'undefined' && window._fazCfg !== null ) {
     window._fazConfig = window._fazCfg;
 }
+// Build marker — bump when shipping behavioural changes to this file. Lets
+// `fazcookie._diag().build` reveal at a glance whether a cache (CDN / optimizer)
+// is serving a stale bundle after a plugin update. #auto-show-hardening
+// Declared up here, ahead of everything that can stand the runtime down,
+// because the version-skew check below must run on exactly the page views
+// where the runtime never starts. See the longer note above `_fazRef._diag`.
+const _FAZ_BUILD = '1.34.5+static-config-recovery-and-proxy-hosts';
+// Version skew between this bundle and the PHP side that printed _fazConfig.
+// `_version` is FAZ_VERSION from the main plugin file (it is also the `?ver=`
+// of this script's own URL), and the numeric prefix of _FAZ_BUILD is the
+// release this file shipped with. They differ in two situations, and the
+// direction tells them apart:
+//   - the bundle is NEWER than the page: the HTML was generated before an
+//     update and is still served by a page, CDN or host cache that was not
+//     purged, while the script URL already returns the new file;
+//   - the bundle is OLDER: a cached previous script.min.js, or a plugin
+//     directory that mixes two releases (an update interrupted half-way, a
+//     partial deployment or staging sync, a second copy of the plugin whose
+//     main file defines FAZ_VERSION first). A 1.34 runtime under a 1.28
+//     header reads configuration keys that PHP never prints, and the
+//     breakage looks like anything but a version problem.
+// So say it, once, and change nothing else: this is diagnostic only.
+function _fazCompareVersions(a, b) {
+    var pa = String(a).split(/[.-]/), pb = String(b).split(/[.-]/);
+    for (var i = 0; i < 3; i++) {
+        var d = (parseInt(pa[i], 10) || 0) - (parseInt(pb[i], 10) || 0);
+        if (d) return d > 0 ? 1 : -1;
+    }
+    return 0;
+}
+(function () {
+    try {
+        var serverVersion = window._fazConfig && window._fazConfig._version;
+        var bundleVersion = String(_FAZ_BUILD).split('+')[0];
+        if (typeof serverVersion === 'string' && serverVersion !== '' && serverVersion !== bundleVersion) {
+            var head = '[FAZ Cookie Manager] The runtime bundle is ' + bundleVersion + ' but the PHP side reports ' + serverVersion + ': ';
+            window.console.warn(_fazCompareVersions(bundleVersion, serverVersion) > 0
+                ? head + 'this page\'s HTML was generated before the update and is still being served by a page, CDN or host cache '
+                    + 'that was not purged. Purge those caches; nothing needs reinstalling if this disappears afterwards. '
+                    + 'System Status -> Runtime Bundle reads the file on disk: if it matches the plugin version there, the cache is the cause.'
+                : head + 'either a page, CDN or optimiser cache is still serving the previous script.min.js (purge '
+                    + 'those caches first), or the plugin directory mixes files from two versions (an interrupted update, a partial '
+                    + 'deployment or staging sync, or a second copy of the plugin). If purging does not clear this, reinstall the plugin '
+                    + 'from Plugins -> Add New -> Upload Plugin or through the wp-admin updater, and check wp-content/plugins for '
+                    + 'duplicate FAZ Cookie Manager folders. System Status -> Runtime Bundle reads the file on disk and tells the two apart.');
+        }
+    } catch (e) { /* diagnostic only */ }
+})();
+// The static configuration file (uploads/faz-cookie-manager/assets/
+// config-<md5>.js) is a deferred dependency of this script, printed before
+// it, and it defines window._fazStaticConfig. When it arrives empty, is not
+// executed, or executes after this file, the runtime must not start without
+// the provider rules (see `_fazStaticConfigMissing` below) — and until now it
+// simply stood down for the page view, which on a WooCommerce checkout parks
+// every PayPal / Google Pay / gateway iframe for good. The field cases behind
+// a "200 (disk cache)" that still leaves the global undefined:
+//   - a zero-byte or truncated copy: the name is a content hash, so a copy
+//     that was cut once (a staging clone, a full disk, a bad sync) is cached
+//     by the browser as immutable and stays broken on every reload;
+//   - a non-JS Content-Type with `X-Content-Type-Options: nosniff`: the
+//     browser refuses to execute it and the Network row still reads 200;
+//   - a login or staging-protection layer answering static files with HTML;
+//   - an optimiser (Delay/Defer JS) that re-typed the tag or moved it after
+//     this one.
+// So recover, once, before the merge below: fetch the file again with a
+// cache-busting query and SYNCHRONOUSLY, because everything after this point
+// decides from the merged store and a deferred script cannot wait. The sync
+// request only ever runs on a page that is already broken. The body is
+// exactly `window._fazStaticConfig=<json>;` (Frontend::enqueue_scripts()), so
+// it is parsed with JSON.parse — never eval or new Function, which a strict
+// CSP forbids and which would execute whatever a proxy put in its place.
+// Fail-closed and never throwing: any doubt leaves the store missing and the
+// runtime stands down exactly as it did before, with a precise reason (the
+// `!_fazStore` branch below reads this report).
+const _FAZ_STATIC_CONFIG_PREFIX = 'window._fazStaticConfig=';
+// Matched on the file name only: an uploads offload or CDN rewrite may move
+// the directory, and the recovery below validates whatever it fetches.
+const _FAZ_STATIC_CONFIG_FILE_RE = /\/config-[0-9a-f]{32}\.js(?:[?#]|$)/;
+const _FAZ_STATIC_CONFIG_NAME_RE = /\/config-[0-9a-f]{32}\.js$/;
+function _fazIsStaticConfigUrl(value) {
+    try {
+        var parsed = new URL(value, document.baseURI);
+        return /^(?:http:|https:)$/.test(parsed.protocol) && _FAZ_STATIC_CONFIG_NAME_RE.test(parsed.pathname);
+    } catch (e) { return false; }
+}
+// The recovery request is always made to this page's own origin. The inline
+// URL is absolute on the uploads host, which on a translation proxy, a mirror
+// or a CDN-rewritten page is another origin: a synchronous cross-origin GET is
+// refused by the bootstrap before consent, and uploads send no CORS headers
+// anyway, so it could only ever fail. The page's own tag is preferred when it
+// is already same-origin (a proxy rewrote it); otherwise the content-hashed
+// path is requested from this origin, which a proxy forwards to the site and
+// a CDN-rewritten page still serves. Never a third-party host.
+function _fazStaticConfigRecoveryUrl(candidates) {
+    var origin = window.location && window.location.origin;
+    var valid = [];
+    for (var i = 0; i < candidates.length; i++) {
+        if (!candidates[i] || !_fazIsStaticConfigUrl(candidates[i].url)) continue;
+        var parsed = new URL(candidates[i].url, document.baseURI);
+        if (origin && parsed.origin === origin) return { url: parsed.href, source: candidates[i].source };
+        valid.push({ parsed: parsed, source: candidates[i].source });
+    }
+    if (!valid.length || !origin || 'null' === origin) return null;
+    // Rebase the server's own URL first: its path is the real uploads path,
+    // while a tag rewritten to a CDN may carry the CDN's layout.
+    valid.sort(function (a, b) { return ('inline' === b.source) - ('inline' === a.source); });
+    return { url: origin + valid[0].parsed.pathname + valid[0].parsed.search, source: 'rebased' };
+}
+// JSON syntax alone is not enough: an empty object (or a different cached
+// payload) would start the runtime without its blocking rules. Only the three
+// keys offloaded by PHP belong here; the remaining settings must stay inline.
+function _fazIsRecoveredStaticConfig(value, cfg) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    if (Object.keys(value).some(function (key) {
+        return ['_providersToBlock', '_cookieCategoryMap', '_serviceCatalogue'].indexOf(key) === -1;
+    })) return false;
+    if (!Array.isArray(value._providersToBlock) || value._providersToBlock.some(function (provider) {
+        return !provider || typeof provider.re !== 'string' || !Array.isArray(provider.categories)
+            || provider.categories.some(function (category) { return typeof category !== 'string'; });
+    })) return false;
+    var map = value._cookieCategoryMap;
+    if (!map || typeof map !== 'object' || (Array.isArray(map) && map.length !== 0)
+        || Object.keys(map).some(function (key) { return typeof map[key] !== 'string'; })) return false;
+    var catalogue = value._serviceCatalogue;
+    if ((cfg._perServiceConsent || catalogue !== undefined)
+        && (!catalogue || typeof catalogue !== 'object' || (Array.isArray(catalogue) && catalogue.length !== 0))) return false;
+    return true;
+}
+// Where an optimiser parks a delayed script's URL instead of `src`
+// (Perfmatters, WP Rocket, LiteSpeed, generic lazy loaders).
+const _FAZ_STATIC_CONFIG_SRC_ATTRS = ['src', 'data-src', 'data-pmdelayedscript', 'data-rocket-src', 'data-litespeed-src', 'data-lazy-src'];
+const _fazStaticConfigRecovery = (function () {
+    var report = { attempted: false, ok: false, url: '', source: '', status: 0, contentType: '', nosniff: false, bytes: 0, verdict: '', tag: '' };
+    try {
+        var cfg = window._fazConfig;
+        if (!cfg || !cfg._staticConfigRequired) return report;
+        if (window._fazStaticConfig && typeof window._fazStaticConfig === 'object') return report;
+        var doc = window.document;
+        var tagSrc = function (el) {
+            for (var i = 0; i < _FAZ_STATIC_CONFIG_SRC_ATTRS.length; i++) {
+                var v = el.getAttribute(_FAZ_STATIC_CONFIG_SRC_ATTRS[i]);
+                if (v) return { url: v, attr: _FAZ_STATIC_CONFIG_SRC_ATTRS[i] };
+            }
+            return null;
+        };
+        // How the page's own tag looks says which cause is likely: no tag at
+        // all (removed or combined), a URL parked in a data-* attribute or a
+        // non-JS `type` (delayed by an optimiser), or an ordinary tag (the
+        // copy the browser executed was empty, refused or out of order).
+        var tag = doc ? (doc.getElementById('faz-cookie-manager-static-config-js') || doc.getElementById('faz-fw-static-config-js')) : null;
+        var found = tag ? tagSrc(tag) : null;
+        if (!found && doc) {
+            var scripts = doc.getElementsByTagName('script');
+            for (var s = 0; s < scripts.length && !found; s++) {
+                var candidate = tagSrc(scripts[s]);
+                if (candidate && _FAZ_STATIC_CONFIG_FILE_RE.test(candidate.url)) { tag = scripts[s]; found = candidate; }
+            }
+        }
+        if (tag && found) {
+            var type = (tag.getAttribute('type') || '').toLowerCase();
+            report.tag = ('src' !== found.attr || (type && !/^(?:text\/javascript|application\/javascript)$/.test(type))) ? 'delayed' : 'present';
+        } else {
+            report.tag = 'absent';
+        }
+        // The inline URL is the server's own word and survives an optimiser
+        // that rewrote or removed the tag; the tag is the fallback for a page
+        // cached before the inline key existed, and the one used when a proxy
+        // rewrote it to this host while the inline URL stayed cross-origin
+        // (the scan matches any config-<hash>.js, so it never outranks a
+        // same-origin inline URL). Either must name a content-hashed
+        // config file: this path fetches nothing else, and only from this
+        // page's origin (_fazStaticConfigRecoveryUrl).
+        var chosen = _fazStaticConfigRecoveryUrl([
+            typeof cfg._staticConfigUrl === 'string' ? { url: cfg._staticConfigUrl, source: 'inline' } : null,
+            found ? { url: found.url, source: 'tag' } : null
+        ]);
+        if (!chosen || typeof window.XMLHttpRequest !== 'function') return report;
+        var url = chosen.url;
+        report.source = chosen.source;
+        report.attempted = true;
+        report.url = url;
+        // A fresh query string bypasses a poisoned (empty, truncated) entry
+        // in the browser's cache for this immutable, content-hashed name.
+        var bare = url.split('#')[0];
+        var xhr = new window.XMLHttpRequest();
+        try {
+            xhr.open('GET', bare + (bare.indexOf('?') === -1 ? '?' : '&') + 'faz-recover=' + Date.now(), false);
+            xhr.send(null);
+        } catch (e) {
+            report.verdict = 'network';
+            return report;
+        }
+        report.status = xhr.status || 0;
+        report.contentType = String(xhr.getResponseHeader('Content-Type') || '');
+        report.nosniff = /nosniff/i.test(String(xhr.getResponseHeader('X-Content-Type-Options') || ''));
+        var body = String(xhr.responseText || '');
+        report.bytes = body.length;
+        if (!report.status) { report.verdict = 'network'; return report; }
+        if (404 === report.status || 410 === report.status) { report.verdict = 'not-found'; return report; }
+        if (report.status < 200 || report.status >= 300) { report.verdict = 'http'; return report; }
+        var text = body.replace(/^﻿/, '').trim();
+        if ('' === text) { report.verdict = 'empty'; return report; }
+        if ('<' === text.charAt(0) || /text\/html/i.test(report.contentType)) { report.verdict = 'html'; return report; }
+        if (text.indexOf(_FAZ_STATIC_CONFIG_PREFIX) !== 0) { report.verdict = 'malformed'; return report; }
+        var parsed;
+        try { parsed = JSON.parse(text.slice(_FAZ_STATIC_CONFIG_PREFIX.length).replace(/;\s*$/, '')); } catch (e) { report.verdict = 'malformed'; return report; }
+        if (!_fazIsRecoveredStaticConfig(parsed, cfg)) { report.verdict = 'malformed'; return report; }
+        window._fazStaticConfig = parsed;
+        report.ok = true;
+        // A fresh copy that is valid narrows the cause down: its own response
+        // headers, then the shape of the page's tag.
+        var likely = (report.contentType && !/javascript|ecmascript/i.test(report.contentType))
+            ? 'the file is served as "' + report.contentType + '"' + (report.nosniff ? ' with X-Content-Type-Options: nosniff' : '')
+                + ', which a browser refuses to execute as a script: map .js to application/javascript for wp-content/uploads in the web server or CDN'
+            : ('delayed' === report.tag
+                ? 'a script optimiser delayed or re-typed the configuration tag: exclude faz-cookie-manager from its Delay/Defer JavaScript options'
+                : ('absent' === report.tag
+                    ? 'the configuration tag is missing from the page, so an optimiser removed or combined it: exclude faz-cookie-manager from JavaScript combine/minify'
+                    : 'the copy the browser executed was empty or truncated (a cached copy of a once-truncated file), or a script optimiser ran it after this runtime: if this repeats after a hard reload, exclude faz-cookie-manager from Delay/Defer JavaScript'));
+        window.console.info('[FAZ Cookie Manager] The static configuration file had not been applied when the consent runtime ran, so it was fetched again and the banner continues normally. Likely cause: '
+            + likely + '. File: ' + url);
+    } catch (e) {
+        if (!report.verdict && !report.ok) report.verdict = 'error';
+    }
+    return report;
+})();
 // Optimisers may delay the small inline merge while the external configuration
 // and runtime are already available. Merge before any blocking decisions.
 if (window._fazConfig && window._fazStaticConfig) {
@@ -53,6 +279,43 @@ const _FAZ_SCOPE_FP_KEY = "__scope.fp";
 // Focus-loop handlers per element; see _fazAttachFocusLoop().
 const _fazFocusLoopHandlers = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
 
+/**
+ * The Domain attribute a consent cookie may carry on `hostname`.
+ *
+ * `_rootDomain` is computed by PHP from the WordPress Address
+ * (faz_get_cookie_domain(), `.example.com` when subdomain sharing is on), and
+ * the page is not always served on that host. A translation proxy such as
+ * GTranslate's paid tier serves machine-translated copies of the same pages on
+ * OTHER registrable domains (example.de, example.pl): it rewrites every full
+ * URL in the HTML to the translated domain, but `_rootDomain` is a bare domain,
+ * not a URL, and arrives untouched. `document.cookie = "…; domain=.example.com"`
+ * on example.de is then silently rejected by the browser (RFC 6265 §5.3 step
+ * 6), so the consent was never stored there: the banner came back on every
+ * page, server-side blocking never saw a consent cookie and nothing was ever
+ * released. The same holds for a mirror, a CDN host or a staging copy that
+ * kept the production settings.
+ *
+ * Returns `rootDomain` unchanged when `hostname` is that domain or one of its
+ * subdomains (label boundary, so `badexample.com` does not match
+ * `.example.com`), and '' otherwise — a host-only cookie, which is what a page
+ * outside the configured scope can actually store. The choice is then made per
+ * domain, which is all a browser lets a site do across registrable domains.
+ * Declared here, at the top of the script and outside the runtime's block,
+ * for the old-WebKit rule described above; it reads nothing but its arguments.
+ *
+ * @param {string} rootDomain Configured cookie domain (`_rootDomain`), may be ''.
+ * @param {string} hostname   Host the page is served on (location.hostname).
+ * @returns {string}
+ */
+function _fazCookieDomainForHost(rootDomain, hostname) {
+    var root = String(rootDomain || '').trim().toLowerCase().replace(/\.$/, '');
+    var host = String(hostname || '').trim().toLowerCase().replace(/\.$/, '');
+    var bare = root.charAt(0) === '.' ? root.slice(1) : root;
+    if (!bare || !host) return '';
+    if (host === bare || host.slice(-(bare.length + 1)) === '.' + bare) return String(rootDomain).trim();
+    return '';
+}
+
 if ( ! _fazStore ) {
     // _fazConfig is injected by wp_localize_script. If it is missing (e.g. a
     // JS-defer plugin scoped the localize block inside a DOMContentLoaded
@@ -63,8 +326,35 @@ if ( ! _fazStore ) {
     // cross-origin parked for the rest of the page view. Saying "resources
     // remain blocked" without that distinction described a state the code does
     // not produce, and the banner is gone for this page view either way.
+    // When the recovery above re-fetched the static file and still found no
+    // usable configuration, its answer names the cause: a support thread that
+    // only has "failed to load" and a 200 from disk cache in the Network tab
+    // cannot tell an empty file from a MIME problem from a login page.
+    var _fazStaticVerdict = '';
+    if ( _fazStaticConfigMissing && _fazStaticConfigRecovery.attempted ) {
+        var _fazR = _fazStaticConfigRecovery;
+        var _fazCauses = {
+            'empty': 'the file is EMPTY (a truncated config-*.js on disk, or an empty cached copy): delete wp-content/uploads/faz-cookie-manager/assets/ and reload, the plugin regenerates it',
+            'html': 'the server answered with an HTML page instead of the script: a login, maintenance or staging-protection layer is intercepting static files under wp-content/uploads',
+            'malformed': 'the file does not hold the expected configuration (truncated, or rewritten by a minifier or proxy): delete wp-content/uploads/faz-cookie-manager/assets/ and reload, and exclude faz-cookie-manager from JavaScript minify/combine',
+            'not-found': 'the file does not exist (404): a full-page cache is serving HTML older than the generated assets, or the uploads directory was not copied; purge the page cache',
+            'http': 'the server refused the file: check the web server, CDN or security rules for wp-content/uploads',
+            'network': 'the request did not complete (a network error, an ad-blocker rule, or a proxy or CDN that does not serve wp-content/uploads/faz-cookie-manager/ on this host)',
+            'error': 'the recovery could not run in this browser'
+        };
+        _fazStaticVerdict = ' A fresh request for ' + _fazR.url + ' returned HTTP ' + _fazR.status
+            + ', Content-Type "' + ( _fazR.contentType || 'none' ) + '"' + ( _fazR.nosniff ? ' (nosniff)' : '' )
+            + ', ' + _fazR.bytes + ' bytes: ' + ( _fazCauses[ _fazR.verdict ] || _fazCauses.error ) + '.';
+        // Only when the server actually returned the file: a 404 or 403 page
+        // is usually text/html, and a MIME remedy there would mislead.
+        if ( 'malformed' === _fazR.verdict && _fazR.status >= 200 && _fazR.status < 300
+            && _fazR.contentType && ! /javascript|ecmascript/i.test( _fazR.contentType ) ) {
+            _fazStaticVerdict += ' The Content-Type is not JavaScript either: map .js to application/javascript for wp-content/uploads, or a browser will refuse to execute the file.';
+        }
+    }
     console.warn( _fazStaticConfigMissing
-        ? '[FAZ Cookie Manager] The static configuration file failed to load, so the provider rules this runtime needs are missing and the consent banner is disabled for this page view. Third-party resources stay parked and same-origin requests are released; reload to retry. Check the Network tab for frontend/js/config-*.js under wp-content/uploads.'
+        ? '[FAZ Cookie Manager] The static configuration file failed to load, so the provider rules this runtime needs are missing and the consent banner is disabled for this page view. Third-party resources stay parked and same-origin requests are released; reload to retry.'
+            + ( _fazStaticVerdict || ' Check the Network tab for wp-content/uploads/faz-cookie-manager/assets/config-*.js.' )
         : '[FAZ Cookie Manager] _fazConfig is not defined — banner disabled. If you use a JS optimisation plugin (WP Rocket, LiteSpeed, etc.), exclude _fazConfig from deferral.' );
     // Expose a no-op stub so any external callers (GTM, etc.) do not crash.
     window.fazcookie = window.fazcookie || {};
@@ -91,10 +381,10 @@ window.fazcookie = window.fazcookie || {};
 _fazRef = window.fazcookie;
 _fazRef._fazConsentStore = new Map();
 
-// Build marker — bump when shipping behavioural changes to this file. Lets
-// `fazcookie._diag().build` reveal at a glance whether a cache (CDN / optimizer)
-// is serving a stale bundle after a plugin update. #auto-show-hardening
-// Diagnostic only: nothing compares it against the server. The cache buster is
+// Build marker `_FAZ_BUILD` — declared at the top of this file (the version
+// skew check there must run even when the runtime stands down).
+// Diagnostic only: the one comparison against the server is that console
+// warning, and it changes no behaviour. The cache buster is
 // the `?ver=` on the enqueued script, which follows FAZ_VERSION, so a change
 // that couples this file to new server output (like the `<\/` escape in the
 // banner template, which an older script.js does not undo) only reaches
@@ -108,7 +398,6 @@ _fazRef._fazConsentStore = new Map();
 // before it installs its gates (adoptStale() in bootstrap.js). It used to be
 // survivable only on paper — that runtime's _fazRenderBanner() looped forever
 // on the bootstrap's held insertions, which never left their source.
-const _FAZ_BUILD = '1.34.4+css-ready-and-script-restore';
 
 /**
  * One-call frontend self-diagnosis for support: paste
@@ -137,7 +426,12 @@ _fazRef._diag = function () {
         perServiceConsent: !!store._perServiceConsent,
         perCookieConsent: !!store._perCookieConsent,
         services: Array.isArray(store._services) ? store._services.map(function (s) { return s && s.id; }) : null,
-        catalogueCount: (store._serviceCatalogue && typeof store._serviceCatalogue === 'object') ? Object.keys(store._serviceCatalogue).length : 0
+        catalogueCount: (store._serviceCatalogue && typeof store._serviceCatalogue === 'object') ? Object.keys(store._serviceCatalogue).length : 0,
+        // The configured scope and the one this host actually writes: they
+        // differ on a translation-proxy / mirror domain, where '' (host-only)
+        // is correct and a non-empty value would be rejected by the browser.
+        rootDomain: store._rootDomain || '',
+        cookieDomain: _fazCookieDomainForHost(store._rootDomain, location.hostname)
     };
 };
 
@@ -789,10 +1083,30 @@ _fazRef._fazGetCookie = function (name) {
  * @param {*} name Name of the cookie.
  * @param {*} value Value to be set.
  * @param {*} days Expiry in days.
- * @param {*} domain Cookie domain.
+ * @param {*} domain Cookie domain. Omitted, it is the configured consent scope
+ *                   (`_rootDomain`) as far as THIS host can store it — see
+ *                   _fazCookieDomainForHost(). An explicit value is used as
+ *                   given (the dead-cookie sweep passes each declared domain).
  */
-_fazRef._fazSetCookie = function (name, value, days = 0, domain = _fazStore._rootDomain) {
+_fazRef._fazSetCookie = function (name, value, days = 0, domain) {
     const date = new Date();
+    if (domain === undefined) {
+        domain = _fazCookieDomainForHost(_fazStore._rootDomain, location.hostname);
+        // Say once per page view why the cookie is host-only here: a support
+        // session otherwise sees `domain=.example.com` in the configuration
+        // and a cookie without it in the jar, and has to work out the proxy.
+        if (!domain && _fazStore._rootDomain && !_fazRef._fazCookieScopeNoted) {
+            _fazRef._fazCookieScopeNoted = true;
+            if (typeof console !== "undefined" && console.info) {
+                console.info(
+                    "[FAZ Cookie Manager] This page is served on " + location.hostname +
+                    ", outside the configured cookie domain " + _fazStore._rootDomain +
+                    " (a translation proxy such as GTranslate, a mirror or a CDN host). " +
+                    "Consent cookies are stored for this host only, so the choice made here applies to this domain."
+                );
+            }
+        }
+    }
     if (!!domain) {
         domain = `domain=${domain}`;
     }
@@ -10307,9 +10621,12 @@ function _fazSaveVendorConsent(choice) {
     const expiry = _fazStore._expiry || 180;
     const date = new Date();
     date.setTime(date.getTime() + (expiry * 24 * 60 * 60 * 1000));
+    // Same scope as the consent cookie: the configured domain only where this
+    // host can store it (_fazCookieDomainForHost()), host-only elsewhere.
     let domain = '';
-    if (_fazStore._rootDomain) {
-        domain = ';domain=' + _fazStore._rootDomain;
+    const scopedDomain = _fazCookieDomainForHost(_fazStore._rootDomain, location.hostname);
+    if (scopedDomain) {
+        domain = ';domain=' + scopedDomain;
     }
     const secure = location.protocol === 'https:' ? ';Secure' : '';
     const budget = _fazVendorRecordBudget();
