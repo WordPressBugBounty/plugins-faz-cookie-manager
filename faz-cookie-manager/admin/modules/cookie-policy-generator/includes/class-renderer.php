@@ -384,9 +384,16 @@ class Renderer {
 			$sentinel = Generator::html_token_sentinel( $token_name );
 			// Standalone-line case: markdown wrapped the sentinel in `<p>…</p>`.
 			// Strip the wrapper so the block-level HTML isn't nested inside <p>.
-			$html = (string) preg_replace(
+			// preg_replace_callback, not preg_replace: the replacement is HTML an
+			// operator's URL can end up in (a policy link such as
+			// `…/privacy?ref=$1`), and preg_replace() would read `$1` as a
+			// back-reference and drop it. The callback inserts it literally.
+			$literal = (string) $html_value;
+			$html    = (string) preg_replace_callback(
 				'/<p>\s*' . preg_quote( $sentinel, '/' ) . '\s*<\/p>/',
-				(string) $html_value,
+				static function () use ( $literal ) {
+					return $literal;
+				},
 				$html
 			);
 			// Inline-case fallback: sentinel sat mid-paragraph. Replace in place;
@@ -691,6 +698,7 @@ class Renderer {
 			/* translators: %s: recipient country name. */
 			$transfer_to_fmt  = esc_html__( 'Transfers personal data to: %s', 'faz-cookie-manager' );
 			$transfer_outside = self::transfer_outside_label( $jurisdiction, true );
+			$policy_link_lbl  = esc_html__( 'Read the provider\'s privacy policy', 'faz-cookie-manager' );
 			self::restore_policy_locale( $switched );
 
 			$parts = array();
@@ -763,6 +771,13 @@ class Renderer {
 							? sprintf( $transfer_to_fmt, esc_html( $t_country ) )
 							: $transfer_outside;
 						$desc_cell .= '<small class="faz-cookie-policy-transfer">' . $indicator . '</small>';
+					}
+					// Provider privacy-policy link (#360): same per-row contract as
+					// the banner and the legacy table — only when the operator set
+					// an absolute http(s) URL; new tab, no opener, no referrer.
+					$policy_url = self::decode_policy_url_meta( $row['cookie_meta'] ?? '' );
+					if ( '' !== $policy_url ) {
+						$desc_cell .= '<small class="faz-cookie-policy-link-wrap"><a class="faz-audit-policy-link" href="' . esc_url( $policy_url ) . '" target="_blank" rel="noopener noreferrer">' . $policy_link_lbl . '</a></small>';
 					}
 					$parts[]  = '<td data-label="' . $col_desc . '">' . $desc_cell . '</td>';
 					$parts[]  = '</tr>';
@@ -943,6 +958,42 @@ class Renderer {
 			'countries' => ( isset( $transfer['countries'] ) && is_array( $transfer['countries'] ) ) ? $transfer['countries'] : array(),
 			'safeguard' => ( isset( $transfer['safeguard'] ) && is_array( $transfer['safeguard'] ) ) ? $transfer['safeguard'] : array(),
 		);
+	}
+
+	/**
+	 * Decode a cookie's `meta` value and return its provider privacy-policy URL
+	 * (#360), or '' when absent, malformed or not an absolute http(s) URL.
+	 *
+	 * Reads the raw column like decode_transfer_meta() because this renderer
+	 * works on the shared inventory rows, not on Cookie objects; the scheme
+	 * check mirrors Cookie::sanitize_policy_url_value() so a value written by
+	 * an older sanitiser or a direct DB edit still cannot print a javascript:
+	 * href.
+	 *
+	 * @param mixed $raw_meta The cookie's raw `meta` column (JSON string / array).
+	 * @return string
+	 */
+	private static function decode_policy_url_meta( $raw_meta ) {
+		if ( is_array( $raw_meta ) ) {
+			$meta = $raw_meta;
+		} elseif ( is_string( $raw_meta ) && '' !== $raw_meta ) {
+			$meta = json_decode( $raw_meta, true );
+		} else {
+			$meta = null;
+		}
+		if ( ! is_array( $meta ) || empty( $meta['policy_url'] ) || ! is_string( $meta['policy_url'] ) ) {
+			return '';
+		}
+		// The one URL contract every surface shares (#365 review): a looser
+		// regex here rendered links the banner and the REST API treat as empty.
+		// class_exists() lets the autoloader resolve it under WordPress; a
+		// harness that loads this file alone, without the cookie model, gets
+		// the model's own first-stage check rather than a fatal.
+		if ( class_exists( '\\FazCookie\\Admin\\Modules\\Cookies\\Includes\\Cookie' ) ) {
+			return \FazCookie\Admin\Modules\Cookies\Includes\Cookie::sanitize_policy_url_value( $meta['policy_url'] );
+		}
+		$url = trim( $meta['policy_url'] );
+		return ( strlen( $url ) <= 2048 && preg_match( '#^https?://[^\x00-\x20\x7f]+$#i', $url ) ) ? $url : '';
 	}
 
 	/**

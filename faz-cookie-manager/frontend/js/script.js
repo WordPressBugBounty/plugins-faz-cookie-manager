@@ -10,7 +10,7 @@ if ( typeof window._fazConfig === 'undefined' && typeof window._fazCfg !== 'unde
 // Declared up here, ahead of everything that can stand the runtime down,
 // because the version-skew check below must run on exactly the page views
 // where the runtime never starts. See the longer note above `_fazRef._diag`.
-const _FAZ_BUILD = '1.34.5+static-config-recovery-and-proxy-hosts';
+const _FAZ_BUILD = '1.35.0+static-config-recovery-and-proxy-hosts';
 // Version skew between this bundle and the PHP side that printed _fazConfig.
 // `_version` is FAZ_VERSION from the main plugin file (it is also the `?ver=`
 // of this script's own URL), and the numeric prefix of _FAZ_BUILD is the
@@ -1476,6 +1476,9 @@ function _fazInitOperations() {
             _fazShowBanner();
         }
         _fazFireConsentReadyEvent(_fazGpcChanged ? 'gpc' : (_fazStoredAction ? 'restore' : 'init'));
+        // The GPC opt-out above has already denied the sale/share categories in
+        // the store, so only the categories still accepted replay (#360).
+        if (_fazStoredAction) _fazRunPersistentOptInScripts();
         return;
     }
     if (!_fazStoredAction || _fazPreviewEnabled()) {
@@ -1498,6 +1501,53 @@ function _fazInitOperations() {
         else _fazRemoveBanner();
         _fazFireConsentReadyEvent('restore');
         _fazScheduleRestoreUnblock();
+        _fazRunPersistentOptInScripts();
+    }
+}
+
+/**
+ * Replay the opt-in scripts flagged "run on every page load" (#360) for the
+ * categories the returning visitor has accepted.
+ *
+ * _fazExecuteConsentScripts() fires an opt-in script once, on the accept
+ * transition. A booking widget or chat loader declared that way worked on the
+ * page where the visitor clicked Accept and was dead on every page after it, so
+ * operators had to keep a second copy of the snippet behind a getFazConsent()
+ * check. The admin flag puts the same script in `opt_in_persistent`; this runs
+ * that list on the stored-consent bootstrap paths only (never on a first visit,
+ * never in preview, never on a record a signal wrote that the visitor has not
+ * answered), once per page load, for the categories accepted AND — with
+ * per-service consent on — only when the owning declared service is not denied.
+ * The accept-click page is covered by the transition path, so the script never
+ * fires twice there.
+ */
+var _fazPersistentOptInRan = false;
+function _fazRunPersistentOptInScripts() {
+    if (_fazPersistentOptInRan) return;
+    _fazPersistentOptInRan = true;
+    // A record nobody answered is not a consent to replay (#365 review): GPC or
+    // a Do Not Sell form writes one with the jurisdiction defaults — analytics
+    // still "yes" on a CCPA site — and those pages never ran an opt-in script,
+    // so replaying here would make the opt-out signal start tracking from page
+    // two. Raw marker, not _fazUndecided: that one is about re-offering the
+    // banner and is false under CCPA, the very case this guards.
+    if (_fazRef._fazGetFromStore('undecided') === '1') return;
+    var scripts = _fazStore._cookieScripts;
+    if (!scripts || typeof scripts !== 'object') return;
+    var cats = _fazStore._categories || [];
+    for (var i = 0; i < cats.length; i++) {
+        var slug  = cats[i].slug;
+        var entry = scripts[slug];
+        // A map cached before this key existed has no opt_in_persistent: treat
+        // it as empty rather than throw.
+        if (!entry || !Array.isArray(entry.opt_in_persistent) || !entry.opt_in_persistent.length) continue;
+        if (_fazRef._fazGetFromStore(slug) !== 'yes') continue;
+        // Then the owner: a declared service the visitor turned off (svc.<id>:no)
+        // must not get its widget back on every page just because the category
+        // stayed granted (#360 review).
+        entry.opt_in_persistent.forEach(function (item) {
+            if (_fazConsentScriptAllowed(item, slug)) _fazRunScript(_fazConsentScriptCode(item));
+        });
     }
 }
 
@@ -8915,15 +8965,88 @@ function _fazExecuteConsentScripts(prevAccepted) {
         if (!entry) continue;
         var wasAccepted = Array.isArray(prevAccepted) && prevAccepted.indexOf(slug) !== -1;
         var isAccepted  = _fazRef._fazGetFromStore(slug) === 'yes';
-        var toRun = null;
-        if (!wasAccepted && isAccepted  && entry.opt_in  && entry.opt_in.length)  toRun = entry.opt_in;
+        if (isAccepted && entry.opt_in && entry.opt_in.length) {
+            entry.opt_in.forEach(function (item) {
+                // Two ways an entry's consent goes no → yes in this action (#360):
+                //  - its category was just accepted, and (per-service consent on)
+                //    the owning declared service is not denied — the owner gate,
+                //    not the category alone, decides;
+                //  - its category was already accepted and only the owning
+                //    service flipped from not-yes to yes in the preference
+                //    centre. Read from the pre-consent snapshot, which holds the
+                //    effective consent of every visible service (declared
+                //    cookies included) and is empty with per-service off — so
+                //    bare-string and owner-less entries, and every entry on a
+                //    category-only site, keep the category transition alone.
+                // The two are exclusive on wasAccepted, so an entry runs at most
+                // once per action and never twice on the accept page.
+                if (!_fazConsentScriptAllowed(item, slug)) return;
+                var run = !wasAccepted;
+                if (!run && item && typeof item === 'object' && item.service
+                    && _fazServicesBeforeConsent && Object.prototype.hasOwnProperty.call(_fazServicesBeforeConsent, item.service)) {
+                    run = _fazServicesBeforeConsent[item.service] !== 'yes';
+                }
+                if (run) _fazRunScript(_fazConsentScriptCode(item));
+            });
+        }
         // Run opt_out on any rejection — including first-visit Reject All where
         // wasAccepted is false. Opt-out scripts are cleanup routines (idempotent).
-        if (!isAccepted && entry.opt_out && entry.opt_out.length) toRun = entry.opt_out;
-        if (toRun) {
-            toRun.forEach(function (code) { _fazRunScript(code); });
+        if (!isAccepted && entry.opt_out && entry.opt_out.length) {
+            entry.opt_out.forEach(function (item) { _fazRunScript(_fazConsentScriptCode(item)); });
+        } else if (isAccepted && entry.opt_out && entry.opt_out.length) {
+            // The mirror of the opt-in owner rule (#365 review): with the
+            // category still granted, revoking only the owning declared service
+            // is a rejection for that script — its widget's own cleanup must
+            // run, or it is lost to the reload _fazAfterConsent() does on a
+            // service revoke. Judged on the same pre-consent snapshot, which is
+            // empty with per-service off, so a category-only site is unchanged.
+            entry.opt_out.forEach(function (item) {
+                if (!item || typeof item !== 'object' || !item.service) return;
+                if (!_fazServicesBeforeConsent || !Object.prototype.hasOwnProperty.call(_fazServicesBeforeConsent, item.service)) return;
+                if (_fazServicesBeforeConsent[item.service] === 'yes' && !_fazConsentScriptAllowed(item, slug)) {
+                    _fazRunScript(_fazConsentScriptCode(item));
+                }
+            });
         }
     }
+}
+
+/**
+ * The JavaScript source of a _cookieScripts entry.
+ *
+ * Entries are {code, service} objects; a bare string is a map the 12-hour
+ * transient cached before the owner was shipped, and is read the same way.
+ *
+ * @param {Object|string} item List entry.
+ * @return {string}
+ */
+function _fazConsentScriptCode(item) {
+    if (typeof item === 'string') return item;
+    return (item && typeof item.code === 'string') ? item.code : '';
+}
+
+/**
+ * Whether a _cookieScripts entry may run now that its category is accepted.
+ *
+ * An entry that names its owning declared service is allowed only when that
+ * service's effective consent is yes: an explicit svc.<id>:no wins over the
+ * granted category (per-service consent on), and with no token the answer is
+ * the category's — so with per-service consent off nothing changes. A bare
+ * string or an empty owner (scanner-discovered row) stays category-gated,
+ * which the caller has already established.
+ *
+ * @param {Object|string} item List entry.
+ * @param {string}        slug Category slug the entry is filed under.
+ * @return {boolean}
+ */
+function _fazConsentScriptAllowed(item, slug) {
+    if (!item || typeof item === 'string' || !item.service) return true;
+    // Per-service consent off: the category alone decides, like the server
+    // (get_service_consent() returns nothing when the option is off). A
+    // svc.<id>:no token left in the cookie from when the option WAS on must
+    // not keep denying a script the category now grants.
+    if (!_fazStore._perServiceConsent) return true;
+    return _fazServiceEffectiveConsent(item.service, slug) === 'yes';
 }
 
 /**
@@ -10858,17 +10981,33 @@ window.getFazConsent = function () {
  * Every service the visitor can be asked about on THIS site, with its effective
  * consent resolved.
  *
- * Empty when per-service consent is off: the server ships no service list in
- * that mode, so there is nothing finer than the category to report, and an empty
- * map says exactly that instead of inventing entries.
+ * With per-service consent off the server ships no provider list, so only the
+ * administrator's hand-declared cookies (#360) are listed, each answered with
+ * its category's consent; on a site that declares none the map is empty, which
+ * says there is nothing finer than the category to report.
  *
  * @return {Object} serviceId → true|false.
  */
 function _fazPublicServiceConsentMap() {
     var out = {};
+    // With per-service consent off only declared cookies are listed, and a
+    // stale svc.<id> token (from when the option was on) must not speak for
+    // them: the category decides, as it does server-side.
+    var perService = !!_fazStore._perServiceConsent;
     _fazEachDeclaredService(function (service) {
         if (!service || !service.id || Object.prototype.hasOwnProperty.call(out, service.id)) return;
-        out[service.id] = _fazServiceEffectiveConsent(service.id, service.category || "") === "yes";
+        // defineProperty, not out[id] = …: a declared id may legally be
+        // "__proto__" (sanitize_key keeps underscores), and a plain assignment
+        // would set the prototype instead of a key, so services.__proto__ read
+        // back Object.prototype rather than false (#365 review). The map keeps
+        // its ordinary prototype, so integrators' services.hasOwnProperty()
+        // calls go on working.
+        Object.defineProperty(out, service.id, {
+            value: perService
+                ? _fazServiceEffectiveConsent(service.id, service.category || "") === "yes"
+                : _fazRef._fazGetFromStore(service.category || "") === "yes",
+            enumerable: true, writable: true, configurable: true,
+        });
     });
     return out;
 }
@@ -10885,7 +11024,11 @@ function _fazPublicServiceConsentMap() {
  * @param {Function} fn Receives each service object.
  */
 function _fazEachDeclaredService(fn) {
-    var lists = [_fazStore._services, _fazStore._serviceCatalogue];
+    // _declaredServices (#360) is the administrator's own cookie declarations
+    // surfaced as services. It is shipped even when per-service consent is off
+    // — the first two lists are empty then — so getFazConsent().services can
+    // still answer for a hand-declared cookie with its category's consent.
+    var lists = [_fazStore._services, _fazStore._serviceCatalogue, _fazStore._declaredServices];
     for (var li = 0; li < lists.length; li++) {
         var list = lists[li];
         if (!list) continue;
@@ -10912,8 +11055,9 @@ function _fazEachDeclaredService(fn) {
  * @param {string} cookieName Exact cookie name (patterns are matched for you).
  * @return {boolean|null} true = allowed, false = denied, null = this site
  *         declares no service for that cookie, so ask about the category
- *         instead. null is the answer on every site with per-service consent
- *         off, since the server ships no service list in that mode.
+ *         instead. With per-service consent off only hand-declared cookies
+ *         (#360) get an answer — their category's consent — and every other
+ *         name is null.
  */
 window.getFazCookieConsent = function (cookieName) {
     if (!cookieName || typeof cookieName !== "string") return null;
@@ -10930,7 +11074,13 @@ window.getFazCookieConsent = function (cookieName) {
                     decision = _fazRef._fazGetFromStore(_fazCkKey(service.id, pattern));
                 }
                 if (decision !== "yes" && decision !== "no") {
-                    decision = _fazServiceEffectiveConsent(service.id, service.category || "");
+                    // Per-service consent off: the category decides, as in
+                    // getFazConsent().services, the script gate and the server.
+                    // A svc.<id> token left from when the option was on must
+                    // not make this API disagree with them (#365 review).
+                    decision = _fazStore._perServiceConsent
+                        ? _fazServiceEffectiveConsent(service.id, service.category || "")
+                        : (_fazRef._fazGetFromStore(service.category || "") === "yes" ? "yes" : "no");
                 }
                 if (decision === "no") { decided = false; return; }
                 if (decision === "yes" && decided === null) decided = true;

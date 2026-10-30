@@ -256,6 +256,13 @@ class Frontend {
 	private $visitor_service_cookie_decisions_cache = null;
 	private $whitelisted_cookie_patterns_cache = null;
 	private $catalog_cookie_categories_cache = null;
+
+	/**
+	 * Request cache for get_declared_cookie_services().
+	 *
+	 * @var array|null
+	 */
+	private $declared_services_cache = null;
 	/**
 	 * Per-cookie-name memo for the Open Cookie Database tier, mirrored into the
 	 * faz_server_cookie_definition_map transient. Misses are memoized too — an
@@ -3720,6 +3727,17 @@ class Frontend {
 			}
 		}
 
+		// Cookies the administrator declared by hand (#360). Their declaration is
+		// a stronger signal than a scan hit — the operator says the cookie is set
+		// on this site — so they get a toggle without a detected-name match.
+		foreach ( $this->get_declared_cookie_services( $valid_categories ) as $declared ) {
+			if ( isset( $seen[ $declared['id'] ] ) ) {
+				continue;
+			}
+			$services[]                = $declared;
+			$seen[ $declared['id'] ]   = true;
+		}
+
 		/**
 		 * Filter the per-service consent list.
 		 *
@@ -3780,6 +3798,18 @@ class Frontend {
 				'third_party' => $this->is_third_party_service( $enforceable_id ),
 			);
 		}
+		// Admin-declared cookies as services (#360): keeps their svc.<id> token
+		// alive in get_service_consent() and lets the shredder honour a per-
+		// service denial by name. Their pattern list is empty, so the output
+		// buffer never blocks a script on their account.
+		$known_ids = array_flip( array_column( $services, 'id' ) );
+		foreach ( $this->get_declared_cookie_services( $valid_categories ) as $declared ) {
+			if ( isset( $known_ids[ $declared['id'] ] ) ) {
+				continue;
+			}
+			$services[]                      = $declared;
+			$known_ids[ $declared['id'] ]    = true;
+		}
 		/**
 		 * Filter the enforceable per-service list (broader than the visible one).
 		 *
@@ -3790,6 +3820,77 @@ class Frontend {
 		$services = apply_filters( 'faz_enforceable_services', $services, $valid_categories );
 		$this->enforceable_cache = $services;
 		return $this->enforceable_cache;
+	}
+
+	/**
+	 * Administrator-declared cookies surfaced as consent services (#360).
+	 *
+	 * A cookie added by hand under Cookies → <category> (not scanner-discovered)
+	 * has no Known_Providers entry, so until now it was invisible to
+	 * window.getFazConsent().services and never got a per-service toggle: an
+	 * operator who declared a booking widget's cookie could not ask the runtime
+	 * whether that specific widget was accepted. Each such row becomes a
+	 * synthetic service keyed by Cookie::get_service_id(), carrying the cookie
+	 * name for the shredder and NO URL patterns, so the output buffer keeps
+	 * judging scripts by category exactly as before.
+	 *
+	 * Which rows qualify, and under which key, is decided once in
+	 * Cookie_Controller::get_declared_service_map() — pure function of the
+	 * cookie inventory and the category slugs, never of the visitor, so it is
+	 * invariant across consent states and safe under Cache Compatibility Mode,
+	 * and cached in a transient Cookie_Controller::delete_cache() drops on every
+	 * cookie or category write.
+	 *
+	 * @param string[]|null $valid_categories Active non-necessary category slugs.
+	 * @return array<int,array<string,mixed>> Each: {id,label,category,patterns,cookies,third_party,declared}.
+	 */
+	private function get_declared_cookie_services( $valid_categories = null ) {
+		if ( null !== $this->declared_services_cache ) {
+			return $this->declared_services_cache;
+		}
+		if ( null === $valid_categories ) {
+			$valid_categories = $this->get_valid_category_slugs();
+		}
+		// Degrade to "no declared services" — never a fatal — when the cookie
+		// module is not loaded in this process (a CLI utility or a standalone
+		// harness that boots Frontend alone). Same guard shape as
+		// is_third_party_service(); under the plugin autoloader both resolve.
+		if (
+			! class_exists( '\\FazCookie\\Admin\\Modules\\Cookies\\Includes\\Cookie_Controller' )
+			|| ! class_exists( '\\FazCookie\\Admin\\Modules\\Cookies\\Includes\\Cookie' )
+			|| ! function_exists( 'get_transient' )
+		) {
+			$this->declared_services_cache = array();
+			return $this->declared_services_cache;
+		}
+
+		// One map for every surface (#365 review): REST, admin dialog and the
+		// scripts map read the same answer, built and cached in one place.
+		$map    = \FazCookie\Admin\Modules\Cookies\Includes\Cookie_Controller::get_instance()->get_declared_service_map();
+		$cached = array();
+		foreach ( $map['services'] as $service_id => $service ) {
+			$cached[ $service_id ] = array(
+				'id'          => $service['id'],
+				'label'       => $service['label'],
+				'category'    => $service['category'],
+				'patterns'    => array(),
+				'cookies'     => $service['cookies'],
+				'third_party' => false,
+				'declared'    => true,
+			);
+		}
+
+		// Re-check the category against the live active set on every read: the
+		// transient may predate a category being disabled or renamed.
+		$services = array();
+		foreach ( $cached as $service ) {
+			if ( empty( $service['id'] ) || empty( $service['category'] ) || ! in_array( $service['category'], $valid_categories, true ) ) {
+				continue;
+			}
+			$services[] = $service;
+		}
+		$this->declared_services_cache = $services;
+		return $services;
 	}
 
 	/**
@@ -4288,6 +4389,15 @@ class Frontend {
 		// (P1-3, inline consent logger), the consent cookie is hard-capped against
 		// the 4 KB browser limit (P1-4, see _fazSetInStore), and the list below is
 		// filtered to providers with a DETECTED cookie (P2, just here).
+		// Admin-declared cookies as services (#360), shipped whether or not
+		// per-service consent is on: with it off there is no toggle, but
+		// getFazConsent().services still has to answer for the declared cookie
+		// (its category's consent). Small (one entry per hand-declared cookie)
+		// and a pure function of the inventory, like _cookieScripts above.
+		$declared_services = $this->get_declared_cookie_services( $valid_categories );
+		if ( ! empty( $declared_services ) ) {
+			$store['_declaredServices'] = array_values( $declared_services );
+		}
 		$per_service = ! empty( $settings['banner_control']['per_service_consent'] );
 		if ( $per_service ) {
 			// P2: source the per-service toggle list from the cookies actually
@@ -4372,7 +4482,11 @@ class Frontend {
 	 * Result is cached by the caller in a 12h transient and invalidated
 	 * on cookie saves / category renames (see Cookies module hooks).
 	 *
-	 * @return array<string, array{opt_in: string[], opt_out: string[]}>
+	 * Every list entry is {code: string, service: string} — the service is the
+	 * owning declared service id (Cookie_Controller::get_declared_service_map()),
+	 * or '' for a row the runtime does not expose as a service.
+	 *
+	 * @return array<string, array{opt_in: array, opt_out: array, opt_in_persistent: array}>
 	 */
 	private function build_cookie_scripts_map() {
 		global $wpdb;
@@ -4388,6 +4502,12 @@ class Frontend {
 		// so a description containing the literal text "opt_in_script" cannot
 		// false-positive into the result set. json_decode() below remains the
 		// authoritative parser; LIKE only narrows the rows we have to decode.
+		$declared_owners = array();
+		if ( class_exists( '\\FazCookie\\Admin\\Modules\\Cookies\\Includes\\Cookie_Controller' ) ) {
+			$declared_map    = \FazCookie\Admin\Modules\Cookies\Includes\Cookie_Controller::get_instance()->get_declared_service_map();
+			$declared_owners = $declared_map['by_cookie'];
+		}
+
 		$like_opt_in  = '%"opt_in_script":"%';
 		$like_opt_out = '%"opt_out_script":"%';
 
@@ -4395,7 +4515,7 @@ class Frontend {
 		do {
 			$rows = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT c.cookie_id, c.meta, cat.slug AS category_slug
+					"SELECT c.cookie_id, c.name, c.slug, c.discovered, c.meta, cat.slug AS category_slug
 					 FROM {$wpdb->prefix}faz_cookies c
 					 INNER JOIN {$wpdb->prefix}faz_cookie_categories cat ON c.category = cat.category_id
 					 WHERE c.cookie_id > %d
@@ -4423,13 +4543,39 @@ class Frontend {
 					continue;
 				}
 				if ( ! isset( $cookie_scripts[ $cat_slug ] ) ) {
-					$cookie_scripts[ $cat_slug ] = array( 'opt_in' => array(), 'opt_out' => array() );
+					$cookie_scripts[ $cat_slug ] = array( 'opt_in' => array(), 'opt_out' => array(), 'opt_in_persistent' => array() );
 				}
+				// Each script is shipped WITH its owner (#360 review): a hand-declared
+				// cookie is also a per-service toggle, so with per-service consent on
+				// a visitor can grant the category and still deny that one service.
+				// The runtime gates the entry on _fazServiceEffectiveConsent(service,
+				// category), which falls back to the category when no svc.* token
+				// exists — so with per-service off nothing changes. A scanner-
+				// discovered row has no toggle of its own (its provider does), so it
+				// carries '' and stays category-gated; a map cached before this shape
+				// existed holds bare strings, which the runtime reads the same way.
+				// The owner comes from the declared-services map, not a fresh
+				// derivation: a row the runtime does not expose (a provider's own
+				// cookie, a key another category holds) has no toggle, and gating
+				// its script on one would let a toggle the row does not own block
+				// it (#365 review).
+				$owner = isset( $declared_owners[ (int) $row->cookie_id ] ) ? $declared_owners[ (int) $row->cookie_id ] : '';
 				if ( ! empty( $meta['opt_in_script'] ) ) {
-					$cookie_scripts[ $cat_slug ]['opt_in'][] = (string) $meta['opt_in_script'];
+					$entry = array( 'code' => (string) $meta['opt_in_script'], 'service' => $owner );
+					$cookie_scripts[ $cat_slug ]['opt_in'][] = $entry;
+					// #360: flagged scripts ALSO go to the persistent list, which the
+					// runtime replays on every later page load while the owner is
+					// accepted. The accept-click transition still runs `opt_in`, so a
+					// script never fires twice on the page where consent is given.
+					// Same strict allowlist Cookie::get_meta() applies: this method reads
+					// the raw column, so an import that stored "yes"/"1"/"on" must not
+					// show the replay as on in the admin and skip it at runtime.
+					if ( isset( $meta['opt_in_run_each_load'] ) && \FazCookie\Admin\Modules\Cookies\Includes\Cookie::sanitize_bool_value( $meta['opt_in_run_each_load'] ) ) {
+						$cookie_scripts[ $cat_slug ]['opt_in_persistent'][] = $entry;
+					}
 				}
 				if ( ! empty( $meta['opt_out_script'] ) ) {
-					$cookie_scripts[ $cat_slug ]['opt_out'][] = (string) $meta['opt_out_script'];
+					$cookie_scripts[ $cat_slug ]['opt_out'][] = array( 'code' => (string) $meta['opt_out_script'], 'service' => $owner );
 				}
 
 				if ( $scanned >= $max_rows ) {

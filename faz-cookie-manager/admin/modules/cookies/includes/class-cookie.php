@@ -166,6 +166,18 @@ class Cookie extends Store {
 			'url_pattern'   => $this->get_url_pattern(),
 			'category'      => $this->get_category(),
 			'transfer'      => $this->get_transfer(),
+			// Public, non-script metadata (#360). The service id is the stable key
+			// under which window.getFazConsent().services reports this cookie; the
+			// policy URL is shown under the cookie row in every declaration surface;
+			// the flag only decides WHEN the opt-in script runs, never what it is,
+			// so none of the three needs the unfiltered_html gate. The service id is
+			// the one the runtime actually exposes, '' for a row it does not
+			// (scanner-discovered, necessary, a provider's own cookie, a cross-
+			// category clash): showing a key that getFazConsent().services never
+			// answers would send an integrator to gate on undefined.
+			'service_id'    => $this->get_exposed_service_id(),
+			'policy_url'    => $this->get_policy_url(),
+			'opt_in_run_each_load' => $this->get_opt_in_run_each_load(),
 			'date_created'  => $this->get_date_created(),
 			'date_modified' => $this->get_date_modified(),
 		);
@@ -331,6 +343,20 @@ class Cookie extends Store {
 				$meta[ $key ] = (string) $item;
 			} elseif ( in_array( $key, $structured_keys, true ) ) {
 				$meta[ $key ] = $this->sanitize_transfer_meta( $item );
+			} elseif ( 'policy_url' === $key ) {
+				// A URL, not free text: sanitize_textarea_field() would keep a
+				// javascript: scheme and mangle nothing useful. The dedicated
+				// sanitiser keeps http(s) only.
+				$meta[ $key ] = self::sanitize_policy_url_value( $item );
+			} elseif ( 'service_id' === $key ) {
+				// The frozen public key: the same alphabet derive_service_id()
+				// produces, so a hand-edited value cannot smuggle anything else in.
+				$meta[ $key ] = is_string( $item ) ? sanitize_key( $item ) : '';
+			} elseif ( 'opt_in_run_each_load' === $key ) {
+				// Strict bool: sanitize_textarea_field() would turn `true` into
+				// the string "1" and `false` into "", and a later `! empty()`
+				// read would then treat the string "false" as on.
+				$meta[ $key ] = self::sanitize_bool_value( $item );
 			} else {
 				$meta[ $key ] = sanitize_textarea_field( $item );
 			}
@@ -391,6 +417,335 @@ class Cookie extends Store {
 		$meta                    = $this->get_meta();
 		$meta['opt_out_script']  = (string) $script;
 		$this->set_meta( $meta );
+	}
+
+	/**
+	 * Stable public identifier of this cookie as a consent "service".
+	 *
+	 * This is the key under which window.getFazConsent().services reports the
+	 * cookie's effective consent, and the id of its per-service toggle when
+	 * per-service consent is on (#360). It derives from the slug, falling back
+	 * to the cookie name — the admin "Add cookie" form never sets a slug, so
+	 * most hand-declared rows only have a name. sanitize_title() turns
+	 * "Booking Widget" into "booking-widget" before sanitize_key() enforces the
+	 * same [a-z0-9_-] alphabet every Known_Providers id already lives in.
+	 *
+	 * @return string '' when neither slug nor name yields a usable key.
+	 */
+	public function get_service_id() {
+		return self::service_id_for_row( $this->get_slug(), $this->get_name(), $this->get_meta() );
+	}
+
+	/**
+	 * The key window.getFazConsent().services reports this cookie under, or ''
+	 * when the runtime does not expose it as a declared service.
+	 *
+	 * Read from the same inventory map the frontend builds the services from,
+	 * so the REST client and the admin dialog can never disagree with it.
+	 *
+	 * @return string
+	 */
+	public function get_exposed_service_id() {
+		$id = (int) $this->get_id();
+		if ( $id < 1 || $this->is_discovered() || ! class_exists( __NAMESPACE__ . '\\Cookie_Controller' ) ) {
+			return '';
+		}
+		$map = Cookie_Controller::get_instance()->get_declared_service_map();
+		return isset( $map['by_cookie'][ $id ] ) ? (string) $map['by_cookie'][ $id ] : '';
+	}
+
+	/**
+	 * Carry a frozen service id into this row — the recycle-bin restore and a
+	 * settings import replay it from the snapshot, so a cookie that was renamed
+	 * after its first save, or got a -2 suffix, comes back under the key
+	 * integrators and returning visitors' svc.<id> tokens already use (#365
+	 * review). An empty value is a no-op: save() then freezes a fresh id, and
+	 * a restored key now held by another category is re-resolved there.
+	 *
+	 * Not a REST field: the schema marks service_id readonly, so neither the
+	 * single-item nor the bulk endpoint dispatches to this setter.
+	 *
+	 * @param string $service_id Key from a snapshot.
+	 * @return void
+	 */
+	public function set_service_id( $service_id ) {
+		$service_id = is_string( $service_id ) ? sanitize_key( $service_id ) : '';
+		if ( '' === $service_id ) {
+			return;
+		}
+		$meta               = $this->get_meta();
+		$meta['service_id'] = $service_id;
+		// set_object_data(), not set_meta(), for the reason documented on save().
+		$this->set_object_data( 'meta', $meta );
+		$this->decoded_meta = null;
+	}
+
+	/**
+	 * The service id of a raw row: the one frozen in its meta when it was saved,
+	 * else the derivation from slug or name.
+	 *
+	 * The frozen copy is what makes the id stable (#365 review). Derived on every
+	 * read, it changed when the operator fixed a typo in the cookie name, or when
+	 * a later release added a Known_Providers entry with the same key — and the
+	 * integrator's getFazConsent().services[id] check, plus every returning
+	 * visitor's svc.<id> token, silently stopped matching. Rows saved before the
+	 * id was frozen still derive, exactly as before.
+	 *
+	 * @param string       $slug Row slug (may be '').
+	 * @param string       $name Row name.
+	 * @param array|string $meta Decoded meta array, or the raw JSON column.
+	 * @return string
+	 */
+	public static function service_id_for_row( $slug, $name, $meta ) {
+		if ( is_string( $meta ) && '' !== $meta ) {
+			$meta = json_decode( $meta, true );
+		}
+		if ( is_array( $meta ) && isset( $meta['service_id'] ) && is_string( $meta['service_id'] ) ) {
+			$stored = sanitize_key( $meta['service_id'] );
+			if ( '' !== $stored ) {
+				return $stored;
+			}
+		}
+		return self::derive_service_id( $slug, $name );
+	}
+
+	/**
+	 * Save the cookie, freezing its service id on the first save of a declared row.
+	 *
+	 * Only hand-declared rows get one: a scanner-discovered row is never a
+	 * service of its own (its provider is). The id must not collide with a
+	 * declared cookie in ANOTHER category, which the runtime could not expose
+	 * (one key cannot answer for two categories): it gets a -2, -3… suffix
+	 * instead. A same-category match keeps the shared key on purpose — two rows
+	 * whose names collapse to one key are one declared thing to the visitor.
+	 *
+	 * The check runs on every save, not only the first (#365 review): moving a
+	 * row whose key it shares with a sibling into another category would
+	 * otherwise leave one key in two categories, and the runtime would drop
+	 * whichever row came second — possibly the sibling nobody touched. The row
+	 * being saved is the one that moves; an id nothing contests is never
+	 * rewritten.
+	 *
+	 * Written through set_object_data(), not set_meta(): the latter strips the
+	 * script keys for a user without unfiltered_html, and assigning an id must
+	 * never cost a row the scripts an administrator gave it.
+	 *
+	 * @return int
+	 */
+	public function save() {
+		if ( ! $this->is_discovered() ) {
+			$meta       = $this->get_meta();
+			$stored     = isset( $meta['service_id'] ) ? (string) $meta['service_id'] : '';
+			$service_id = '' !== $stored ? $stored : self::derive_service_id( $this->get_slug(), $this->get_name() );
+			if ( '' !== $service_id && class_exists( __NAMESPACE__ . '\\Cookie_Controller' ) ) {
+				$service_id = Cookie_Controller::get_instance()->unique_declared_service_id( $service_id, (int) $this->get_category(), (int) $this->get_id() );
+			}
+			if ( '' !== $service_id && $service_id !== $stored ) {
+				$this->write_service_id( $service_id );
+			}
+		}
+		$saved = parent::save();
+		// The REST handlers build their response before the faz_after_update_cookie
+		// action busts the caches, so drop the map here: the response must already
+		// carry the key this save just exposed.
+		if ( ! $this->is_discovered() && class_exists( __NAMESPACE__ . '\\Cookie_Controller' ) ) {
+			Cookie_Controller::get_instance()->forget_declared_service_map();
+		}
+		return $saved;
+	}
+
+	/**
+	 * Write meta.service_id without set_meta()'s script stripping.
+	 *
+	 * @param string $service_id Sanitised id.
+	 * @return void
+	 */
+	private function write_service_id( $service_id ) {
+		$meta               = $this->get_meta();
+		$meta['service_id'] = $service_id;
+		$this->set_object_data( 'meta', $meta );
+		$this->decoded_meta = null;
+	}
+
+	/**
+	 * Whether a cookie name belongs to a Known_Providers service.
+	 *
+	 * Such a cookie already has an owner — the provider's toggle and key — so a
+	 * hand-declared row for it (an operator adding `_ga` because the scanner
+	 * missed it) must not become a second service for the same cookie: the
+	 * preference centre would show two toggles, and the most-restrictive
+	 * shredder rule would delete `_ga` for a visitor who granted Google
+	 * Analytics but left the duplicate off (#365 review). Exact names and
+	 * trailing-wildcard patterns (`_ga_*`), the same matching the shredder uses.
+	 *
+	 * @param string $name Cookie name.
+	 * @return bool
+	 */
+	public static function is_provider_cookie_name( $name ) {
+		$name = (string) $name;
+		if ( '' === $name || ! class_exists( '\\FazCookie\\Includes\\Known_Providers' ) ) {
+			return false;
+		}
+		foreach ( \FazCookie\Includes\Known_Providers::get_all() as $provider ) {
+			if ( empty( $provider['cookies'] ) || ! is_array( $provider['cookies'] ) ) {
+				continue;
+			}
+			foreach ( $provider['cookies'] as $pattern ) {
+				$pattern = (string) $pattern;
+				if ( $pattern === $name ) {
+					return true;
+				}
+				if ( false !== strpos( $pattern, '*' ) && preg_match( '/^' . str_replace( '\\*', '.*', preg_quote( $pattern, '/' ) ) . '$/', $name ) ) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * The service-id derivation behind get_service_id(), callable on raw row
+	 * values so the frontend scripts map (which reads wp_faz_cookies directly,
+	 * without building a Cookie per row) tags each script with the same key the
+	 * per-service toggle and getFazConsent().services use.
+	 *
+	 * @param string $slug Row slug (may be '').
+	 * @param string $name Row name.
+	 * @return string '' when neither yields a usable key.
+	 */
+	public static function derive_service_id( $slug, $name ) {
+		$base = is_string( $slug ) ? trim( $slug ) : '';
+		if ( '' === $base ) {
+			$base = is_string( $name ) ? sanitize_text_field( $name ) : '';
+		}
+		if ( '' === $base ) {
+			return '';
+		}
+		$title = function_exists( 'sanitize_title' ) ? sanitize_title( $base ) : strtolower( preg_replace( '/\s+/', '-', $base ) );
+		$id    = sanitize_key( $title );
+		if ( '' === $id ) {
+			return '';
+		}
+		// The Known_Providers ids are reserved: a cookie an operator happened to
+		// name "google-analytics" must not share a key with the provider
+		// toggle, or getFazConsent().services[id] would answer with the
+		// provider's consent and the declared cookie would vanish from the per-
+		// service lists (first id wins there). The suffix is deterministic and
+		// applied here, at the one derivation every surface (REST, admin dialog,
+		// store, scripts map) goes through, so they keep agreeing.
+		if ( class_exists( '\\FazCookie\\Includes\\Known_Providers' ) ) {
+			$providers = \FazCookie\Includes\Known_Providers::get_all();
+			if ( is_array( $providers ) && isset( $providers[ $id ] ) ) {
+				$id .= '-cookie';
+			}
+		}
+		return $id;
+	}
+
+	/**
+	 * Return the provider's privacy-policy URL for this cookie ('' when unset).
+	 *
+	 * Shown under the cookie row in the banner preference centre, the generated
+	 * policy and the [faz_cookie_table] shortcode so the visitor can read the
+	 * third party's own policy before deciding (#360).
+	 *
+	 * @return string
+	 */
+	public function get_policy_url() {
+		$meta = $this->get_meta();
+		return isset( $meta['policy_url'] ) ? (string) $meta['policy_url'] : '';
+	}
+
+	/**
+	 * Set the provider's privacy-policy URL, merging into the existing meta.
+	 *
+	 * Routes through set_meta() like every other meta write. Reachable from the
+	 * REST single-item update, the bulk endpoint and settings import via the
+	 * generic set_{key}() dispatch, because `policy_url` is a schema property.
+	 *
+	 * @param string $url Raw URL.
+	 * @return void
+	 */
+	public function set_policy_url( $url ) {
+		$meta               = $this->get_meta();
+		$meta['policy_url'] = self::sanitize_policy_url_value( $url );
+		$this->set_meta( $meta );
+	}
+
+	/**
+	 * Whether the opt-in script must ALSO run on every later page load while
+	 * the cookie's category stays accepted — not only at the moment of the
+	 * accept click (#360).
+	 *
+	 * @return bool
+	 */
+	public function get_opt_in_run_each_load() {
+		$meta = $this->get_meta();
+		return isset( $meta['opt_in_run_each_load'] ) && true === $meta['opt_in_run_each_load'];
+	}
+
+	/**
+	 * Set the "run the opt-in script on every page load" flag.
+	 *
+	 * @param mixed $flag Anything the strict bool allowlist recognises.
+	 * @return void
+	 */
+	public function set_opt_in_run_each_load( $flag ) {
+		$meta                         = $this->get_meta();
+		$meta['opt_in_run_each_load'] = self::sanitize_bool_value( $flag );
+		$this->set_meta( $meta );
+	}
+
+	/**
+	 * Keep only an absolute http(s) URL; anything else becomes ''.
+	 *
+	 * Public so the REST schema boundary (Cookies_API::sanitize_policy_url_field)
+	 * and the model setter normalise identically. esc_url_raw() is used when WP
+	 * is loaded (it also strips a stray javascript: scheme); the standalone
+	 * fallback keeps the same contract for CLI/unit contexts.
+	 *
+	 * @param mixed $value Raw value.
+	 * @return string
+	 */
+	public static function sanitize_policy_url_value( $value ) {
+		if ( ! is_scalar( $value ) ) {
+			return '';
+		}
+		$url = trim( (string) $value );
+		if ( '' === $url || strlen( $url ) > 2048 ) {
+			return '';
+		}
+		// Judge the operator's OWN input first: esc_url_raw() would prepend
+		// "http://" to a scheme-less host and encode a space as %20, turning a
+		// value this contract says to refuse into one that passes the check
+		// below. Absolute http(s), no whitespace or control characters.
+		if ( ! preg_match( '#^https?://[^\x00-\x20\x7f]+$#i', $url ) ) {
+			return '';
+		}
+		if ( function_exists( 'esc_url_raw' ) ) {
+			$url = esc_url_raw( $url, array( 'http', 'https' ) );
+		}
+		if ( ! preg_match( '#^https?://[^\s/$.?\#][^\s]*$#i', $url ) ) {
+			return '';
+		}
+		return $url;
+	}
+
+	/**
+	 * Strict bool allowlist shared by the flag setter and get_meta().
+	 *
+	 * Only an explicit truthy token turns the flag on — the same rule
+	 * sanitize_transfer_value() applies to `enabled`, so an unrecognised value
+	 * (including the string "false" a form may post) resolves to off.
+	 *
+	 * @param mixed $value Raw value.
+	 * @return bool
+	 */
+	public static function sanitize_bool_value( $value ) {
+		if ( is_string( $value ) ) {
+			$value = strtolower( trim( $value ) );
+		}
+		return in_array( $value, array( true, 1, '1', 'true', 'yes', 'on' ), true );
 	}
 
 	/**
