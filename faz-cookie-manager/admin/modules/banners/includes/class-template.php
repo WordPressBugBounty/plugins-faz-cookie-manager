@@ -446,7 +446,13 @@ class Template {
 		if ( '' === $template ) {
 			return $html;
 		}
-		$html = do_shortcode( $template );
+		// The chosen notice button order (#367) is applied to the shortcodes,
+		// so the buttons are rendered in that order rather than moved by CSS.
+		$settings = isset( $this->properties['settings'] ) && is_array( $this->properties['settings'] )
+			? $this->properties['settings']
+			: array();
+		$template = Banner::apply_button_order( $template, isset( $settings['buttonOrder'] ) ? $settings['buttonOrder'] : '' );
+		$html     = do_shortcode( $template );
 		if ( ! class_exists( 'DOMDocument' ) || ! class_exists( 'DOMXPath' ) ) {
 			return $html;
 		}
@@ -473,6 +479,25 @@ class Template {
 				foreach ( $preview_nodes as $node ) {
 					$node->parentNode->removeChild( $node ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName
 				}
+			}
+
+			// The template is printed as a <template> element, so a page
+			// optimiser now sees its images. A lazy-loader that swaps `src` for
+			// a placeholder (LiteSpeed's, WP Rocket's, Jetpack's…) leaves the
+			// mounted banner without its icons: the content of a <template> is
+			// never in view, and the loader's script does not watch it. Every
+			// image carries the opt-outs those loaders honour.
+			foreach ( $finder->query( '//img' ) as $img ) {
+				if ( ! $img instanceof \DOMElement ) {
+					continue;
+				}
+				$img->setAttribute( 'data-no-lazy', '1' );
+				$img->setAttribute( 'data-skip-lazy', '1' );
+				$classes = preg_split( '/\s+/', trim( $img->getAttribute( 'class' ) ), -1, PREG_SPLIT_NO_EMPTY );
+				if ( ! in_array( 'skip-lazy', $classes, true ) ) {
+					$classes[] = 'skip-lazy';
+				}
+				$img->setAttribute( 'class', implode( ' ', $classes ) );
 			}
 
 			$elements   = $finder->query( '//*[@data-faz-tag]' );
@@ -717,6 +742,8 @@ class Template {
 					'ptype'          => isset( $settings['preferenceCenterType'] ) ? $settings['preferenceCenterType'] : 'popup',
 					'theme'          => isset( $settings['theme'] ) ? $settings['theme'] : 'light',
 					'law'            => isset( $settings['applicableLaw'] ) ? $settings['applicableLaw'] : 'gdpr',
+					// The notice button order rewrites the markup (#367).
+					'button_order'   => Banner::sanitize_button_order( isset( $settings['buttonOrder'] ) ? $settings['buttonOrder'] : '' ),
 					'do_not_sell'    => $do_not_sell,
 					'optout_popup'   => ! empty( $config['optoutPopup']['status'] ),
 					'revisit_status' => isset( $config['revisitConsent']['status'] ) ? (bool) $config['revisitConsent']['status'] : true,

@@ -4,7 +4,7 @@ Donate link: https://buymeacoffee.com/fabiodalez
 Tags: cookie, gdpr, ccpa, consent, privacy
 Requires at least: 5.0
 Tested up to: 7.1
-Stable tag: 1.35.0
+Stable tag: 1.36.0
 Requires PHP: 7.4
 License: GPL-3.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
@@ -191,11 +191,27 @@ Documentation / Privacy:
 * https://amp.dev/documentation/components/amp-consent
 * https://policies.google.com/privacy
 
+= Google tag (Google Analytics, Google Ads, Google Tag Manager) =
+
+Used only when you enter one or more Google tag IDs under Google Consent Mode → Google Tag, to load Google's tag in the visitor's browser on your behalf. The plugin loads nothing from Google while that field is empty.
+
+Triggered when: a visitor accepts the consent category the tag belongs to (Analytics for G-/GT- IDs, Marketing for AW-/DC- IDs, the catalogue category of Google Tag Manager for GTM- IDs). With Advanced Consent Mode enabled, the gtag.js tags for G-/GT-/AW-/DC- IDs load on page view before consent in Google's cookieless mode; Tag Manager containers always wait for consent. Nothing is loaded on pages where the consent banner is turned off.
+
+Data sent: by the visitor's browser, directly to Google: the visitor IP address, standard browser request data, the configured tag IDs, and whatever the tag itself collects under the consent state the plugin signals. Your server sends nothing to Google.
+
+Service URLs:
+* https://www.googletagmanager.com/gtag/js
+* https://www.googletagmanager.com/gtm.js
+
+Terms of Service / Privacy Policy:
+* https://marketingplatform.google.com/about/analytics/terms/us/
+* https://policies.google.com/privacy
+
 = Note on third-party domain strings inside the plugin codebase =
 
 The source contains third-party domain names (`js.stripe.com`, `connect.facebook.net`, `googletagmanager.com` and others) purely as **string patterns**, for two purposes:
 
-1. **Blocking detection** -- to recognise analytics, advertising and tracking scripts injected by the site's *other* plugins, so they can be held until consent. This plugin loads none of them itself.
+1. **Blocking detection** -- to recognise analytics, advertising and tracking scripts injected by the site's *other* plugins, so they can be held until consent. This plugin loads none of them itself, with one opt-in exception: the Google tag you configure under Google Consent Mode → Google Tag (see its entry above).
 2. **Explicit exceptions** -- no whole third-party plugin is whitelisted and no profiling resource is: Google Fonts, Google Maps, OAuth endpoints and generic CDNs stay blocked until consent. The only defaults are four anti-abuse challenge endpoints (reCAPTCHA, its gstatic assets, Cloudflare Turnstile, hCaptcha), which gate a form the visitor is actively submitting and load before consent by default. Whether they count as strictly necessary is the site owner's call: Settings → Script Blocking → "Allow anti-spam services before consent" holds them until consent instead. An administrator can also add a narrow audited exception in Settings.
 
 Every outbound request documented above happens only when its feature is used. `/faz/v1/banner` is hosted by this plugin on the same site: no third-party call leaves the visitor's browser.
@@ -271,7 +287,9 @@ Yes. The Languages page lets you select from 180+ available languages. Each bann
 
 = Does it work with GTranslate or another translation proxy that serves my site on other domains? =
 
-Yes. GTranslate's paid plans (and similar proxies, mirrors or CDN hosts) serve translated copies of your pages on other hosts — `example.de`, `de.example.com` — and forward every request made there, including the consent log and the Do-Not-Sell form, back to your WordPress site. Three things follow, and the plugin handles each one:
+Yes. GTranslate's paid plans (and similar proxies, mirrors or CDN hosts) serve translated copies of your pages on other hosts — `example.de`, `de.example.com` — and forward every request made there, including the consent log and the Do-Not-Sell form, back to your WordPress site. Four things follow, and the plugin handles each one:
+
+* **The banner itself.** The proxy translates the page, banner included, so on a translated domain the banner shows in that language. The banner markup travels in a `<template>` element the proxy can translate without breaking its structure. (Up to 1.35.0 it travelled in a script element the proxy also read as HTML, which on the translated domains left the consent bar nested inside the revisit button with no buttons.)
 
 * **The consent cookie on a translated domain.** A browser cannot share a cookie between different registrable domains, so on `example.de` the consent is stored for that domain only, even when "Share consent across subdomains" is on for `example.com`. The visitor makes their choice once per domain. (Earlier versions wrote the cookie for the configured domain, which the browser rejects on another domain, so the banner came back on every page.) A cookie the server itself sets, such as the Do-Not-Sell confirmation, is host-only too.
 * **Consent records and Do-Not-Sell submissions from those domains.** They arrive with the translated domain as their origin and used to be refused as "cross-origin". The domains GTranslate's own settings describe (Enterprise plan: custom domains or language sub-domains) are now trusted automatically while GTranslate is active. Any other domain is added under **Settings → Trusted Alternate Domains** (one per line: a bare domain, or a full URL when the scheme or port matters), or with the `faz_trusted_origins` filter. **System Status** lists the effective domains and where each came from.
@@ -279,9 +297,9 @@ Yes. GTranslate's paid plans (and similar proxies, mirrors or CDN hosts) serve t
 
 `add_filter( 'faz_trusted_proxy_cidrs', function ( $cidrs ) { return array_merge( $cidrs, array( '203.0.113.0/24' ) ); } );`
 
-`add_filter( 'faz_proxy_forwarded_header', function () { return 'HTTP_X_GT_VIEWER_IP'; } );`
+`add_filter( 'faz_proxy_forwarded_header', function () { return 'HTTP_X_GT_CLIENTIP'; } );`
 
-Replace `203.0.113.0/24` with the ranges you were given. See "My site is behind Cloudflare or a reverse proxy" below for how these two filters work.
+Replace `203.0.113.0/24` with the ranges you were given; GTranslate publishes its current list at https://gtranslate.net/ips.txt. The filter takes the server variable name of the header: GTranslate forwards the visitor's address in `X-GT-ClientIP`, which PHP exposes as `HTTP_X_GT_CLIENTIP`. See "My site is behind Cloudflare or a reverse proxy" below for how these two filters work.
 
 = Does multi-banner mean one banner per language? =
 
@@ -469,6 +487,12 @@ The full changelog (every release back to 1.0.0) lives at:
 https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/blob/main/CHANGELOG.md
 and on the GitHub Releases page:
 https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/releases
+
+= 1.36.0 =
+* Added: Banner → Buttons → Button Order chooses the order of the notice buttons (#367). The four orders offered all keep Accept All and Reject All next to each other, because position is part of the equal weight the EDPB and the Garante ask for between accepting and refusing. The order is written into the markup, so keyboard focus follows what is on screen.
+* Added: Google Consent Mode → Google Tag: enter up to five Google tag IDs (G-, GT-, AW-, DC-, GTM-) and the plugin loads them itself (#366). Each tag waits for the consent a pasted copy would get: Google Analytics for Analytics, Google Ads and Floodlight for Marketing, each with its own loader, and the Tag Manager container for its category. The tags are printed already blocked, so they also stay held on a page excluded from script blocking. With Advanced Consent Mode on, gtag.js loads before consent behind the denied default and the container still waits. The settings page warns when the home page already loads one of the IDs from elsewhere.
+* Fixed: On a domain served through a translation proxy such as the GTranslate Translation Proxy the banner broke: the consent bar ended up inside the revisit button, without its buttons. The banner markup now travels in a template element the proxy translates without breaking it, so the banner also shows in the translated language. The FAQ names GTranslate's X-GT-ClientIP header (HTTP_X_GT_CLIENTIP).
+* Fixed: On phones the templates reordered the notice buttons with CSS, putting Reject last and away from Accept, while keyboard focus followed a different order (#368). Phones now show the buttons in the same order as desktop, the one chosen under Button Order.
 
 = 1.35.0 =
 * Added: A cookie declared by hand under Cookies is now a consent service of its own (#360). It appears in window.getFazConsent().services under a stable Service ID shown in the cookie dialog and exposed read-only by the REST API; with per-service consent on it also gets its own toggle in the preference centre and is honoured by the cookie shredder. The id is fixed at the first save, so a later rename or slug edit never moves the key a returning visitor's choice is stored under. Cookies that belong to a known provider, scanner-discovered cookies and Necessary cookies are not exposed as separate services, and script blocking is unchanged.

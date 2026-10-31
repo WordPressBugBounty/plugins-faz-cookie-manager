@@ -10,7 +10,7 @@ if ( typeof window._fazConfig === 'undefined' && typeof window._fazCfg !== 'unde
 // Declared up here, ahead of everything that can stand the runtime down,
 // because the version-skew check below must run on exactly the page views
 // where the runtime never starts. See the longer note above `_fazRef._diag`.
-const _FAZ_BUILD = '1.35.0+static-config-recovery-and-proxy-hosts';
+const _FAZ_BUILD = '1.36.0+static-config-recovery-and-proxy-hosts';
 // Version skew between this bundle and the PHP side that printed _fazConfig.
 // `_version` is FAZ_VERSION from the main plugin file (it is also the `?ver=`
 // of this script's own URL), and the numeric prefix of _FAZ_BUILD is the
@@ -2078,10 +2078,10 @@ function _fazFetchBannerForLanguage(endpoint, lang, timeoutMs) {
  * with the payload returned by the REST endpoint. Must run before
  * _fazRenderBanner() parses the template.
  *
- * The banner HTML is stored inside a `<script type="text/template">`
- * element and originates from a wp_kses-sanitised PHP render; writing it
- * via textContent preserves the exact same content contract as the
- * server-initial render (which uses echo wp_kses inside the same tag).
+ * The banner HTML is stored in the `<template id="fazBannerTemplate">`
+ * element and originates from a wp_kses-sanitised PHP render, the same
+ * contract as the server-initial render; _fazWriteBannerTemplate() writes it
+ * in the form that element needs.
  *
  * @param {Object} payload Response body from /faz/v1/banner/{lang}.
  */
@@ -2135,7 +2135,7 @@ function _fazApplyBannerPayload(payload) {
     }
     if (typeof payload.html === 'string' && payload.html !== '') {
         var tpl = document.getElementById('fazBannerTemplate');
-        if (tpl) tpl.textContent = payload.html;
+        if (tpl) _fazWriteBannerTemplate(tpl, payload.html);
     }
     if (typeof payload.styles === 'string' && payload.styles !== '') {
         var style = document.getElementById('faz-jurisdiction-bootstrap-styles');
@@ -2584,21 +2584,50 @@ function _fazDomReady(callback) {
 }
 
 /**
+ * Whether #fazBannerTemplate is a <template> element (the current markup)
+ * rather than the <script type="text/template"> earlier releases printed.
+ *
+ * @param {Element} template #fazBannerTemplate.
+ * @returns {boolean}
+ */
+function _fazIsTemplateElement(template) {
+    return !!template && String(template.nodeName).toLowerCase() === 'template' && !!template.content;
+}
+
+/**
  * Read the banner template markup.
  *
- * The server escapes every `</` in the template as `<\/` (see
- * Frontend::banner_html()), so that an HTML4 parser that rewrites the page —
- * PHP's DOMDocument::loadHTML(), used by image optimisers such as WPSpeed's —
- * cannot read the closing tags as the end of the <script> element and drop
- * them. Browsers keep `<\/` as literal text inside a script, so it is undone
- * here. Content written client-side (the geo bootstrap) is not escaped, which
- * the replacement leaves untouched.
+ * The server prints a <template> (see Frontend::banner_html()), whose
+ * innerHTML serialises its inert content. A page cached before the update
+ * still carries the old <script type="text/template">, in which the server
+ * wrote every `</` as `<\/` for HTML4 page rewriters; that escape is undone
+ * for the script form only.
  *
  * @param {Element} template #fazBannerTemplate.
  * @returns {string}
  */
 function _fazReadBannerTemplate(template) {
-    return String(template.innerHTML || '').replace(/<\\\//g, '</');
+    var html = String(template.innerHTML || '');
+    return _fazIsTemplateElement(template) ? html : html.replace(/<\\\//g, '</');
+}
+
+/**
+ * Replace the banner template markup (the geo bootstrap's live payload).
+ *
+ * A <template> takes the markup as parsed nodes in its inert content:
+ * textContent would store it as a text node that innerHTML then serialises
+ * escaped. innerHTML on a <template> parses into that inert content, so
+ * nothing in it runs or loads. The legacy script form keeps textContent.
+ *
+ * @param {Element} template #fazBannerTemplate.
+ * @param {string} html Banner markup (wp_kses-sanitised on the server).
+ */
+function _fazWriteBannerTemplate(template, html) {
+    if (_fazIsTemplateElement(template)) {
+        template.innerHTML = html;
+    } else {
+        template.textContent = html;
+    }
 }
 
 /**
@@ -6780,7 +6809,7 @@ function _fazMutationObserver(mutations) {
                     : "";
                 var nodeCategory = rawCategory.replace("fazcookie-", "");
                 var nodeService = node.getAttribute ? (node.getAttribute("data-faz-service") || "") : "";
-                if (!_fazShouldBlockResource(nodeCategory, blockingTarget, nodeService)) continue;
+                if (!_fazShouldBlockScriptNode(node, nodeCategory, blockingTarget, nodeService)) continue;
                 // Reveal a per-service toggle for the provider we just blocked.
                 // This is the only place a JS-injected embed (e.g. a YouTube
                 // iframe_api player) — invisible to the server-side scanner — is
@@ -6882,7 +6911,7 @@ function _fazUnblock() {
                 var nodeService = node && typeof node.getAttribute === "function"
                     ? (node.getAttribute("data-faz-service") || "")
                     : "";
-                if (_fazShouldBlockResource(nodeCategory, nodeTarget, nodeService)) return true;
+                if (_fazShouldBlockScriptNode(node, nodeCategory, nodeTarget, nodeService)) return true;
                 if (node.nodeName.toLowerCase() === "script") {
                     if (anchor && !anchor.isConnected) return false;
                     // Connect the original inert node first. The common restore
@@ -7198,7 +7227,7 @@ function _fazDrainScriptRestoreQueue() {
         if (!script.isConnected || script.getAttribute('data-faz-executed') === '1'
             || (waitFor && _fazIsCategoryToBeBlocked(waitFor))
             || (!_fazIsUserWhitelisted(src, script) && !script.classList.contains('faz-skip')
-                && _fazShouldBlockResource(category, src || script.textContent || '', service))) {
+                && _fazShouldBlockScriptNode(script, category, src || script.textContent || '', service))) {
             _fazScriptRestorePending.delete(script);
             continue;
         }
@@ -7932,6 +7961,121 @@ function _fazGetServiceConsentForTarget(formattedRE) {
         }
     }
     return hasExplicitYes ? "yes" : "";
+}
+
+/**
+ * The provider of a gtag.js script the plugin itself printed, or "" (#371 review).
+ *
+ * Mirror of Google_Tag::own_tag_provider(). The Ads/Floodlight loader
+ * (gtag/js?id=AW-…) also matches the google-analytics catalogue pattern, so
+ * _fazShouldBlockResource() — which ORs in a provider match on the URL — kept
+ * it parked for a visitor who accepted Marketing and rejected Analytics. The
+ * server prints the real provider in data-faz-google-tag; it is trusted only
+ * when the marker, the URL and every ID agree with the generated markup, and
+ * for a parked copy only when data-faz-service names the same provider. Any
+ * other script borrowing the attribute keeps the URL matching it always had.
+ * The Tag Manager container is never trusted this way.
+ *
+ * @param {Element} script
+ * @return {string} "google-analytics", "google-ads" or "".
+ */
+function _fazOwnGoogleTagProvider(script) {
+    if (!script || typeof script.getAttribute !== "function") return "";
+    var marker = script.getAttribute("data-faz-google-tag") || "";
+    if (marker !== "google-analytics" && marker !== "google-ads") return "";
+    var service = script.getAttribute("data-faz-service");
+    if (service !== null && service !== marker) return "";
+    var ids = [];
+    var src = (script.getAttribute("src") || "").trim();
+    if (src) {
+        var loader = /^https:\/\/www\.googletagmanager\.com\/gtag\/js\?id=([A-Z0-9-]+)(?:&l=[A-Za-z0-9_%]+)?$/.exec(src);
+        if (!loader) return "";
+        ids.push(loader[1]);
+    } else {
+        var body = (script.textContent || "").trim();
+        var boot = /^window\[("[A-Za-z0-9_$]+")\]=window\[\1\]\|\|\[\];function gtag\(\)\{window\[\1\]\.push\(arguments\);\}gtag\("js",new Date\(\)\);((?:gtag\("config","[A-Z0-9-]+"\);)+)$/.exec(body);
+        if (!boot) return "";
+        var re = /gtag\("config","([A-Z0-9-]+)"\);/g, m;
+        while ((m = re.exec(boot[2]))) ids.push(m[1]);
+    }
+    if (!ids.length) return "";
+    for (var i = 0; i < ids.length; i++) {
+        var provider = /^(G|GT)-[A-Z0-9]{4,20}$/.test(ids[i]) ? "google-analytics"
+            : (/^(AW|DC)-[A-Z0-9]{4,20}$/.test(ids[i]) ? "google-ads" : "");
+        if (provider !== marker) return "";
+    }
+    return marker;
+}
+
+/**
+ * Block decision for one of the plugin's own gtag.js scripts: its own service's
+ * explicit choice, then its own category — never another provider's URL match.
+ *
+ * @param {string} category Category the script is parked under.
+ * @param {string} provider _fazOwnGoogleTagProvider() result.
+ * @return {boolean}
+ */
+function _fazShouldBlockOwnGoogleTag(category, provider) {
+    var geoPending = _fazGeoBootstrapPending();
+    if (!geoPending && _fazStore._perServiceConsent && _fazIsRecognizedService(provider)) {
+        var explicit = _fazRef._fazGetFromStore("svc." + provider);
+        if (explicit === "no") return true;
+        if (explicit === "yes") return false;
+    }
+    if (!category) {
+        // Two own tags carry no category (#371 review): the live markup
+        // render() prints under the Advanced exemption, and the clone the
+        // restore queue inserts (_fazBuildRestoredScript() drops the parking
+        // attributes). Both reach the mutation observer, and treating "no
+        // category" as "blocked" re-parked them for good.
+        // Advanced: the live tag runs behind the denied consent default, as
+        // _fazShouldBlockResource() lets any gtag.js URL — only the explicit
+        // denial above holds it.
+        if (!geoPending && _fazStore._gcmAdvanced) return false;
+        // Otherwise judge it by its own provider's category, resolved from the
+        // store only — category slugs are dynamic, so a literal "marketing"
+        // could name a category this site does not have, which
+        // _fazIsCategoryToBeBlocked() would read as "not blocked" (#371 review).
+        // A provider whose category cannot be resolved to a configured one
+        // stays parked.
+        category = _fazUndetectedProviderCategory(provider) || _fazKnownServiceCategory(provider);
+        if (!category || !_fazCategoryIsConfigured(category)) return true;
+    }
+    return _fazIsCategoryToBeBlocked(category);
+}
+
+/** Whether a category slug is one of this site's configured categories. */
+function _fazCategoryIsConfigured(slug) {
+    var cats = _fazStore._categories || [];
+    for (var i = 0; i < cats.length; i++) {
+        if (cats[i] && cats[i].slug === slug) return true;
+    }
+    return false;
+}
+
+/**
+ * Block decision for a script element: the plugin's own Google tag by its own
+ * service and category, every other node by _fazShouldBlockResource(). Used by
+ * every path that judges a script ELEMENT — the restore queue, the mutation
+ * observer (which also sees the restored clone, still carrying its gtag.js
+ * URL) and the backup-node pass — so one of them cannot re-park what another
+ * released.
+ */
+function _fazShouldBlockScriptNode(node, category, target, serviceId) {
+    var own = _fazOwnGoogleTagProvider(node);
+    if (!own) return _fazShouldBlockResource(category, target, serviceId);
+    // The clone the restore queue just released (data-faz-executed): it was
+    // judged with its full category before release, and
+    // _fazBuildRestoredScript() then dropped data-faz-category. Re-deciding it
+    // from scratch is what re-parked it. Only what can change after release
+    // still holds it: an explicit denial of its own service, or the geo
+    // bootstrap not having resolved yet (#371 review).
+    if (!category && node.getAttribute && node.getAttribute("data-faz-executed") === "1") {
+        if (_fazGeoBootstrapPending()) return true;
+        return !!(_fazStore._perServiceConsent && _fazIsRecognizedService(own)
+            && _fazRef._fazGetFromStore("svc." + own) === "no");
+    }
+    return _fazShouldBlockOwnGoogleTag(category, own);
 }
 
 function _fazShouldBlockResource(category, target, serviceId) {

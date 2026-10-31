@@ -390,6 +390,9 @@ class Frontend {
 		// top of <head>, ahead of theme/plugin gtag snippets. No-op unless
 		// Advanced mode is on.
 		add_action( 'wp_head', array( $this, 'print_gcm_default_inline' ), 0 );
+		// Built-in Google tag (#366): right after the Advanced-mode default, so
+		// the tag never runs ahead of the consent default it depends on.
+		add_action( 'wp_head', array( $this, 'print_google_tag' ), 1 );
 		add_action( 'template_redirect', array( $this, 'render_banner_preview_frame' ), 0 );
 		// Cookie shredding needs the resolved main query so WooCommerce checkout /
 		// cart conditionals and page exclusions are reliable. template_redirect is
@@ -936,7 +939,7 @@ class Frontend {
 				 * the first paint.
 				 *
 				 * Nothing on the page needs it before script.js runs: the banner
-				 * is built from a <script type="text/template"> by script.js, and
+				 * is built from a <template> by script.js, and
 				 * the few rules that style server-rendered page content
 				 * (.faz-hidden on blocked embeds, the placeholder floor, the
 				 * [faz_cookie_settings] button) are printed inline below. So the
@@ -1602,11 +1605,11 @@ class Frontend {
 	 * the document as HTML4 (DOMDocument::loadHTML(), e.g. WPSpeed's image
 	 * optimiser). libxml ends a <script> at the first `</` followed by a
 	 * letter, so a `</` inside the bundle's string literals truncates the
-	 * script. The banner template escapes `</` as `<\/` for this reason
-	 * (escape_template_end_tags()), but that is not done here on purpose:
-	 * rewriting `</` in JavaScript source would corrupt regex literals and
-	 * other code where `<\/` is not equivalent. A site that combines this
-	 * option with such a rewriter should leave this option off.
+	 * script. The banner template avoids this by being a <template> rather
+	 * than a script; a bundle cannot, and rewriting `</` in JavaScript source
+	 * would corrupt regex literals and other code where `<\/` is not
+	 * equivalent. A site that combines this option with such a rewriter
+	 * should leave this option off.
 	 *
 	 * @param string $handle        Script handle.
 	 * @param string $relative_path Path relative to frontend/.
@@ -3170,8 +3173,7 @@ class Frontend {
 	}
 
 	/**
-	 * Print banner HTML as script template using
-	 * type="text/template" attribute
+	 * Print the banner HTML as an inert <template> for script.js to mount.
 	 *
 	 * @return void
 	 */
@@ -3251,37 +3253,23 @@ class Frontend {
 		// icon, which browsers surface as a local-network access prompt.
 		$html = $this->repair_stale_asset_origin( $html );
 
-		// `<script type="text/template">` is the W3C-recommended way to
-		// embed inert HTML templates in the page (browsers do NOT execute
-		// it — `type` is not `text/javascript` or `module`). The banner
-		// frontend mounts this template into the DOM at runtime via
-		// `_fazInjectBannerHtml()` in script.js. wp_enqueue_script()
-		// cannot model this: there is no JS to load, only an HTML payload
-		// that must appear inline so the renderer finds it synchronously.
-		// phpcs:ignore WordPress.WP.EnqueuedResources.NonEnqueuedScript -- inert HTML template (type=text/template is non-executable); see comment above.
-		echo '<script id="fazBannerTemplate" type="text/template">';
-		echo self::escape_template_end_tags( wp_kses( $html, faz_allowed_html() ) ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- already through wp_kses(); only `</` is rewritten.
-		echo '</script>';
-	}
-
-	/**
-	 * Write every `</` in the banner template as `<\/`.
-	 *
-	 * The template travels inside a <script type="text/template">. HTML5 ends
-	 * that element only at `</script`, but an HTML4 parser — libxml, i.e. PHP's
-	 * DOMDocument::loadHTML() — ends a script at any `</` followed by a letter
-	 * and then throws the stray end tags away. Optimisation plugins that
-	 * rewrite the whole page through DOMDocument (WPSpeed's image optimiser,
-	 * on by default) therefore delivered the template with every closing tag
-	 * removed: the browser nested the whole banner inside the title and the
-	 * consent bar rendered 0 px tall, with no buttons. `<\/` is plain text to
-	 * both parsers; _fazReadBannerTemplate() in script.js turns it back.
-	 *
-	 * @param string $html Sanitised template markup.
-	 * @return string
-	 */
-	public static function escape_template_end_tags( $html ) {
-		return str_replace( '</', '<\/', (string) $html );
+		// The banner markup travels in a <template> element: inert (nothing in
+		// it renders, runs or loads) and read by script.js, which mounts it
+		// into the page. It used to be a <script type="text/template"> with
+		// every `</` written as `<\/`, so that an HTML4 rewriter (libxml,
+		// DOMDocument::loadHTML() — WPSpeed's image optimiser) would not end
+		// the script at the first closing tag. A translation proxy (GTranslate
+		// Translation Proxy) parses that script body as HTML: it saw the
+		// opening tags, read every `<\/div>` as text, escaped it, translated
+		// it ("\ / Div", "przycisk") and closed the elements where it chose,
+		// so on the translated domains the consent bar ended up inside the
+		// revisit button with no buttons. In a <template> the closing tags are
+		// real: the proxy translates the text and keeps the structure, and
+		// libxml's HTML4 parser keeps an unknown element's children, so the
+		// DOMDocument round trip gives back the same DOM without any escape.
+		echo '<template id="fazBannerTemplate">';
+		echo wp_kses( $html, faz_allowed_html() ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- wp_kses() is the escape.
+		echo '</template>';
 	}
 
 	/**
@@ -3425,6 +3413,10 @@ class Frontend {
 		}
 		$gcm          = $this->gcm_settings;
 		$gcm_settings = $gcm->get();
+		// The built-in Google tag IDs (#366) are printed server-side by
+		// print_google_tag(); gcm.js has no use for them, and repeating them in
+		// an inline script makes the page look like it loads the tag twice.
+		unset( $gcm_settings['google_tag_ids'] );
 
 		// When the runtime geo-routing flag is on, override the Google Consent
 		// Mode default signals from the resolved ruleset's CMv2 block so the
@@ -3526,6 +3518,48 @@ class Frontend {
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- inline JS bootstrap; the id is a plugin constant passed through esc_attr, $hints is a literal, and every interpolated value is a bool/int or wp_json_encode of plugin-controlled constants, no user input.
 		echo '<script id="' . esc_attr( $this->gcm_default_script_id() ) . '"' . $hints . '>' . $js . "</script>\n";
+	}
+
+	/**
+	 * Print the built-in Google tag (#366) configured on the Consent Mode page.
+	 *
+	 * Printed only where the consent banner runs, so the visitor can always
+	 * release it: with the banner off there is no way to consent and nothing
+	 * is loaded. The gtag.js groups go out live only while the Advanced-mode
+	 * gtag exemption is active (the denied default is already in front of
+	 * them in this response), and then still pass through the output buffer
+	 * like any pasted tag, so an explicit per-service rejection keeps them
+	 * blocked. In every other case they, and the Tag Manager container always,
+	 * are printed already parked (see Google_Tag::render()).
+	 *
+	 * @return void
+	 */
+	public function print_google_tag() {
+		if ( apply_filters( 'faz_is_amp_request', false ) || faz_is_machine_readable_request() ) {
+			return;
+		}
+		if ( ! $this->gcm_settings || ! $this->template ) {
+			return;
+		}
+		if ( true === faz_disable_banner() || $this->is_banner_disabled_by_settings() ) {
+			return;
+		}
+		$ids = $this->gcm_settings->get_google_tag_ids();
+		if ( empty( $ids ) ) {
+			return;
+		}
+		$hints = apply_filters( 'faz_auto_exclude_cache_plugins', true )
+			? ' data-no-defer="1" data-no-optimize="1" data-no-minify="1" data-cfasync="false" data-ao-skip="1" data-noptimize="1"'
+			: '';
+		$markup = \FazCookie\Includes\Google_Tag::render(
+			$ids,
+			array(
+				'gtag_unblocked' => $this->gcm_advanced_exemption_active(),
+				'data_layer'     => $this->gcm_datalayer_name(),
+				'hints'          => $hints,
+			)
+		);
+		echo $markup; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Google_Tag::render() builds the markup from IDs validated against fixed patterns, escapes every attribute and encodes every JS value with wp_json_encode; $hints is a literal.
 	}
 
 	/**
@@ -5394,6 +5428,35 @@ class Frontend {
 		// Skip non-executable script types (structured data, templates, etc.).
 		if ( in_array( $type, array( 'application/ld+json', 'application/json', 'text/template', 'text/html', 'importmap' ), true ) ) {
 			return $full;
+		}
+
+		// The plugin's own Google tag (#371 review). print_google_tag() prints it
+		// live only under the Advanced Consent Mode exemption; parked copies are
+		// text/plain and never reach this point. Its gtag.js URL also matches the
+		// google-analytics catalogue pattern, so judged by URL the Ads/Floodlight
+		// loader was hard-blocked by a google-analytics denial it has nothing to
+		// do with. Judge it by the provider the server printed instead — trusted
+		// only for markup that is exactly Google_Tag::render()'s — so only an
+		// explicit denial of THAT service blocks it, as for any other Google tag
+		// under the exemption.
+		// Only a script carrying the marker pays for this, and a process that
+		// booted Frontend without the class (CLI, standalone harnesses) keeps
+		// the URL path instead of fataling.
+		$own_marker = (string) $this->extract_tag_attr( $attrs, 'data-faz-google-tag' );
+		$own_google = ( '' !== $own_marker && class_exists( '\\FazCookie\\Includes\\Google_Tag' ) )
+			? \FazCookie\Includes\Google_Tag::own_tag_provider(
+				$own_marker,
+				html_entity_decode( (string) $this->extract_tag_attr( $attrs, 'src' ), ENT_QUOTES | ENT_HTML5, 'UTF-8' ),
+				$content
+			)
+			: '';
+		if ( '' !== $own_google && $this->gcm_advanced_exemption_active() ) {
+			$own_consent = $this->get_service_consent();
+			if ( ! isset( $own_consent[ $own_google ] ) || 'no' !== $own_consent[ $own_google ] ) {
+				return $full;
+			}
+			$own_category = \FazCookie\Includes\Google_Tag::category_for( $own_google, 'google-ads' === $own_google ? 'marketing' : 'analytics' );
+			return '<script' . $this->label_category_first( $this->set_script_type_plain( $attrs ), $own_category ) . '>' . $content . '</script>';
 		}
 
 		$matched_category = $this->match_script_to_provider( $attrs, $match_body, $providers, $blocked_categories );
@@ -10965,7 +11028,8 @@ class Frontend {
 		// v5: the compact labels wrap instead of clipping, the buttons follow
 		// DOM order and the classic chevron keeps its padding. Same reason.
 		// v7: style the consent identifier in both inline and detached modals.
-		$cache_key = 'faz_boosted_css_v7_' . FAZ_VERSION . '_' . $layout . '_' . md5( $raw_css );
+		// v8: the comfortable phone layout follows the markup order (#368).
+		$cache_key = 'faz_boosted_css_v8_' . FAZ_VERSION . '_' . $layout . '_' . md5( $raw_css );
 		$cached    = get_transient( $cache_key );
 		if ( false !== $cached ) {
 			return $cached;
@@ -11000,7 +11064,7 @@ class Frontend {
 		$css_fixes .= '#faz-consent [data-faz-tag="detail-consent-id"],.faz-modal [data-faz-tag="detail-consent-id"]{display:block;margin:12px 24px;font-size:12px;color:var(--faz-detail-description-color,#212121);}'
 			. '#faz-consent [data-faz-tag="detail-consent-id"][hidden],.faz-modal [data-faz-tag="detail-consent-id"][hidden]{display:none;}'
 			. '#faz-consent [data-faz-tag="detail-consent-id"] input,.faz-modal [data-faz-tag="detail-consent-id"] input{display:block;width:100%;max-width:100%;margin-top:4px;padding:6px 8px;border:1px solid #c5c7cb;border-radius:4px;background:transparent;color:inherit;font-size:12px;}';
-		$css = $css_reset . $css . $css_fixes . self::settings_button_css() . self::compact_mobile_css( $layout );
+		$css = $css_reset . $css . $css_fixes . self::settings_button_css() . self::markup_order_mobile_css() . self::compact_mobile_css( $layout );
 
 		set_transient( $cache_key, $css, DAY_IN_SECONDS );
 		return $css;
@@ -11029,6 +11093,80 @@ class Frontend {
 		// emitted, and a row written before the sanitiser existed - or by hand -
 		// must not reach the stylesheet.
 		return 'compact' === $value ? 'compact' : 'comfortable';
+	}
+
+	/**
+	 * Phone rules shared by both layouts: the markup decides the order of the
+	 * buttons (#368).
+	 *
+	 * The compact layout below resets `order` on the notice buttons for its own
+	 * reasons (point 4); this does the same for the stacked comfortable layout,
+	 * where the template phone rules put Accept first and Reject last behind
+	 * Customise while focus still ran in markup order, and for the
+	 * preference-centre buttons in both layouts. The order of the markup itself
+	 * is the one chosen in Banner → Buttons (#367).
+	 *
+	 * Emitted for both layouts so the compact stylesheet stays the comfortable
+	 * one plus an appended block; where these rules out-rank a compact rule on
+	 * specificity, compact_mobile_css() restores its own value.
+	 *
+	 * @since 1.36.0
+	 * @return string CSS.
+	 */
+	private static function markup_order_mobile_css() {
+		// Every shipped template sorts the buttons on phones with CSS `order`:
+		// Accept 1, Customise / Save 2, Reject 3, against a markup order of
+		// Customise → Reject → Accept. Keyboard and screen-reader users then
+		// meet the buttons in a different order from the one on screen (WCAG
+		// 2.4.3, 1.3.2), and Reject ends up last, behind Customise, on phones
+		// only. `order:0` makes the phone layout follow the markup, whose order
+		// is the one chosen in Banner → Buttons (#367), so desktop and phone
+		// agree (#368). The rules carry the `#faz-consent` / `.faz-modal`
+		// prefixes boost_css_specificity() gives the template rules, so they
+		// win on document order at equal specificity.
+		return '@media (max-width:576px){'
+			. '#faz-consent .faz-notice-btn-wrapper .faz-btn,'
+			. '#faz-consent .faz-prefrence-btn-wrapper .faz-btn,'
+			. '.faz-modal .faz-prefrence-btn-wrapper .faz-btn{order:0;}'
+			// The preference-centre templates gave Accept `margin-top:0` as the
+			// button they sorted first; the first button in the markup takes it.
+			. '#faz-consent .faz-prefrence-btn-wrapper .faz-btn-accept,'
+			. '.faz-modal .faz-prefrence-btn-wrapper .faz-btn-accept{margin-top:10px;}'
+			. '#faz-consent .faz-prefrence-btn-wrapper .faz-btn:first-child,'
+			. '.faz-modal .faz-prefrence-btn-wrapper .faz-btn:first-child{margin-top:0;}'
+			// The classic template stretched only Accept to the full width and
+			// left Customise and Reject to share the row after it, so Accept was
+			// both first and wider than Reject. Every button takes its own full
+			// row, as in the other templates.
+			. '#faz-consent.faz-classic-top .faz-notice-btn-wrapper .faz-btn,'
+			. '#faz-consent.faz-classic-bottom .faz-notice-btn-wrapper .faz-btn{width:100%;margin-right:0;margin-left:0;}'
+			. '}'
+			// Box and popup (at 440px) and banner (at 425px) gave Accept a 16px
+			// top margin as the first button under the description; it now
+			// belongs to whichever button is first, at the same widths. Classic
+			// never had it and keeps its 10px.
+			. '@media (max-width:440px){'
+			. '#faz-consent .faz-notice-btn-wrapper .faz-btn-accept{margin-top:10px;}'
+			. self::first_notice_button_selector( array( 'box-bottom-left', 'box-bottom-right', 'box-top-left', 'box-top-right', 'popup-center' ) ) . '{margin-top:16px;}'
+			. '}'
+			. '@media (max-width:425px){'
+			. self::first_notice_button_selector( array( 'banner-top', 'banner-bottom' ) ) . '{margin-top:16px;}'
+			. '}';
+	}
+
+	/**
+	 * Selector list for the first notice button under the given container
+	 * position classes (without the `faz-` prefix).
+	 *
+	 * @param string[] $positions Position class suffixes.
+	 * @return string
+	 */
+	private static function first_notice_button_selector( array $positions ) {
+		$selectors = array();
+		foreach ( $positions as $position ) {
+			$selectors[] = '#faz-consent.faz-' . $position . ' .faz-notice-btn-wrapper .faz-btn:first-child';
+		}
+		return implode( ',', $selectors );
 	}
 
 	/**
@@ -11068,7 +11206,8 @@ class Frontend {
 	 * 5. Under 360px three buttons no longer fit side by side. Accept and reject
 	 *    stay paired on their own row and "customise" - the one control that
 	 *    takes no part in the equal-prominence comparison - takes a row of its
-	 *    own. Since it comes first in the markup, that row sits above the pair.
+	 *    own, above the pair or below it as the chosen button order (#367)
+	 *    places it in the markup.
 	 *
 	 * Emitted AFTER boost_css_specificity(), so the selectors are written with
 	 * their `#faz-consent` prefix already in place and need no `!important`:
@@ -11150,6 +11289,13 @@ class Frontend {
 			. '#faz-consent .faz-notice-btn-wrapper [data-faz-tag="donotsell-button"]{'
 			. 'flex:1 1 100%;width:100%;display:block;white-space:normal;'
 			. '}'
+			// markup_order_mobile_css() gives the first stacked button a 16px top
+			// margin and the classic buttons a full row each, with selectors
+			// heavier than the reset above. Side by side neither applies, so the
+			// compact values are restored with the same selectors, later.
+			. self::first_notice_button_selector( array( 'box-bottom-left', 'box-bottom-right', 'box-top-left', 'box-top-right', 'popup-center', 'banner-top', 'banner-bottom' ) ) . ','
+			. '#faz-consent.faz-classic-top .faz-notice-btn-wrapper .faz-btn,'
+			. '#faz-consent.faz-classic-bottom .faz-notice-btn-wrapper .faz-btn{width:auto;margin:0;}'
 			. '}'
 			. '@media (max-width:360px){'
 			// 40% rather than calc(50% - 4px): the exact value lands on the
@@ -12019,6 +12165,14 @@ class Frontend {
 	 *     on such a tag is dropped, which means text/javascript;
 	 *   - `<link data-href=…>` without `href` → `href` restored.
 	 *
+	 * And inside the banner <template>, the inline style "Lazy render" adds
+	 * (`content-visibility: auto;contain-intrinsic-size: auto Npx;`) is taken
+	 * off again. The template is real markup, so the Cloud Optimizer counts its
+	 * elements as page content below the fold; once mounted they are the fixed
+	 * consent bar and preference centre, where that containment would clip and
+	 * re-anchor them. Its exclusion list matches each element's own tag, which
+	 * the banner's unclassed inner elements would not match.
+	 *
 	 * @param mixed $html Optimised page HTML.
 	 * @return mixed
 	 */
@@ -12056,6 +12210,27 @@ class Frontend {
 		);
 		if ( is_string( $links ) ) {
 			$html = $links;
+		}
+
+		$template = preg_replace_callback(
+			'#(<template\b[^>]*\bid=(["\']?)fazBannerTemplate\2[^>]*>)(.*?)(</template>)#is',
+			static function ( $match ) {
+				// Not counted in $restored: with Lazy render on this happens on
+				// every optimised page by design, and is not a FAZ asset the
+				// exclusions failed to protect.
+				$body = preg_replace_callback(
+					'#\sstyle=(["\'])content-visibility:\s*auto;\s*contain-intrinsic-size:\s*auto\s+[0-9.]+px;\s*(.*?)\1#is',
+					static function ( $style ) {
+						return '' === trim( $style[2] ) ? '' : ' style=' . $style[1] . $style[2] . $style[1];
+					},
+					$match[3]
+				);
+				return $match[1] . ( is_string( $body ) ? $body : $match[3] ) . $match[4];
+			},
+			$html
+		);
+		if ( is_string( $template ) ) {
+			$html = $template;
 		}
 
 		if ( $restored > 0 ) {
