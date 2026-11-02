@@ -466,10 +466,23 @@ class Banner extends Store {
 				? $content['notice']['elements']['description']
 				: '';
 			$current     = self::normalize_notice_description( $current );
-			$old_default = self::normalize_notice_description( $defaults[ $old_key ] );
+			$old_default = array( self::normalize_notice_description( $defaults[ $old_key ] ) );
+			// A slot saved while its language had no catalogue holds the English
+			// copy, so the previous law's default is the English one there; the
+			// localised default alone no longer matches it once a catalogue ships.
+			// Both the resolved English copy (a downloaded en catalogue may reword
+			// it) and the shipped one, which is what such a slot was filled from.
+			if ( 'en' !== $lang ) {
+				$english       = self::get_law_notice_descriptions( 'en' );
+				$shipped       = self::shipped_english_contents();
+				$old_default[] = self::normalize_notice_description( $english[ $old_key ] );
+				if ( isset( $shipped[ $old_key ]['notice']['elements']['description'] ) ) {
+					$old_default[] = self::normalize_notice_description( $shipped[ $old_key ]['notice']['elements']['description'] );
+				}
+			}
 			$new_default = isset( $defaults[ $new_key ] ) ? $defaults[ $new_key ] : '';
 
-			if ( ( '' === $current || $current === $old_default )
+			if ( ( '' === $current || in_array( $current, $old_default, true ) )
 				&& '' !== $new_default
 				&& self::normalize_notice_description( $new_default ) !== $current ) {
 				if ( ! isset( $content['notice'] ) || ! is_array( $content['notice'] ) ) {
@@ -498,7 +511,9 @@ class Banner extends Store {
 	 * @return string
 	 */
 	private static function normalize_notice_description( $value ) {
-		return trim( preg_replace( '/\s+/', ' ', (string) $value ) );
+		// The same folding the stored-copy repair uses, so both recognise the
+		// whitespace an editor adds between paragraphs and neither ignores markup.
+		return self::fold_text( $value );
 	}
 
 	/**
@@ -622,6 +637,7 @@ class Banner extends Store {
 				$content           = isset( $data[ $lang ] ) ? $data[ $lang ] : array();
 				$content           = empty( self::array_empty_assoc( $content ) ) ? $this->get_translations( $lang ) : $content;
 				$content           = is_string( $content ) ? json_decode( $content, true ) : $content;
+				$content           = self::translate_stored_defaults( $content, $lang, $this->get_law() );
 				$contents[ $lang ] = $this->sanitize_contents( $content );
 			}
 		}
@@ -661,6 +677,7 @@ class Banner extends Store {
 		if ( ! is_array( $content ) ) {
 			return '';
 		}
+		$content = self::translate_stored_defaults( $content, $lang, $this->get_law() );
 		return isset( $content['notice']['elements']['description'] )
 			? (string) $content['notice']['elements']['description']
 			: '';
@@ -1031,6 +1048,98 @@ class Banner extends Store {
 		}
 		wp_cache_delete( 'faz_contents_v2_' . $safe_lang, 'faz_banner_contents' );
 		wp_cache_delete( 'faz_law_notice_desc_' . $safe_lang, 'faz_banner_contents' );
+	}
+
+	/**
+	 * Replace English defaults previously stored in a non-English slot.
+	 *
+	 * Saving the banner writes the copy of every selected language, and for a
+	 * language with no catalogue that copy is the English fallback. Once stored
+	 * the slot is no longer empty, so get_contents() never falls back to the
+	 * catalogue again: shipping one later (Croatian, in 1.36.1) changed nothing
+	 * on a site that had already saved its banner. The same repair already runs
+	 * for category names in Cookie_Categories::translate_stored_value().
+	 *
+	 * A leaf is replaced only while it still equals the shipped English default
+	 * at the same path, with whitespace and case folded so an editor reflow
+	 * still matches. Markup is compared as it is: a link or emphasis the
+	 * administrator added to the default sentence makes it their wording, and
+	 * it stays. The cost is the case the categories
+	 * accept too: English chosen on purpose in a non-English slot cannot be told
+	 * apart from English inherited, and is translated.
+	 *
+	 * @param mixed  $content Stored contents of one language.
+	 * @param string $lang    Language of that slot.
+	 * @param string $law     Banner law (gdpr, ccpa).
+	 * @return mixed The contents, with untouched English defaults translated.
+	 */
+	public static function translate_stored_defaults( $content, $lang, $law ) {
+		if ( 'en' === $lang || ! is_array( $content ) ) {
+			return $content;
+		}
+		$english = self::shipped_english_contents();
+		$local   = self::resolve_bundled_contents( $lang );
+		if ( ! isset( $english[ $law ], $local[ $law ] ) || ! is_array( $english[ $law ] ) || ! is_array( $local[ $law ] ) ) {
+			return $content;
+		}
+		return self::replace_english_leaves( $content, $english[ $law ], $local[ $law ] );
+	}
+
+	/**
+	 * The English copy as shipped in contents/en.json, without any downloaded
+	 * catalogue laid over it: the copy a slot without a catalogue was saved from.
+	 *
+	 * @return array
+	 */
+	private static function shipped_english_contents() {
+		static $english = null;
+		if ( null === $english ) {
+			$english = faz_read_json_file( __DIR__ . '/contents/en.json' );
+			$english = is_array( $english ) ? $english : array();
+		}
+		return $english;
+	}
+
+	/**
+	 * Walk translate_stored_defaults() over one subtree.
+	 *
+	 * @param array $stored  Stored subtree.
+	 * @param array $english Same subtree of the English catalogue.
+	 * @param array $local   Same subtree of the resolved catalogue for the slot's language.
+	 * @return array
+	 */
+	private static function replace_english_leaves( $stored, $english, $local ) {
+		foreach ( $stored as $k => $value ) {
+			if ( is_array( $value ) ) {
+				if ( isset( $english[ $k ], $local[ $k ] ) && is_array( $english[ $k ] ) && is_array( $local[ $k ] ) ) {
+					$stored[ $k ] = self::replace_english_leaves( $value, $english[ $k ], $local[ $k ] );
+				}
+				continue;
+			}
+			if ( ! is_string( $value ) || '' === trim( $value ) || ! isset( $english[ $k ], $local[ $k ] ) ) {
+				continue;
+			}
+			if ( ! is_string( $english[ $k ] ) || ! is_string( $local[ $k ] ) || $local[ $k ] === $english[ $k ] ) {
+				continue;
+			}
+			if ( self::fold_text( $value ) === self::fold_text( $english[ $k ] ) ) {
+				$stored[ $k ] = $local[ $k ];
+			}
+		}
+		return $stored;
+	}
+
+	/**
+	 * Comparable form of a copy string: whitespace and case folded, markup kept.
+	 *
+	 * @param string $text Text to fold.
+	 * @return string
+	 */
+	private static function fold_text( $text ) {
+		// Whitespace around a paragraph tag is layout an editor adds; anywhere
+		// else a space between two inline elements is part of the text.
+		$plain = trim( (string) preg_replace( array( '/\s+/u', '/\s*(<\/?p\b[^>]*>)\s*/u' ), array( ' ', '$1' ), (string) $text ) );
+		return function_exists( 'mb_strtolower' ) ? mb_strtolower( $plain, 'UTF-8' ) : strtolower( $plain );
 	}
 
 	/**
