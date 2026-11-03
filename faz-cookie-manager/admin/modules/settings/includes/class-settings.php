@@ -234,6 +234,10 @@ class Settings extends Store {
 				'cache_geo_bootstrap' => false,
 				'target_regions'      => array( 'eu', 'uk' ),
 				'default_behavior'    => 'show_banner',
+				// Retained to normalize earlier imports/saved settings. Missing
+				// opt-in banners always use the GDPR rendition; an opt-out
+				// banner must not waive a visitor's jurisdiction requirements.
+				'missing_law_banner'  => 'gdpr_version',
 				// Which GeoLite2 edition the downloader fetches and the lookup
 				// reads: 'country' (small, country-level only — the default and
 				// the historical behaviour) or 'city' (larger, adds region /
@@ -396,6 +400,7 @@ class Settings extends Store {
 			// 'comfortable' for the layout and 'widget' for the withdrawal path.
 			'mobile_layout',
 			'withdrawal_path',
+			'missing_law_banner',
 			'sites',
 			'custom_rules',
 			'target_regions',
@@ -995,6 +1000,9 @@ class Settings extends Store {
 			case 'default_behavior':
 				$allowed = array( 'show_banner', 'no_banner' );
 				$value   = in_array( $value, $allowed, true ) ? $value : 'show_banner';
+				break;
+			case 'missing_law_banner':
+				$value = 'gdpr_version';
 				break;
 			case 'target_regions':
 				if ( ! is_array( $value ) ) {

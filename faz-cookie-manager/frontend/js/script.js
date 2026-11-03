@@ -10,7 +10,7 @@ if ( typeof window._fazConfig === 'undefined' && typeof window._fazCfg !== 'unde
 // Declared up here, ahead of everything that can stand the runtime down,
 // because the version-skew check below must run on exactly the page views
 // where the runtime never starts. See the longer note above `_fazRef._diag`.
-const _FAZ_BUILD = '1.36.1+static-config-recovery-and-proxy-hosts';
+const _FAZ_BUILD = '1.37.0+static-config-recovery-and-proxy-hosts';
 // Version skew between this bundle and the PHP side that printed _fazConfig.
 // `_version` is FAZ_VERSION from the main plugin file (it is also the `?ver=`
 // of this script's own URL), and the numeric prefix of _FAZ_BUILD is the
@@ -2291,6 +2291,10 @@ async function _fazInit() {
         // server-selected template. Bootstrap pages render only after the
         // bounded decision above, preventing a GDPR→CCPA UI flash.
         _fazInitOperations();
+        // The administrator explicitly asked to inspect the real visitor
+        // banner. Reopen only its UI after normal consent/GPC reconciliation;
+        // never clear the cookie, seed new defaults or relax enforcement.
+        if (_fazStore && _fazStore._adminBannerTest) _fazShowBanner();
         // Second pass, intentionally not redundant with the pre-paint one at the
         // top: _fazInitOperations() restores server-allowed services (svc.*:yes)
         // and can unblock iframes that immediately set cookies, so re-run the

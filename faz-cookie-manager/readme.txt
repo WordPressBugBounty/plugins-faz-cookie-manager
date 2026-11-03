@@ -4,7 +4,7 @@ Donate link: https://buymeacoffee.com/fabiodalez
 Tags: cookie, gdpr, ccpa, consent, privacy
 Requires at least: 5.0
 Tested up to: 7.1
-Stable tag: 1.36.1
+Stable tag: 1.37.0
 Requires PHP: 7.4
 License: GPL-3.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
@@ -243,6 +243,12 @@ To replace the floating widget, put the link on every page and disable **Banner 
 = Do scheduled scans require WP-CLI? =
 
 No. A hosting cron that calls WordPress’s `wp-cron.php` runs the plugin’s scheduled events too. If your host already provides that job, do not add a duplicate. **System Status → Cron Jobs** includes a cPanel example and explains how to check the next scheduled times.
+
+= Why can I not see the banner after changing its privacy law? =
+
+A saved choice normally keeps the banner closed. Use the revisit control to reopen preferences. With Geo-Targeting on, visitors who need opt-in consent receive an opt-in version of your CCPA banner when no GDPR banner applies; an unknown country receives the protective fallback too. Its look and policy links are preserved.
+
+The WordPress Dashboard and FAZ screens explain fallback coverage and offer **Check the banner on your site**. This reopens the real banner for your administrator account without clearing consent or changing other visitors' choices. The global banner switch and configured page/region exclusions still apply. If a cache continues serving a banner-less page from an older version, purge that page cache and any external CDN cache after updating.
 
 = Why does the dashboard show -- for pageviews? =
 
@@ -487,6 +493,11 @@ The full changelog (every release back to 1.0.0) lives at:
 https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/blob/main/CHANGELOG.md
 and on the GitHub Releases page:
 https://github.com/fabiodalez-dev/FAZ-Cookie-Manager/releases
+
+= 1.37.0 =
+* Fixed: With Geo-Targeting on and only a CCPA banner active, visitors who need opt-in consent saw no banner at all (#377): visitors from the EU and the UK, and every visitor on a site that cannot detect the country. They now see your banner as an opt-in banner, with its look and policy links, the default GDPR text and Accept and Reject buttons, and nothing optional runs until they choose. AMP and language swaps show the same banner.
+* Fixed: The cache-safe jurisdiction bootstrap now works on CCPA-only sites, so those pages can be cached again.
+* Added: The notice that explains this also appears on the WordPress Dashboard, and offers an administrator-only check that reopens the banner on your site without clearing consent.
 
 = 1.36.1 =
 * Fixed: On a site set to Croatian the banner was shown in English, because the banner and category texts come from bundled catalogues and Croatian had none. Both are now included. Banner texts that a site had already saved while they were still the English defaults are shown in the language of the banner; any text you changed stays as you wrote it.
